@@ -1,0 +1,43 @@
+# Rusty Conduit SSH GUI — UI-agnostic Rust workspace.
+#
+# All connection, vault, and session orchestration logic lives in these crates so the
+# Tauri/Svelte frontend stays a thin adapter. See docs/MASTER-PLAN.md.
+[workspace]
+resolver = "2"
+members = [
+    "crates/conduit-core",
+    "crates/conduit-vault",
+    "crates/conduit-ssh",
+    "crates/conduit-runtime",
+]
+
+# Shared workspace dependencies so every crate pins identical versions.
+[workspace.dependencies]
+# Embedded upstream proxy engine. Embedded as a library crate with zero upstream changes.
+rusty-conduit-ssh = { path = "../rusty-conduit-ssh" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["serde", "v4"] }
+humantime = "2"
+tokio = { version = "1", features = ["net", "time", "sync", "rt", "macros", "io-util"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+
+# conduit-vault: envelope encryption, key management, and keyring.
+# conduit-vault: envelope encryption, key management, and keyring.
+chacha20poly1305 = { version = "0.10", features = ["alloc"] }
+argon2 = { version = "0.5" }
+rand = "0.8"
+zeroize = { version = "1", features = ["derive"] }
+secrecy = "0.10"
+# russh::keys provides pure-Rust OpenSSH/PEM/PKCS#8 key parsing and Ed25519/ECDSA-P256 generation.
+russh = { version = "0.65", default-features = false, features = ["ring"] }
+keyring-core = "1.1"
+base64 = "0.22"
+pkcs8 = { version = "0.11", features = ["pem", "encryption"] }
+p256 = { version = "0.14", features = ["ecdsa"] }
+elliptic-curve = { version = "0.14" }
+
+# Keep debug builds small and fast to compile.
+[profile.dev]
+opt-level = 0

@@ -1,0 +1,18 @@
+[package]
+name = "conduit-ssh"
+version = "0.1.0"
+edition = "2021"
+description = "russh multi-hop chain, host-key pinning, and scoped agent for Rusty Conduit SSH GUI."
+license = "BSD-3-Clause"
+
+[dependencies]
+conduit-core = { path = "../conduit-core" }
+russh = { workspace = true }
+rusty-conduit-ssh = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+conduit-vault = { path = "../conduit-vault" }
+tokio = { workspace = true, features = ["rt-multi-thread"] }

@@ -1,0 +1,28 @@
+[package]
+name = "conduit-vault"
+version = "0.1.0"
+edition = "2021"
+description = "Envelope-encrypted secret vault (vault.bin) for Rusty Conduit SSH GUI."
+license = "BSD-3-Clause"
+
+[dependencies]
+russh = { workspace = true }
+chacha20poly1305 = { workspace = true }
+argon2 = { workspace = true }
+rand = { workspace = true }
+zeroize = { workspace = true }
+secrecy = { workspace = true }
+keyring-core = { workspace = true }
+base64 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+pkcs8 = { workspace = true }
+p256 = { workspace = true }
+elliptic-curve = { workspace = true }
+
+# Dev-dependencies: only needed by the key tests, which encrypt an OpenSSH key
+# via ssh-key's `PrivateKey::encrypt` (requires a `rand_core 0.10` `TryCryptoRng`).
+[dev-dependencies]
+getrandom = { version = "0.4", features = ["sys_rng"] }

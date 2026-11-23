@@ -1,0 +1,5 @@
+# Rust build artifacts
+/target
+
+# The goal ledger is always tracked — never ignore it.
+!.goal-ledger/
