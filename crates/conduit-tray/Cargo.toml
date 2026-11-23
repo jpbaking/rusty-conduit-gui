@@ -1,0 +1,19 @@
+[package]
+name = "conduit-tray"
+version = "0.1.0"
+edition = "2021"
+description = "UI-agnostic system tray model and backends for Rusty Conduit SSH GUI."
+license = "BSD-3-Clause"
+
+[dependencies]
+conduit-core = { path = "../conduit-core" }
+conduit-runtime = { path = "../conduit-runtime" }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = "0.3"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread"] }

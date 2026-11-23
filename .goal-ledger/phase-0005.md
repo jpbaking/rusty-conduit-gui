@@ -1,58 +1,60 @@
-# phase-0005 — conduit-runtime SessionManager, state machine, backoff, logs & events
+# phase-0005 — src-tauri/ui Multi-Hop Jump Chain Builder & Host Profiles
 
 - Status: done
 - Owner: executor
-- Depends on: phase-0001, phase-0002, phase-0003, phase-0004
-- Goal: Implement `conduit-runtime` with `SessionManager`, full session state machine, bounded log ring buffers, live stats, exponential backoff reconnect with account-lockout protection, vault lock/unlock gating, host-key approval flow, and debounced sleep/wake hooks.
-- Done when: `cargo test -p conduit-runtime && cargo clippy --workspace --all-targets -- -D warnings` exits 0 with unit tests covering state transitions, backoff reset, lockout halt, log ring buffer bounding/redaction, and debounced wake handling.
-- Pattern to follow: `/home/j.baking/Workspace/github/rusty-conduit-ssh/src/lib.rs:106` (`run_until` startup and graceful shutdown order)
+- Depends on: phase-0004
+- Goal: Implement the Connection & Multi-Hop Jump Chain Builder UI (with drag-and-drop + keyboard reorder, reusable Host Profile picker, per-hop auth/vaulted key picker, agent-forwarding warning, host-key status/reset, and prefix-by-prefix `Test Chain` diagnostics) plus the Host Profiles management view.
+- Done when: `(cd src-tauri/ui && npm run check && npm run build)` exits 0 with all chain-builder and host-profile components wired to live `src-tauri` IPC commands.
+- Pattern to follow: `docs/MASTER-PLAN.md` Sections 5.3 and 8.2
 
 ## Context
-`conduit-runtime` is the UI-agnostic supervisor that Tauri commands and the system tray will drive in Phase 2.
+Multi-hop jump chains (`Local → Jump 1 → Jump 2 → … → Target`) are the signature UX feature of Rusty Conduit SSH GUI.
 Key decisions already made:
-- State machine: `Stopped`, `Starting`, `Connected`, `Reconnecting { attempt, next_retry_secs }`, `WaitingForNetwork`, `Locked`, `AwaitingHostKey(HostKeyPrompt)`, `NeedsAttention { reason }`, `Failed { reason }`.
-- Graceful startup/shutdown order mirrors `rusty_conduit_ssh::run_until`: start `AccessLogger` → start `ReverseProxy` (survives reconnects) → connect SSH chain → wire `tcpip-forward` → start forward `Server` (with `MitmState`, `FilteredDialer`, `StatsDialer`). On shutdown: drain forward `Server` → tear down SSH chain → drain `ReverseProxy` → flush `AccessLogger`.
-- Keep forward listeners bound while reconnecting (`RusshDialer` returns `NotConnected`). Reset exponential backoff only after 5s of stable uptime.
-- **Account Lockout Protection:** on `SshError::AuthFailed` or `SshError::HostKeyChanged`, immediately halt reconnects and transition to `NeedsAttention`. Never auto-retry bad credentials.
-- If vault is locked when starting a session that requires secrets, transition to `Locked`; sessions requiring no secrets may still start.
-- Wake-from-sleep events debounce 2–5s (configurable for tests) and proactively recycle only `Connected` or `Reconnecting` sessions (never `Stopped` or `NeedsAttention`).
-- On each SSH chain connect/reconnect when reverse forwarding is enabled, create a fresh `conduit_ssh::reverse_policy` and `ReverseRelay::start` (the policy receiver is consumed per connection).
-- For `AuthMethod::KeyboardInteractive` (whose `conduit-core` variant currently stores only `prompts: Vec<String>` without `SecretRef`), pass an empty answer list or map any configured vault answers if present; do not modify `conduit-core`.
+- Every hop in a session's chain can either be picked from a reusable `HostProfile` (or promoted via *Save as Profile*) or configured inline.
+- Support both drag-and-drop AND keyboard-accessible Move Up / Move Down reordering of hops, plus Add Jump / Remove Hop.
+- Per-hop Auth editor: ordered list of vaulted Key picker (`KeyId` from Key Vault metadata) and write-only Password input (sends password to backend, receives `SecretRef`, clears input immediately, displays `Saved password` badge + Replace/Clear).
+- Per-hop opt-in Agent Forwarding toggle displays a clear warning that root on that remote host can use forwarded keys while connected.
+- Prefix-by-prefix **Test Chain** displays live per-hop badges (`✓` connected + ms, `!` exact failing hop + error reason, `–` not attempted).
+- Include basic Forward/Reverse port fields in the session editor so users can create, save, test, and start a real session immediately (full 7-tab parity for Filters/MITM/Logging/Advanced comes in Master Plan Phase 3).
+- **Planner answers to escalation:**
+  1. Added read-only IPC command `list_host_key_pins` in `src-tauri/src/commands.rs` returning `Vec<HostKeyEntry>` (`{ key: { hop_id, host, port }, record: { algorithm, fingerprint_sha256, first_seen, approved } }`). Wire `listHostKeyPins()` in `src-tauri/ui/src/lib/api.ts` and store `pins` in `stores.svelte.ts` (reloaded on `refresh()` and `KnownHostsChanged`).
+  2. Pinned host-key fingerprint display and Reset Pin apply to **session hops** (keyed by `(hop_id, host, port)`), not standalone `HostProfile`s.
 
 ## Scope
-- In: `Cargo.toml`, `Cargo.lock`, `crates/conduit-runtime/**`
-- Out: `crates/conduit-core/**`, `crates/conduit-vault/**`, `crates/conduit-ssh/**`, `docs/MASTER-PLAN.md`
+- In: `src-tauri/ui/src/**`, `src-tauri/ui/dist/**`
+- Out: `crates/**`, `src-tauri/src/**`, `docs/MASTER-PLAN.md`
 
 ## Sub-tasks
-1. [done] Implement `crates/conduit-runtime/src/state.rs` and `crates/conduit-runtime/src/events.rs` defining `SessionState`, `HostKeyPrompt`, `SessionSnapshot`, `SessionStatsSnapshot`, and `RuntimeEvent` broadcast channel — done when: `cargo test -p conduit-runtime state` exits 0
-2. [done] Implement `crates/conduit-runtime/src/logs.rs` providing bounded `LogRingBuffer` (default 2,000 lines, query/clear/subscribe) and `std::io::Write` / `tokio::io::AsyncWrite` adapters for `rusty_conduit_ssh::logging::Logger::with_writer` and `AccessLogger::start_with_stdout` — done when: `cargo test -p conduit-runtime logs` exits 0
-3. [done] Implement `crates/conduit-runtime/src/backoff.rs` and `crates/conduit-runtime/src/hardening.rs` (exponential backoff with 5s stable-uptime reset, plus cross-platform `disable_core_dumps()` using `PR_SET_DUMPABLE=0` on Linux and `setrlimit(RLIMIT_CORE, 0)` on Unix) — done when: `cargo test -p conduit-runtime backoff` exits 0
-4. [done] Implement `crates/conduit-runtime/src/runner.rs` driving a single session end-to-end: resolving secrets from `Vault`, validating & building `rusty_conduit_ssh::Config`, running `ReverseProxy` + `RusshChain` + `RusshDialer` + `StatsDialer` + `FilteredDialer` + `MitmState` + `Server`, handling reconnects, host-key approval oneshot/re-start, and lockout-safe error halts — done when: `cargo check -p conduit-runtime` exits 0
-5. [done] Implement `crates/conduit-runtime/src/manager.rs` (`SessionManager`) managing multiple concurrent sessions (`start`, `stop`, `restart`, `start_all`, `stop_all`, `start_autostart_staggered`, `on_vault_unlocked`, `approve_host_key`, `reject_host_key`, `notify_system_wake` with configurable debounce, `snapshots`, `logs`, `subscribe_events`) — done when: `cargo test -p conduit-runtime` exits 0
-6. [done] Fix-up: release the known-hosts read guard before the await in the `approve_never_overwrites_a_different_pin` test (clippy::await_holding_lock) — done when: the phase Verify block exits 0
+1. [done] Implement `src-tauri/ui/src/lib/components/JumpChainBuilder.svelte` rendering the visual `[Local] → [Jump 1] → … → [Target]` chain with drag-and-drop + keyboard reorder (Move Left/Right or Up/Down), Add/Remove hop, Host Profile picker, *Save as Profile* action, and per-hop `Test Chain` diagnostic badges — done when: `cd src-tauri/ui && npm run check` exits 0
+2. [done] Implement `src-tauri/ui/src/lib/components/HopEditor.svelte` for editing a selected hop's host/port/user, ordered auth methods (vaulted Key picker + write-only Password setter with immediate input clearing), per-hop Agent Forwarding opt-in with security warning, and pinned host-key fingerprint display + Reset Pin action — done when: `cd src-tauri/ui && npm run check` exits 0
+3. [done] Implement `src-tauri/ui/src/lib/components/SessionEditor.svelte` combining `JumpChainBuilder`, `HopEditor`, IP version (`4`/`6`/`auto`), engine selector (`Built-in Rust SSH` vs `OpenSSH (Phase 4)`), autostart toggle, and core Forward/Reverse proxy bind & port fields with validation feedback — done when: `cd src-tauri/ui && npm run check` exits 0
+4. [done] Implement `src-tauri/ui/src/lib/components/HostProfilesView.svelte` for listing, creating, editing, and deleting reusable `HostProfile`s (reusing `HopEditor` auth/key picker) and wire both `SessionEditor` and `HostProfilesView` into `App.svelte` — done when: `cd src-tauri/ui && npm run check && npm run build` exits 0
 
 ## Verify
 ```sh
-cargo test -p conduit-runtime && cargo clippy --workspace --all-targets -- -D warnings
+(cd src-tauri/ui && npm run check && npm run build)
 ```
 
 ## Escalate when
-- `rusty_conduit_ssh::logging::Logger::with_writer` or `AccessLogger::start_with_stdout` has a different signature or visibility than expected → stop, set Status: needs-human — reason: exact signature/visibility in `../rusty-conduit-ssh/src/logging.rs`
+- Any required IPC command or response field is missing from `src-tauri/src/commands.rs` → stop, set Status: needs-human — reason: exact missing IPC command or field
 
 ## Log
 - (append-only, one line per event)
-- sub-task 1: added state.rs (SessionState, transitions, StateCell, snapshots) and events.rs (RuntimeEvent, EventBus); added tokio-util workspace dep
-- sub-task 2: added logs.rs (LogRingBuffer, redact, LogWriter sync+async adapters); signatures of Logger::with_writer and AccessLogger::start_with_stdout matched the phase
-- sub-task 3: added backoff.rs (doubling, cap, 5s stable reset, 100ms floor) and hardening.rs (PR_SET_DUMPABLE=0, RLIMIT_CORE=0)
-- sub-task 4: added runner.rs (Link/Engine seams, supervise loop, SshError classification, vault-per-attempt hop resolution, RusshLink startup/shutdown order, passphrase scrubbing)
-- sub-task 5: added manager.rs (SessionManager lifecycle, autostart stagger, vault resume, host-key approve/reject, debounced wake, snapshots, logs, events)
-- fix-up 6: first Verify failed on clippy::await_holding_lock in one manager test; released the guard before the await
+- read phase, UI sources, IPC commands, controller, and core model before editing; found no IPC read path for pinned host keys; escalated per ## Escalate when; no sub-task started and no UI file changed
+- sub-task 1: added list_host_key_pins client, pins store, validation and chain helpers, and JumpChainBuilder.svelte with pointer drag, keyboard move, add/remove, profile picker, Save as Profile, and test badges
+- sub-task 2: added HopEditor.svelte with host/port/user, ordered key and write-only password methods, agent-forwarding warning, and pinned fingerprint with confirmed Reset Pin
+- sub-task 3: added SessionEditor.svelte combining chain and hop editors with IP version, engine, autostart, forward and reverse fields, and inline validation
+- sub-task 4: added HostProfilesView.svelte, wired SessionEditor and HostProfilesView into App.svelte, blocked Save on invalid fields, and rebuilt dist
 
 ## Evidence
 - (append-only: command → observed result)
-- cargo test -p conduit-runtime state → 6 passed, 0 failed
-- cargo test -p conduit-runtime logs → 10 passed, 0 failed
-- cargo test -p conduit-runtime backoff → 5 passed, 0 failed; cargo test -p conduit-runtime hardening → 1 passed
-- cargo check -p conduit-runtime → exit 0
-- cargo test -p conduit-runtime → 46 passed, 0 failed
-- cargo test -p conduit-runtime && cargo clippy --workspace --all-targets -- -D warnings → exit 0 (46 passed, clippy clean); cargo test --workspace → 186 passed, 0 failed; 10 repeat runs of the runtime lib tests before the fix-up → 0 failures
+- `grep -rnE 'host_key_pin\s*(=|:)\s*Some|\.host_key_pin\s*=' crates src-tauri/src` → no matches, exit 1
+- `grep -cE 'pub async fn (list|get)_(known_hosts?|host_keys?|host_key_pins?|pins?)' src-tauri/src/commands.rs` → 0
+- `grep -c 'known_hosts' src-tauri/src/commands.rs` → 0
+- `grep -rn 'KnownHostsChanged {' -A6 crates/conduit-runtime/src` → fields are session_id, hop_id, host, port (no fingerprint), events.rs:22
+- `cd src-tauri/ui && npm run check` → 0 errors, 0 warnings (141 files)
+- `cd src-tauri/ui && npm run check` → 0 errors, 0 warnings (142 files)
+- `cd src-tauri/ui && npm run check` → 0 errors, 0 warnings (143 files)
+- `cd src-tauri/ui && npm run check && npm run build` → 0 errors, 0 warnings (144 files), built index-BNaa-GU4.js and index-C3o6H_5g.css
+- `(cd src-tauri/ui && npm run check && npm run build)` (## Verify) → exit 0, svelte-check 0 errors and 0 warnings across 144 files, production bundle index-BNaa-GU4.js
+- headless Chromium against the Vite dev server with mock IPC → 29/29 checks passed (add, keyboard and pointer reorder, password clearing, key order, validation, test badges, pin display and reset, promote, profile create/edit/delete, no console errors); real Tauri window and live SSH were not run

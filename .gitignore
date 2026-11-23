@@ -3,3 +3,6 @@
 
 # The goal ledger is always tracked — never ignore it.
 !.goal-ledger/
+
+# Frontend dependencies. ui/dist stays tracked: tauri::generate_context!() needs it at build time.
+/src-tauri/ui/node_modules

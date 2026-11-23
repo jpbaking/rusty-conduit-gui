@@ -1,55 +1,55 @@
-# phase-0001 — Cargo workspace scaffold & conduit-core data model
+# phase-0001 — conduit-tray trait, menu model & pure-Rust Linux ksni backend
 
 - Status: done
 - Owner: executor
 - Depends on: none
-- Goal: Create the 4-crate Cargo workspace and implement the complete `conduit-core` data model, validation, `rusty_conduit_ssh::Config` mapping, and atomic config/known-hosts persistence.
-- Done when: `cargo test -p conduit-core && cargo clippy --workspace --all-targets -- -D warnings` exits 0 with unit tests verifying serde roundtrips, all validation rules, mapping to `rusty_conduit_ssh::Config`, and atomic file persistence.
-- Pattern to follow: `/home/j.baking/Workspace/github/rusty-conduit-ssh/src/config.rs:768` (`Config::default` and validation rules)
+- Goal: Implement `crates/conduit-tray` with the UI-agnostic `TrayBackend` trait, menu state model (`TrayMenuModel` built from `SessionSnapshot` + vault lock status), pure-Rust Linux `ksni` D-Bus SNI backend with watcher online/offline status, and unit tests.
+- Done when: `cargo test -p conduit-tray && cargo clippy --workspace --all-targets -- -D warnings` exits 0 with unit tests verifying menu construction, `socks5h://` URL formatting, vault-locked state, tray action dispatch, and no-tray-host fallback state.
+- Pattern to follow: `docs/MASTER-PLAN.md` Sections 4.2 and 8.1
 
 ## Context
-This project embeds `../rusty-conduit-ssh` (`rusty_conduit_ssh` v1.1.0) as a library crate with zero upstream changes. All data models live in `conduit-core` so future UI shells (Tauri v2 + Svelte 5) remain thin adapters.
+`conduit-tray` abstracts system tray operations across platforms so Linux uses pure-Rust D-Bus `StatusNotifierItem` (`ksni` — zero GTK3 / `libappindicator` dependency) while Windows/macOS will plug in Tauri v2's `tray-icon` adapter in `src-tauri/`.
 Key decisions already made:
-- Default SSH engine is `SshEngine::Russh`; `SshEngine::OpenSsh` is represented in the schema for Phase 4.
-- Zero `~/.ssh/config`, `~/.ssh/id_*`, or `~/.ssh/known_hosts` access anywhere.
-- Host-key pins are keyed by `(hop_id, host, port)` in app-owned `known_hosts.json`.
-- Workspace edition is 2021 to match `../rusty-conduit-ssh`.
+- Menu-first tray: never hide a required action behind left-click; every action lives in the tray menu.
+- Always format SOCKS proxy URLs as `socks5h://` (never `socks5://`) so DNS resolution stays remote.
+- Menu layout follows `docs/MASTER-PLAN.md` Section 8.1: summary header (`N connected · M needs attention`), per-session entries (`●`/`◐`/`!`/`○`) with Stop/Restart/Start, Copy HTTP Proxy URL, Copy SOCKS Proxy URL (`socks5h://`), View Logs; then `Start All`, `Stop All`, conditional `Unlock Vault…` (only when locked), `Open Manage Window…`, and `Quit`.
+- Expose `TrayHostStatus` (`Online`, `Offline`, `Waiting`) so `src-tauri/` can implement the 10-second login wait + no-tray-host fallback banner cleanly.
 
 ## Scope
-- In: `Cargo.toml`, `.gitignore`, `crates/conduit-core/**`, stub `Cargo.toml` + `src/lib.rs` for `crates/conduit-vault`, `crates/conduit-ssh`, `crates/conduit-runtime`
-- Out: `docs/MASTER-PLAN.md`, `../rusty-conduit-ssh/**`, any UI or Tauri files
+- In: `Cargo.toml`, `Cargo.lock`, `crates/conduit-tray/**`
+- Out: `crates/conduit-core/**`, `crates/conduit-vault/**`, `crates/conduit-ssh/**`, `crates/conduit-runtime/**`, `docs/MASTER-PLAN.md`
 
 ## Sub-tasks
-1. [done] Create root `Cargo.toml` (workspace with `crates/conduit-core`, `crates/conduit-vault`, `crates/conduit-ssh`, `crates/conduit-runtime`, shared workspace dependencies including `rusty-conduit-ssh = { path = "../rusty-conduit-ssh" }`), `.gitignore` (ignoring `/target` and NOT ignoring `.goal-ledger/`), and minimal stub `Cargo.toml` + `src/lib.rs` for the four crates — done when: `cargo check --workspace` exits 0
-2. [done] Implement `crates/conduit-core/src/model.rs` with `VaultKeyMeta`, `KeyId`, `SecretRef`, `KeySource`, `HostProfile`, `AuthMethod`, `HostKeyPin`, `SessionProfile`, `SshEngine`, `HopEntry`, `ForwardConfig`, `ReverseConfig`, `MitmConfig`, `MitmCaMode`, `TunnelConfig`, `LoggingConfig`, `OpenSshOptions`, `AppConfig`, and `KnownHostsStore` (keyed by `HostKeyLookup { hop_id, host, port }`) with full `serde` Serialize/Deserialize and sensible defaults — done when: `cargo test -p conduit-core model` exits 0
-3. [done] Implement `crates/conduit-core/src/validate.rs` enforcing all `rusty-conduit-ssh` and GUI invariants: non-empty hop chain, at least one forward or reverse listener port enabled, mutual exclusion of forward allow/block and reverse allow/block filters, valid `FilterRule` syntax, MITM PEM completeness / PKCS#12 mutual exclusion / `cert_ttl >= 10s`, `reconnect_initial_delay <= reconnect_max_delay`, and `OpenSshOptions::extra_args` isolation denylist (`-F`, `-J`, `-i`, `ProxyCommand`, `ProxyJump`, `IdentityAgent`, `IdentityFile`, `UserKnownHostsFile`, `GlobalKnownHostsFile`, `StrictHostKeyChecking`, `ControlPath`, `ControlMaster`, `ForwardAgent`, `Include`) — done when: `cargo test -p conduit-core validate` exits 0
-4. [done] Implement `crates/conduit-core/src/mapping.rs` converting a validated `SessionProfile` (plus optional unlocked MITM passphrase) into `rusty_conduit_ssh::config::Config` and verifying `Config::validate()` succeeds — done when: `cargo test -p conduit-core mapping` exits 0
-5. [done] Implement `crates/conduit-core/src/storage.rs` for atomic JSON load/save of `AppConfig` (`config.json`) and `KnownHostsStore` (`known_hosts.json`) using temp-file + `sync_all` + atomic rename and `0600` Unix permissions — done when: `cargo test -p conduit-core storage` exits 0
+1. [done] Add `crates/conduit-tray` to root `Cargo.toml` workspace members and create `crates/conduit-tray/Cargo.toml` (depending on `conduit-core`, `conduit-runtime`, `tokio`, `thiserror`, `uuid`, and on `#[cfg(target_os = "linux")]` `ksni = "0.3"`) — done when: `cargo check -p conduit-tray` exits 0
+2. [done] Implement `crates/conduit-tray/src/model.rs` defining `TrayAction` (Start/Stop/Restart session, CopyHttpUrl, CopySocksUrl, ViewLogs, StartAll, StopAll, UnlockVault, OpenManageWindow, Quit), `TrayIconState` (Idle, Connected, Reconnecting, Attention, Locked), `TrayHostStatus`, and `TrayMenuModel::from_snapshots(snapshots, vault_locked)` formatting `http://...` and `socks5h://...` URLs accurately — done when: `cargo test -p conduit-tray model` exits 0
+3. [done] Implement `crates/conduit-tray/src/backend.rs` defining the `TrayBackend` trait (`update(&self, model: TrayMenuModel)`, `host_status(&self) -> TrayHostStatus`, `subscribe_actions(&self)`, `shutdown(self)`) plus a `MockTrayBackend` for deterministic tests — done when: `cargo test -p conduit-tray backend` exits 0
+4. [done] Implement `crates/conduit-tray/src/linux_ksni.rs` (`#[cfg(target_os = "linux")]`) implementing `ksni::Tray` and `KsniTrayBackend` wrapping `ksni::TrayService` / `ksni::blocking::TrayMethods` (or async handle), translating `TrayMenuModel` into `ksni::MenuItem` trees, dispatching `TrayAction`s over an `mpsc` channel, and tracking `TrayHostStatus` gracefully when D-Bus or `StatusNotifierWatcher` is absent (never panicking in headless/no-DBus environments) — done when: `cargo test -p conduit-tray` exits 0
+5. [done] Fix-up: replace the `&[s.clone()]` test argument in `crates/conduit-tray/src/model.rs` that fails `clippy::cloned_ref_to_slice_refs` — done when: the `## Verify` command exits 0
 
 ## Verify
 ```sh
-cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && ! git check-ignore -v .goal-ledger/GOAL.md
+cargo test -p conduit-tray && cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 ## Escalate when
-- `../rusty-conduit-ssh` lacks a public type or field needed to construct `rusty_conduit_ssh::config::Config` → stop, set Status: needs-human — reason: exact missing public API in `rusty-conduit-ssh`
-- Cargo dependency resolution fails offline or due to version conflict with `../rusty-conduit-ssh` → stop, set Status: needs-human — reason: exact cargo resolution error
+- `ksni = "0.3"` pulls GTK or C system libraries (`libappindicator`) or fails to compile on this Linux host → stop, set Status: needs-human — reason: exact `ksni` feature/dependency issue
 
 ## Log
-- sub-task 1: root Cargo.toml (4-crate workspace + shared deps incl. rusty-conduit-ssh), .gitignore (keeps .goal-ledger/), stub crates → cargo check --workspace exit 0
-- sub-task 2: model.rs with all 16 types, serde + defaults → cargo test -p conduit-core model exit 0
-- sub-task 3: validate.rs (all invariants + isolation denylist for extra_args) → cargo test -p conduit-core validate exit 0
-- sub-task 4: mapping.rs to_config() + MappingError; maps MITM CA source, resolved passphrase, upstream cert-ttl/cache defaults → cargo test -p conduit-core mapping exit 0
-- sub-task 5: storage.rs atomic JSON load/save (temp-file + sync_all + rename, 0600) → cargo test -p conduit-core storage exit 0
-- phase verify: cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && ! git check-ignore -v .goal-ledger/GOAL.md → all pass
-- phase done
+- (append-only, one line per event)
+- sub-task 1: added crates/conduit-tray to the workspace with its manifest and ksni 0.3 on Linux
+- sub-task 2: implemented TrayAction, TrayIconState, TrayHostStatus, and TrayMenuModel::from_snapshots, including multiplexed listeners and wildcard-to-loopback URLs
+- sub-task 3: implemented TrayBackend, TrayError, and MockTrayBackend
+- sub-task 4: implemented KsniTrayBackend on a dedicated worker thread with retry, watcher tracking, and a no-D-Bus integration test
+- sub-task 5 (fix-up): first Verify failed on one clippy error in a test; replaced the clone with std::slice::from_ref
 
 ## Evidence
-- cargo check --workspace → exit 0
-- cargo test -p conduit-core model → ok
-- cargo test -p conduit-core validate → ok (16 tests)
-- cargo test -p conduit-core mapping → ok (includes mapped_config_passes_engine_validation)
-- cargo test -p conduit-core storage → ok
-- cargo test --workspace → test result: ok. 33 passed; 0 failed
-- cargo clippy --workspace --all-targets -- -D warnings → Finished dev profile, no warnings
-- git check-ignore -v .goal-ledger/GOAL.md → exit 1 (not ignored)
+- (append-only: command → observed result)
+- `cargo check -p conduit-tray` → exit 0; ksni 0.3.7 resolved
+- `cargo tree -p ksni -e normal` filtered for -sys/gtk/gdk/glib/appindicator/dbus/cairo/pango → only linux-raw-sys (pure-Rust bindings), so the GTK escalation condition did not occur
+- `cargo test -p conduit-tray model` → 10 passed, 0 failed
+- `cargo test -p conduit-tray backend` → 5 passed, 0 failed
+- `cargo test -p conduit-tray` → 20 unit + 1 integration passed, 0 failed
+- first Verify → exit 101: clippy `unnecessary use of clone to create a slice from a reference` at crates/conduit-tray/src/model.rs:464
+- `cargo test -p conduit-tray && cargo clippy --workspace --all-targets -- -D warnings` → exit 0 (20 unit + 1 integration passed, clippy clean)
+- `dbus-run-session` with throwaway probe and fake StatusNotifierWatcher (not committed) → Offline, then Online when watcher appeared, full menu read via dbusmenu GetLayout including socks5h:// URL, Offline when watcher left, clean shutdown (exit 0)
+- not tested: a real desktop panel (XFCE, KDE, Waybar) rendering the icon

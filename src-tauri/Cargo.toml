@@ -1,0 +1,47 @@
+[package]
+name = "rusty-conduit-ssh-gui"
+version = "0.1.0"
+edition = "2021"
+description = "Desktop shell for Rusty Conduit SSH: Tauri v2 adapter over the conduit crates."
+license = "BSD-3-Clause"
+
+[lib]
+name = "rusty_conduit_ssh_gui_lib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rusty-conduit-ssh-gui"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
+conduit-core = { path = "../crates/conduit-core" }
+conduit-runtime = { path = "../crates/conduit-runtime" }
+conduit-ssh = { path = "../crates/conduit-ssh" }
+conduit-tray = { path = "../crates/conduit-tray" }
+conduit-vault = { path = "../crates/conduit-vault" }
+russh = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tauri = { version = "2", features = [] }
+tauri-plugin-autostart = "2"
+tauri-plugin-single-instance = "2"
+thiserror = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+zeroize = { workspace = true }
+
+# Linux uses the pure-Rust `ksni` tray, so GTK tray libraries stay out of its build.
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(conduit_check_tauri_tray)'] }
+
+[dev-dependencies]
+getrandom = { version = "0.4", features = ["sys_rng"] }
+tauri = { version = "2", features = ["test"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }

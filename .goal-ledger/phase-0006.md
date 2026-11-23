@@ -1,51 +1,51 @@
-# phase-0006 — End-to-end runtime integration tests & hardening verification
+# phase-0006 — src-tauri/ui Key Vault, Host-Key & Vault Unlock modals, Settings & E2E verify
 
 - Status: done
 - Owner: executor
 - Depends on: phase-0005
-- Goal: Verify the complete headless stack (`conduit-core` + `conduit-vault` + `conduit-ssh` + `conduit-runtime` + `rusty_conduit_ssh`) via comprehensive end-to-end integration tests covering concurrent sessions, reconnects, lockout protection, host-key approval, vault locking, filters, MITM, and zero `~/.ssh` access.
-- Done when: `cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings` exits 0 with all E2E tests in `crates/conduit-runtime/tests/e2e_runtime.rs` passing cleanly.
-- Pattern to follow: `crates/conduit-ssh/tests/loopback_multihop.rs`
+- Goal: Complete the remaining Phase 2 Manage Window views and modals (Key Vault with upload/paste/generate/copy-pubkey/delete-impact warning, Host-Key Approval modal, Vault Unlock modal, Settings view) and run full Rust + frontend verification.
+- Done when: `cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && (cd src-tauri/ui && npm run check && npm run build)` exits 0 with all Phase 2 views wired cleanly.
+- Pattern to follow: `docs/MASTER-PLAN.md` Sections 5.3, 5.4, and 8.2
 
 ## Context
-This phase proves the overall goal's "Done when" criteria across crate boundaries before Gate D planner review. Every test runs hermetically against in-process `russh` test servers on loopback with `HOME` pointing to an isolated temp directory containing no `.ssh` folder.
-Note on MITM E2E: `MitmState::from_config` uses `rustls-platform-verifier` for upstream origin TLS verification (it will not trust a self-signed loopback origin certificate without OS root trust). For `mitm_through_runtime`, generate a passphrase-protected CA (PKCS#12 or encrypted PEM) stored in temp files with its passphrase in `Vault`, verify `SessionManager` loads the CA via `Vault`, performs a real `CONNECT` + client TLS handshake through the `russh` tunnel where the proxy presents a dynamically minted leaf cert signed by the test CA, and logs `mitm=true` in the session's `LogRingBuffer` (without needing OS-trusted upstream roots).
+Every secret-ingestion surface in the UI must be strictly write-only: pasted keys, uploaded key passphrases, and master passwords are cleared from Svelte component state immediately upon submit, and the backend never returns private key material back to JS.
+Key decisions already made:
+- Key Vault view: lists saved keys with friendly name, algorithm, SHA-256 fingerprint, created date, and `"Used by N hosts/sessions"` badge; supports **Upload File**, **Paste Private Key** (with optional passphrase for encrypted keys), **Generate New Key** (`Ed25519` default / `ECDSA-P256`), **Copy Public Key**, **Rename**, and **Delete** (warns and lists affected hosts/sessions before deleting a referenced key).
+- Host-Key Approval modal: opens automatically when any session enters `AwaitingHostKey`, showing hop name, `host:port`, algorithm, and SHA-256 fingerprint, with **Trust & Pin** (`approve_host_key`) and **Reject** (`reject_host_key`).
+- Vault Unlock modal: opens on startup/tray action when vault is locked (or first-time setup to initialize vault with Master Password / OS Keyring), never offering plaintext fallback.
+- Settings view: app autostart toggle (`--tray`), vault lock/unlock controls, and encrypted backup export/import trigger.
 
 ## Scope
-- In: `Cargo.toml`, `Cargo.lock`, `crates/conduit-runtime/tests/**`, `crates/conduit-runtime/Cargo.toml` (dev-dependencies if needed), plus small bug fixes in `crates/conduit-*/src/**` only if an E2E test uncovers a defect
-- Out: `docs/MASTER-PLAN.md`, `../rusty-conduit-ssh/**`
+- In: `src-tauri/ui/src/**`, `src-tauri/ui/dist/**`, plus small bug fixes in `src-tauri/src/**` only if full integration verification uncovers a mismatch
+- Out: `crates/conduit-core/**`, `crates/conduit-vault/**`, `crates/conduit-ssh/**`, `crates/conduit-runtime/**`, `docs/MASTER-PLAN.md`
 
 ## Sub-tasks
-1. [done] Build E2E test fixture in `crates/conduit-runtime/tests/e2e_runtime.rs` setting up isolated temp `app_data` dir, `Vault`, `KnownHostsStore`, `SessionManager`, and in-process `russh` servers — done when: `cargo test -p conduit-runtime --test e2e_runtime -- --list` exits 0
-2. [done] Add E2E test for concurrent sessions (two sessions running simultaneously: one 3-hop forward HTTP+SOCKS5h with forward allow/block filter, one with reverse proxy `-R`) verifying traffic isolation, live stats counters, and ring-buffer log capture — done when: `cargo test -p conduit-runtime --test e2e_runtime concurrent_sessions` exits 0
-3. [done] Add E2E test for intermediate hop drop → `Reconnecting` → automatic recovery with forward listener staying bound and proxy requests succeeding after reconnect — done when: `cargo test -p conduit-runtime --test e2e_runtime reconnect_after_drop` exits 0
-4. [done] Add E2E tests for security gates: (a) bad password halts immediately in `NeedsAttention` with exactly 1 auth attempt (no lockout retry), (b) unknown host key pauses in `AwaitingHostKey` and connects after `approve_host_key`, (c) changed host key halts in `NeedsAttention`, and (d) locked vault puts secret-dependent session in `Locked` until `on_vault_unlocked` — done when: `cargo test -p conduit-runtime --test e2e_runtime security_gates` exits 0
-5. [done] Add E2E test for HTTPS MITM through a `SessionManager`-managed `russh` tunnel using a generated test CA stored in temp files + passphrase in `Vault`, verifying intercepted HTTPS response and access log entry — done when: `cargo test -p conduit-runtime --test e2e_runtime mitm_through_runtime` exits 0
+1. [done] Implement `src-tauri/ui/src/lib/components/KeyVaultView.svelte` with key table (name, algorithm, SHA-256 fingerprint, created date, `Used by N hosts/sessions`), Copy Public Key, Rename, Delete confirmation listing affected hosts/sessions, and write-only modals for Upload File, Paste Private Key (with optional passphrase), and Generate New Key (`Ed25519`/`ECDSA-P256`) — done when: `cd src-tauri/ui && npm run check` exits 0
+2. [done] Implement `src-tauri/ui/src/lib/components/HostKeyModal.svelte` and `VaultUnlockModal.svelte` (covering first-time vault creation, Master Password unlock, OS keyring unlock, and strict TOFU fingerprint approval/rejection) — done when: `cd src-tauri/ui && npm run check` exits 0
+3. [done] Implement `src-tauri/ui/src/lib/components/SettingsView.svelte` (OS login autostart toggle, vault status/lock button, encrypted backup export/import) and wire `KeyVaultView`, `HostKeyModal`, `VaultUnlockModal`, and `SettingsView` into `App.svelte` — done when: `cd src-tauri/ui && npm run check && npm run build` exits 0
+4. [done] Run full cross-stack verification (`cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && (cd src-tauri/ui && npm run check && npm run build)`) and verify zero raw secret fields exist in frontend TypeScript types or IPC responses — done when: full verification command exits 0
 
 ## Verify
 ```sh
-cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && (cd src-tauri/ui && npm run check && npm run build)
 ```
 
 ## Escalate when
-- Any E2E test exposes an architectural flaw requiring changes to `../rusty-conduit-ssh` or a phase re-scope → stop, set Status: needs-human — reason: exact failing scenario and root cause
+- A Rust/TypeScript IPC contract mismatch requires changing `crates/conduit-core` or `crates/conduit-runtime` → stop, set Status: needs-human — reason: exact contract mismatch
 
 ## Log
 - (append-only, one line per event)
-- sub-task 1: added e2e_runtime.rs fixture (hermetic HOME, temp app_data, Vault, KnownHostsStore, SessionManager, in-process russh nodes) and TLS dev-dependencies
-- sub-task 2: added concurrent_sessions_stay_isolated (3-hop forward with allowlist + 1-hop reverse, simultaneous traffic, per-session stats and logs)
-- sub-task 3: added reconnect_after_drop_recovers_on_the_same_listeners (hop 1 dropped, Reconnecting observed, same listeners, HTTP and SOCKS work after recovery)
-- sub-task 4: added four security_gates tests (bad password, unknown host key, changed host key, locked vault) against real russh servers
-- sub-task 5: added mitm_through_runtime_intercepts_https (encrypted PKCS#12 CA, passphrase in Vault, real CONNECT + TLS through russh, minted leaf, mitm=true access record); origin trusted only through a temp SSL_CERT_FILE
-- verification passed: 193 workspace tests, clippy clean, E2E suite stable over 10 repeat runs; no src changes were needed
+- sub-task 1: added KeyVaultView, write-only AddKeyModal, store key-delete and vault helpers, unique modal title ids, and preview mock commands
+- sub-task 2: added HostKeyModal (explicit Trust & Pin or Reject) and VaultUnlockModal (create, password, OS keyring)
+- sub-task 3: added SettingsView and wired Key Vault, Settings, host-key and unlock modals into App
+- sub-task 4: full verification passed on rerun; first run hit a port-collision flake in conduit-runtime concurrent_sessions_stay_isolated (out of scope, not changed); secret audit and browser run with a fake backend passed
 
 ## Evidence
 - (append-only: command → observed result)
-- cargo test -p conduit-runtime --test e2e_runtime -- --list → exit 0 (0 tests, fixture compiles)
-- cargo test -p conduit-runtime --test e2e_runtime concurrent_sessions → 1 passed, exit 0
-- cargo test -p conduit-runtime --test e2e_runtime reconnect_after_drop → 1 passed, exit 0
-- cargo test -p conduit-runtime --test e2e_runtime security_gates → 4 passed, exit 0
-- cargo test -p conduit-runtime --test e2e_runtime mitm_through_runtime → 1 passed, exit 0
-- cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings → test exit 0 (193 passed, 0 failed), clippy exit 0
-- e2e_runtime binary run 10 times → 0 failures
-- strace -f -e trace=%file on e2e_runtime → 7 passed; 7 paths contain .ssh, all ENOENT statx of the temp HOME (the tests' own absence check); 0 outside temp HOME
+- cd src-tauri/ui && npm run check → 146 files, 0 errors, 0 warnings
+- cd src-tauri/ui && npm run check → 148 files, 0 errors, 0 warnings
+- cd src-tauri/ui && npm run check && npm run build → 149 files, 0 errors, 0 warnings; bundle 136.69 kB JS + 10.38 kB CSS
+- full Verify command → exit 0; 17 test suites, 286 passed, 0 failed; clippy clean; svelte-check 149 files 0 errors 0 warnings; bundle 136.69 kB JS + 10.38 kB CSS
+- first full Verify run → exit 101: concurrent_sessions_stay_isolated failed at crates/conduit-runtime/tests/e2e_runtime.rs:212 with "failed to bind HTTP/HTTPS listener on 127.0.0.1:45015: Address already in use"; test alone 5/5 passed, full rerun passed
+- grep of src-tauri/ui/src/lib/types.ts → secret-named fields are only SecretRef ids, has_secret, and a passphrase file path; grep of UI source → no web storage or console logging; production bundle → no mock data
+- headless Chromium on production bundle with fake IPC → 29/29 checks passed, 0 page exceptions (vault create/unlock/lock, key import/delete reconfirm, host-key approve, autostart, backup, secrets cleared)

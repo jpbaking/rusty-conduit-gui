@@ -9,6 +9,8 @@ members = [
     "crates/conduit-vault",
     "crates/conduit-ssh",
     "crates/conduit-runtime",
+    "crates/conduit-tray",
+    "src-tauri",
 ]
 
 # Shared workspace dependencies so every crate pins identical versions.
