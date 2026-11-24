@@ -26,8 +26,6 @@ pub struct ConfigHop {
     /// is set, `ssh` offers an agent key only when it is listed here. Empty renders
     /// `IdentityFile none`, which also stops `ssh` trying its default `~/.ssh/id_*` files.
     pub identity_files: Vec<String>,
-    /// Agent endpoint forwarded to this hop. `None` renders `ForwardAgent no`.
-    pub forward_agent: Option<String>,
 }
 
 /// Everything needed to render one session's config.
@@ -114,7 +112,6 @@ fn render_config_for(config: &SessionConfig, windows: bool) -> Result<String, Co
             return Err(ConfigError::DuplicateHop(hop.hop_id.clone()));
         }
         let identity_agent = optional_path(hop.identity_agent.as_deref())?;
-        let forward_agent = optional_path(hop.forward_agent.as_deref())?;
 
         out.push_str(&format!("Host {alias}\n"));
         let mut directive = |name: &str, value: &str| {
@@ -145,7 +142,8 @@ fn render_config_for(config: &SessionConfig, windows: bool) -> Result<String, Co
             &config.server_alive_count_max.to_string(),
         );
         directive("AddressFamily", address_family);
-        directive("ForwardAgent", forward_agent.as_deref().unwrap_or("no"));
+        // No agent is ever forwarded: the app logs into every hop itself.
+        directive("ForwardAgent", "no");
         if index > 0 {
             directive("ProxyCommand", &proxy_command(config, index - 1, windows)?);
         }
@@ -244,7 +242,6 @@ mod tests {
             user: "alice".into(),
             identity_agent: None,
             identity_files: Vec::new(),
-            forward_agent: None,
         }
     }
 
@@ -440,11 +437,9 @@ mod tests {
         let path = dir.path().join("config");
         let known_hosts = dir.path().join("known_hosts");
         let agent = dir.path().join("a.sock");
-        let forward = dir.path().join("f.sock");
         let first = hop("a", "127.0.0.1");
         let mut second = hop("b", "127.0.0.2");
         second.identity_agent = Some(agent.to_str().unwrap().into());
-        second.forward_agent = Some(forward.to_str().unwrap().into());
         let alias = hop_alias(&second);
         let mut config = session(vec![first, second]);
         config.config_path = path.to_str().unwrap().into();
@@ -470,7 +465,7 @@ mod tests {
             "stricthostkeychecking true".to_string(),
             "identitiesonly yes".to_string(),
             format!("identityagent {}", agent.display()),
-            format!("forwardagent {}", forward.display()),
+            "forwardagent no".to_string(),
             "identityfile none".to_string(),
             "controlmaster false".to_string(),
             "updatehostkeys false".to_string(),

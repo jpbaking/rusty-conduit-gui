@@ -96,8 +96,7 @@ const usesKey = (auth: AuthMethod[], id: KeyId) =>
 const withoutKey = (auth: AuthMethod[], id: KeyId) =>
   auth.filter((method) => !(typeof method === "object" && "Key" in method && method.Key.key === id));
 
-const hopUsesKey = (hop: HopEntry, id: KeyId) =>
-  usesKey(hop.host.auth, id) || hop.agent_forward_keys.includes(id);
+const hopUsesKey = (hop: HopEntry, id: KeyId) => usesKey(hop.host.auth, id);
 
 class AppStore {
   // Backend data. Replaced whole, so `$state.raw` avoids deep proxies and IPC clone problems.
@@ -308,7 +307,6 @@ class AppStore {
       hopUsesKey(hop, id)
         ? {
             ...hop,
-            agent_forward_keys: hop.agent_forward_keys.filter((key) => key !== id),
             host: { ...hop.host, auth: withoutKey(hop.host.auth, id) },
           }
         : hop,

@@ -524,7 +524,6 @@ async fn only_allowlisted_reverse_forwards_are_accepted() {
     hop.policy = ChannelPolicy {
         forward_allowlist: allowlist,
         forward_channels: Some(tx),
-        ..ChannelPolicy::default()
     };
     let chain = connect_chain(&[hop], &pin_all(&[&a]), &options(), None)
         .await
@@ -542,20 +541,6 @@ async fn only_allowlisted_reverse_forwards_are_accepted() {
     assert_eq!(inbound.connected_port, 8080);
     assert_eq!(inbound.originator_address, "10.0.0.9");
     assert!(rx.try_recv().is_err());
-    chain.disconnect().await;
-}
-
-#[tokio::test]
-async fn opted_in_hop_accepts_agent_channel() {
-    let a = spawn_node(None).await;
-    let (tx, mut rx) = mpsc::channel(1);
-    let mut hop = spec(0, &a, vec![password(PASSWORD)]);
-    hop.policy.agent_channels = Some(tx);
-    let chain = connect_chain(&[hop], &pin_all(&[&a]), &options(), None)
-        .await
-        .unwrap();
-    a.session().channel_open_agent().await.unwrap();
-    assert!(rx.recv().await.is_some());
     chain.disconnect().await;
 }
 

@@ -192,7 +192,6 @@ mod tests {
                 user: "root".into(),
                 ..Default::default()
             },
-            ..Default::default()
         }
     }
 

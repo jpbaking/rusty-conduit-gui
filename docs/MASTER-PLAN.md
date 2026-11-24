@@ -16,7 +16,7 @@ Build a lightweight, cross-platform desktop **system tray application** and **Ma
 2. **First-Class Multi-Hop Jumphosts:** Convenient visual chain builder (`Local → Jump 1 → Jump 2 → … → Target`) with reusable Host Profiles, per-hop port/user/auth/host-key settings, and step-by-step connection testing.
 3. **Saved Password Auth (Targets & Jumphosts):** Support unattended password and keyboard-interactive authentication for both targets and intermediate jumphosts — including at login autostart and during auto-reconnect without any TTY — while preventing server account lockouts on bad credentials.
 4. **Zero `~/.ssh/config` (and `~/.ssh/known_hosts`) Dependence:** Never read, write, or implicitly reference `~/.ssh/config`, `/etc/ssh/ssh_config`, `~/.ssh/id_*`, or `~/.ssh/known_hosts`. All connection metadata, keys, and host-key pins are strictly app-managed.
-5. **Embedded Isolated `ssh-agent`:** In-app isolated key store and per-hop/per-session scoped agent so key-based authentication and opt-in agent forwarding work across targets and jumphosts without reading or leaking the user's ambient `SSH_AUTH_SOCK`.
+5. **Embedded Isolated `ssh-agent`:** In-app isolated key store and per-hop/per-session scoped agent so key-based authentication works across targets and jumphosts without reading or leaking the user's ambient `SSH_AUTH_SOCK`. No agent is ever forwarded to a remote host (see §3.5).
 6. **True Cross-Platform Support:** First-class support for Windows, macOS, and Linux — explicitly covering **XFCE (X11 & Wayland)**, KDE Plasma, GNOME (with/without AppIndicator), and wlroots compositors (Sway/Hyprland/Waybar).
 
 ---
@@ -86,7 +86,7 @@ For each `russh` session:
 ### 3.4 Mandatory `russh` Security Hardening
 
 Override these permissive `russh` defaults in every client handler:
-- **`server_channel_open_agent_forward`:** Reject by default unless that specific hop has opt-in agent forwarding enabled and requested.
+- **`server_channel_open_agent_forward`:** Always reject. The app never forwards an agent.
 - **`server_channel_open_forwarded_tcpip`:** Reject any remote address/port not explicitly requested in `reverse.forwards()`.
 - **Embedded Agent Server:** Allow only `RequestKeys` and `Sign` after initial session key loading; deny `AddIdentity`, `RemoveIdentity`, `RemoveAll`, and `Lock`.
 - **Known Hosts:** Never call `russh`'s default `~/.ssh/known_hosts` helpers; always use app-managed pin storage.
@@ -98,11 +98,11 @@ Clarify and cleanly separate the two distinct key-auth workflows:
 1. **Per-Hop Authentication (Default — No Forwarding Needed):**
    - Because the app connects each hop directly through nested `direct-tcpip` channels, private keys **never leave the local machine** and are never exposed to jump hosts.
    - Keys stored in `conduit-vault` (OpenSSH, PEM, PKCS#1/5/8, PuTTY) are decoded in zeroized memory and used directly by the per-hop signer. No socket or external agent is involved.
-2. **Scoped Agent Forwarding (Explicit Per-Hop Opt-In):**
-   - Only needed when a remote process on a hop/target requires access to forwarded keys.
-   - Because `ssh -N` / tunnel-only connections do not open a session channel, opt-in forwarding opens a dedicated session channel with a user-specified remote command (or keepalive shell) and exposes an **in-process isolated agent** containing *only* the keys explicitly assigned to that hop.
-   - Sealed after key load (read-only `RequestKeys`/`Sign`), logs every signature event to the session log, and displays a clear warning that root on the remote host can use forwarded keys while connected.
-   - Reading the system `SSH_AUTH_SOCK` is never done by default (at most an explicit, clearly labeled per-hop opt-in).
+2. **No Agent Forwarding (removed 2026-11-25):**
+   - The app is a forward/reverse proxy. Neither direction needs a remote process to authenticate onward with the user's keys, and per-hop authentication already reaches every jump host and the target.
+   - Agent forwarding (an earlier opt-in that ran a remote command on a session channel with a scoped agent) only added risk: root on that host could use the forwarded keys while connected. It was removed. Hops refuse `auth-agent@openssh.com` channels, the OpenSSH engine always writes `ForwardAgent no`, and `-A` / `ForwardAgent` stay in the `extra_args` denylist.
+   - Profiles saved with the old `agent_forward*` hop fields still load; the fields are ignored and dropped on the next save.
+   - Reading the system `SSH_AUTH_SOCK` is never done.
 
 ### 3.6 OpenSSH Compatibility Engine Hardening (Phase 4)
 
@@ -181,7 +181,7 @@ Private keys are managed as first-class records inside `vault.bin` with **zero r
   - Private key material is **never** returned to the frontend WebView after ingestion (write-only).
 - **Per-Target & Per-Jumphost Picking:**
   - Every Host Profile and every hop in a session's Jump Chain (`Jump 1 → Jump 2 → … → Target`) gets a clean **Key Vault picker** allowing the user to select one or more vaulted keys (ordered) and/or password auth.
-  - At connect time, the embedded isolated `ssh-agent` / signer loads *only* the vaulted keys selected for that specific hop (and, if opt-in agent forwarding is enabled on that hop, exposes *only* the keys explicitly assigned for forwarding).
+  - At connect time, the embedded isolated `ssh-agent` / signer loads *only* the vaulted keys selected for that specific hop.
 
 ### 5.4 Host-Key Verification (Zero `~/.ssh/known_hosts`)
 
@@ -305,7 +305,7 @@ Quit                             (confirms when sessions are active)
 - **Left Sidebar:** Searchable session list with live status indicators (`●`, `◐`, `!`, `○`), `+ New Session`, and navigation links to **Host Profiles**, **Key Vault (Embedded Agent)**, and **Settings**.
 - **Header Bar:** Session title, live state pill, active connection & byte counters, **`[Test Chain]`**, **`[Save]`**, **`[Start / Stop]`**.
 - **7-Tab Session Editor (100% `rusty-conduit-ssh` coverage):**
-  1. **Connection & Jump Chain:** Visual chain `[Local] → [Jump 1 ✓] → [Jump 2 !] → [Target]` with drag-and-drop + keyboard reorder, reusable Host Profile picker (with *Save as Profile* promotion), per-hop auth/secret status, per-hop opt-in agent forwarding, host-key fingerprint/reset, IP version, engine selector (`Built-in Rust SSH` vs. `OpenSSH`).
+  1. **Connection & Jump Chain:** Visual chain `[Local] → [Jump 1 ✓] → [Jump 2 !] → [Target]` with drag-and-drop + keyboard reorder, reusable Host Profile picker (with *Save as Profile* promotion), per-hop auth/secret status, host-key fingerprint/reset, IP version, engine selector (`Built-in Rust SSH` vs. `OpenSSH`).
   2. **Forward Proxy:** Bind IP (with non-loopback warning), HTTP port, SOCKS port, single-port mux toggle, `max_connections`, live port-conflict check across saved sessions and OS sockets.
   3. **Reverse Proxy (`-R`):** Remote bind IP (with exposure/GatewayPorts warning), remote HTTP/SOCKS ports, mux indicator.
   4. **Destination Filters:** Forward and reverse Allowlist/Blocklist mode toggle (enforcing mutual exclusivity), IP/CIDR/FQDN/`*.domain` rule editor, bulk paste import, and interactive "Test host against rules" checker.
@@ -339,7 +339,7 @@ Quit                             (confirms when sessions are active)
 
 ### Phase 3 — Full `rusty-conduit-ssh` Option Parity & Embedded Scoped Agent Forwarding
 - Complete remaining Session Editor tabs: Forward Proxy (with port conflict detection), Reverse Proxy, Filters (with rule tester), HTTPS MITM (with CA expiry/validation), Keepalive & Reconnect, Logging & Advanced.
-- Implement opt-in per-hop **Scoped Agent Forwarding** (in-process read-only agent + signature audit logging + remote-command session channel).
+- Implement opt-in per-hop **Scoped Agent Forwarding** (in-process read-only agent + signature audit logging + remote-command session channel). *Later removed as out of scope for a proxy; see §3.5.*
 - Add encrypted config export/import (secrets omitted by default; optional passphrase-encrypted full backup).
 
 ### Phase 4 — Opt-In OpenSSH Compatibility Engine

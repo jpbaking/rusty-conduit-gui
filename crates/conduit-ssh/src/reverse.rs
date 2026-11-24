@@ -45,7 +45,6 @@ pub fn reverse_policy(capacity: usize) -> (ChannelPolicy, ReverseInbound) {
     let policy = ChannelPolicy {
         forward_allowlist: allowlist.clone(),
         forward_channels: Some(sender),
-        ..ChannelPolicy::default()
     };
     (policy, ReverseInbound { allowlist, receiver })
 }

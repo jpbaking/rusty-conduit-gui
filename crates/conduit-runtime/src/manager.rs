@@ -749,7 +749,6 @@ mod tests {
                 auth,
                 ..Default::default()
             },
-            ..Default::default()
         }
     }
 

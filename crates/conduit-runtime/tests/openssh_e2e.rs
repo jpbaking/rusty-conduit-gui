@@ -238,7 +238,6 @@ fn hop(index: usize, node: &Node, auth: Vec<AuthMethod>) -> HopEntry {
             auth,
             ..Default::default()
         },
-        ..Default::default()
     }
 }
 

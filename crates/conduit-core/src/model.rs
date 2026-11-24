@@ -210,19 +210,14 @@ pub enum SshEngine {
 /// Carries a fully resolved inline [`HostProfile`] so the session is self-contained;
 /// `hop_id` is the stable key for app-owned known_hosts (`known_hosts.json`). The last hop is
 /// the SSH target. Jumphosts are traversed by the russh engine, not by `ssh -J`.
+///
+/// No agent is ever forwarded to a hop: the app logs into every hop itself, so a proxy never
+/// needs one. Profiles saved with the old `agent_forward*` fields still load; they are ignored.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct HopEntry {
     pub hop_id: String,
     pub name: String,
     pub host: HostProfile,
-    #[serde(default)]
-    pub agent_forward: bool,
-    /// Vault keys exposed to this hop when `agent_forward` is on. Nothing else is ever exposed.
-    #[serde(default)]
-    pub agent_forward_keys: Vec<KeyId>,
-    /// Optional command run on this hop's agent-forwarding session channel.
-    #[serde(default)]
-    pub agent_forward_command: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -815,16 +810,18 @@ mod tests {
     }
 
     #[test]
-    fn hop_entry_without_agent_forward_fields_deserializes() {
+    fn hop_entry_saved_with_agent_forwarding_still_loads_and_drops_it() {
         let json = r#"{
             "hop_id": "target",
             "name": "target",
             "host": { "name": "h", "host": "10.0.0.1", "user": "root", "auth": [] },
-            "agent_forward": true
+            "agent_forward": true,
+            "agent_forward_keys": ["00000000-0000-0000-0000-000000000001"],
+            "agent_forward_command": "sleep infinity"
         }"#;
         let hop: HopEntry = serde_json::from_str(json).unwrap();
-        assert!(hop.agent_forward);
-        assert!(hop.agent_forward_keys.is_empty());
-        assert_eq!(hop.agent_forward_command, None);
+        assert_eq!(hop.hop_id, "target");
+        let saved = serde_json::to_string(&hop).unwrap();
+        assert!(!saved.contains("agent_forward"), "{saved}");
     }
 }

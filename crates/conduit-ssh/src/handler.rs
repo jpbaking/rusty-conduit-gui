@@ -1,7 +1,8 @@
 //! Hardened `russh` client handler.
 //!
 //! russh's defaults accept every server-initiated channel. This handler denies them all,
-//! except agent channels on an opted-in hop and `forwarded-tcpip` to an allowlisted address.
+//! except `forwarded-tcpip` to an allowlisted address. Agent channels are always refused: the
+//! app never forwards an agent.
 
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
@@ -55,18 +56,12 @@ pub struct InboundForward {
 /// Which server-initiated channels a hop accepts. The default denies everything.
 #[derive(Debug, Clone, Default)]
 pub struct ChannelPolicy {
-    /// `Some` is the per-hop agent-forwarding opt-in; accepted channels are delivered here.
-    pub agent_channels: Option<mpsc::Sender<Channel<Msg>>>,
     pub forward_allowlist: ForwardAllowlist,
     /// Accepted reverse forwards are delivered here. `None` denies all of them.
     pub forward_channels: Option<mpsc::Sender<InboundForward>>,
 }
 
 impl ChannelPolicy {
-    pub fn allows_agent_forward(&self) -> bool {
-        self.agent_channels.is_some()
-    }
-
     pub fn allows_forward(&self, connected_address: &str, connected_port: u32) -> bool {
         self.forward_channels.is_some()
             && self
@@ -121,25 +116,16 @@ impl client::Handler for HopHandler {
         Ok(true)
     }
 
+    /// Never accepted: the app does not forward an agent to any hop.
     async fn server_channel_open_agent_forward(
         &mut self,
-        channel: Channel<Msg>,
+        _channel: Channel<Msg>,
         reply: ChannelOpenHandle,
         _session: &mut Session,
     ) -> Result<(), SshError> {
-        let Some(sink) = &self.policy.agent_channels else {
-            reply
-                .reject(ChannelOpenFailure::AdministrativelyProhibited)
-                .await;
-            return Ok(());
-        };
-        match sink.try_reserve() {
-            Ok(permit) => {
-                reply.accept().await;
-                permit.send(channel);
-            }
-            Err(_) => reply.reject(ChannelOpenFailure::ResourceShortage).await,
-        }
+        reply
+            .reject(ChannelOpenFailure::AdministrativelyProhibited)
+            .await;
         Ok(())
     }
 
@@ -315,20 +301,9 @@ mod tests {
     }
 
     #[test]
-    fn default_policy_denies_agent_and_forwards() {
+    fn default_policy_denies_forwards() {
         let policy = ChannelPolicy::default();
-        assert!(!policy.allows_agent_forward());
         assert!(!policy.allows_forward("127.0.0.1", 8080));
-    }
-
-    #[test]
-    fn agent_forward_requires_opt_in() {
-        let (tx, _rx) = mpsc::channel(1);
-        let policy = ChannelPolicy {
-            agent_channels: Some(tx),
-            ..ChannelPolicy::default()
-        };
-        assert!(policy.allows_agent_forward());
     }
 
     #[test]
@@ -346,7 +321,6 @@ mod tests {
         let policy = ChannelPolicy {
             forward_allowlist: allowlist.clone(),
             forward_channels: Some(tx),
-            ..ChannelPolicy::default()
         };
         assert!(policy.allows_forward("127.0.0.1", 8080));
         assert!(!policy.allows_forward("127.0.0.1", 8081));

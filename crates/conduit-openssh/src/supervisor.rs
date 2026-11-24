@@ -355,7 +355,6 @@ impl OpenSshSupervisor {
                 user: hop.user,
                 identity_agent,
                 identity_files,
-                forward_agent: None,
             });
         }
         let target_hop = config_hops

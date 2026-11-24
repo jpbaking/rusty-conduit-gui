@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
 use conduit_core::{
-    to_config, validate, AuthMethod, HopEntry, HostKeyLookup, KnownHostsStore, SessionProfile,
+    to_config, validate, AuthMethod, HostKeyLookup, KnownHostsStore, SessionProfile,
     SshEngine,
 };
 use conduit_openssh::{
@@ -21,10 +21,9 @@ use conduit_openssh::{
     SupervisorHop, SupervisorOptions,
 };
 use conduit_ssh::{
-    agent_policy, connect_chain, reverse_policy, AgentForwardRelay, AgentInbound, AgentRelayError,
-    AtomicStats, ChainOptions, ChannelPolicy, DisconnectEvent, HopAuth, HopSpec, HostKeyVerifier,
+    connect_chain, reverse_policy, AtomicStats, ChainOptions, ChannelPolicy, DisconnectEvent, HopAuth, HopSpec, HostKeyVerifier,
     ReverseError, ReverseInbound, ReverseRelay, RusshDialer, ScopedAgent, SignAudit, SignAuditFn,
-    SshChain, SshError, StatsDialer,
+    SshError, StatsDialer,
 };
 use conduit_vault::{import_key, Vault, VaultError};
 use rusty_conduit_ssh::build_engines;
@@ -48,8 +47,6 @@ use crate::state::{HostKeyPrompt, ListenerInfo, SessionState, StateCell};
 
 /// Queued inbound reverse channels per connection.
 const REVERSE_CHANNEL_CAPACITY: usize = 64;
-/// Queued inbound agent channels per opted-in hop.
-const AGENT_CHANNEL_CAPACITY: usize = 16;
 /// Backstop for noticing a dead chain if no disconnect event arrives.
 const LIVENESS_POLL: Duration = Duration::from_secs(1);
 /// A session has two forward ports, so a third pick is always different.
@@ -443,13 +440,7 @@ pub(crate) fn needs_secrets(profile: &SessionProfile) -> bool {
             .any(|m| matches!(m, AuthMethod::Key { .. } | AuthMethod::Password { .. }))
     });
     hop_secret
-        || profile.hops.iter().any(forwards_agent)
         || profile.mitm.as_ref().is_some_and(|m| m.passphrase.is_some())
-}
-
-/// `true` when this hop opted in and has at least one key to expose.
-fn forwards_agent(hop: &HopEntry) -> bool {
-    hop.agent_forward && !hop.agent_forward_keys.is_empty()
 }
 
 /// Resolves one auth method. Returns `None` for a method this engine does not provide.
@@ -472,7 +463,7 @@ fn resolve_auth(vault: &Vault, method: &AuthMethod) -> Result<Option<HopAuth>, L
         AuthMethod::KeyboardInteractive { .. } => {
             Ok(Some(HopAuth::KeyboardInteractive(Vec::new())))
         }
-        // Agent forwarding is never enabled implicitly, and this is not a login credential.
+        // The system agent is never used, and this is not a login credential.
         AuthMethod::SystemAgentOptIn => Ok(None),
     }
 }
@@ -513,15 +504,8 @@ pub(crate) fn resolve_hops(
         .collect()
 }
 
-/// An agent ready to serve one hop once the chain is up.
-struct PendingAgent {
-    hop_index: usize,
-    agent: ScopedAgent,
-    inbound: AgentInbound,
-    command: Option<String>,
-}
-
-/// One audit log line. Holds public metadata only, never key material or the signed data.
+/// One audit log line for a signature by a hop's isolated login agent (OpenSSH engine). Holds
+/// public metadata only, never key material or the signed data.
 fn audit_line(event: &SignAudit) -> String {
     format!(
         "[agent-audit] hop={} fingerprint={} algorithm={} data_len={} result={}",
@@ -531,72 +515,6 @@ fn audit_line(event: &SignAudit) -> String {
         event.data_len,
         if event.allowed { "allowed" } else { "refused" },
     )
-}
-
-/// Loads each opted-in hop's assigned keys and adds the agent opt-in to its channel policy.
-fn attach_agents(
-    profile: &SessionProfile,
-    vault: &Vault,
-    logs: &LogRingBuffer,
-    hops: &mut [HopSpec],
-) -> Result<Vec<PendingAgent>, LinkError> {
-    let mut pending = Vec::new();
-    for (hop_index, (entry, spec)) in profile.hops.iter().zip(hops.iter_mut()).enumerate() {
-        if !forwards_agent(entry) {
-            continue;
-        }
-        let mut keys = Vec::with_capacity(entry.agent_forward_keys.len());
-        for key in &entry.agent_forward_keys {
-            let method = AuthMethod::Key { key: key.clone() };
-            if let Some(HopAuth::Key(private)) = resolve_auth(vault, &method)? {
-                // The comment is sent to the remote host, so vault names stay out of it.
-                keys.push((private, String::new()));
-            }
-        }
-        let sink = logs.clone();
-        let audit: SignAuditFn = Arc::new(move |event: &SignAudit| sink.push(&audit_line(event)));
-        let agent = ScopedAgent::seal(entry.hop_id.clone(), keys, Some(audit));
-        let (policy, inbound) = agent_policy(AGENT_CHANNEL_CAPACITY);
-        // Only this field is set, so a reverse policy on the same hop is preserved.
-        spec.policy.agent_channels = policy.agent_channels;
-        pending.push(PendingAgent {
-            hop_index,
-            agent,
-            inbound,
-            command: entry.agent_forward_command.clone(),
-        });
-    }
-    Ok(pending)
-}
-
-async fn start_agent_relays(
-    chain: &SshChain,
-    pending: Vec<PendingAgent>,
-) -> Result<Vec<AgentForwardRelay>, LinkError> {
-    let mut relays = Vec::with_capacity(pending.len());
-    for item in pending {
-        let handle = chain.hop(item.hop_index).ok_or_else(|| {
-            LinkError::Fatal(format!("agent forwarding: no hop {}", item.hop_index))
-        })?;
-        let relay = AgentForwardRelay::start(
-            handle,
-            item.hop_index,
-            item.agent,
-            item.inbound,
-            item.command.as_deref(),
-        )
-        .await
-        .map_err(classify_agent)?;
-        relays.push(relay);
-    }
-    Ok(relays)
-}
-
-fn classify_agent(error: AgentRelayError) -> LinkError {
-    LinkError::Transient {
-        reason: format!("agent forwarding failed: {error}"),
-        network: false,
-    }
 }
 
 /// The production engine. Routes each session to the SSH engine its profile selects.
@@ -799,8 +717,6 @@ struct RusshLink {
     dialer: Arc<RusshDialer>,
     relay: Option<ReverseRelay>,
     remote_listeners: SharedListeners,
-    agent_relays: Vec<AgentForwardRelay>,
-    logs: LogRingBuffer,
     disconnects: Option<mpsc::UnboundedReceiver<DisconnectEvent>>,
 }
 
@@ -830,13 +746,6 @@ impl RusshLink {
         )
         .await?;
 
-        for hop in profile.hops.iter().filter(|h| h.agent_forward && h.agent_forward_keys.is_empty()) {
-            logs.push(&format!(
-                "notice: agent forwarding is on for hop {} but no keys are assigned, so no agent channel will be opened",
-                hop.hop_id
-            ));
-        }
-
         Ok(Self {
             profile,
             options,
@@ -846,16 +755,12 @@ impl RusshLink {
             dialer,
             relay: None,
             remote_listeners,
-            agent_relays: Vec::new(),
-            logs,
             disconnects: None,
         })
     }
 
     async fn drop_connection(&mut self) {
         self.disconnects = None;
-        // Dropping a relay stops serving and closes its session channel.
-        self.agent_relays.clear();
         let relay = self.relay.take();
         self.remote_listeners
             .lock()
@@ -944,14 +849,12 @@ impl Link for RusshLink {
                 } else {
                     (ChannelPolicy::default(), None)
                 };
-            let (hops, pending) = {
+            let hops = {
                 let vault = self.vault.read().unwrap_or_else(PoisonError::into_inner);
                 if needs_secrets(&self.profile) && !vault.is_unlocked() {
                     return Err(LinkError::Locked);
                 }
-                let mut hops = resolve_hops(&self.profile, &vault, policy)?;
-                let pending = attach_agents(&self.profile, &vault, &self.logs, &mut hops)?;
-                (hops, pending)
+                resolve_hops(&self.profile, &vault, policy)?
             };
 
             let (events, receiver) = mpsc::unbounded_channel();
@@ -960,13 +863,6 @@ impl Link for RusshLink {
                 .map_err(classify)?;
             drop(hops);
 
-            let agent_relays = match start_agent_relays(&chain, pending).await {
-                Ok(relays) => relays,
-                Err(error) => {
-                    chain.disconnect().await;
-                    return Err(error);
-                }
-            };
             if let (Some(reverse), Some(inbound)) = (&self.stack.reverse, inbound) {
                 match ReverseRelay::start(&chain, reverse.forwards(), inbound).await {
                     Ok(relay) => {
@@ -978,13 +874,11 @@ impl Link for RusshLink {
                         self.relay = Some(relay);
                     }
                     Err(error) => {
-                        drop(agent_relays);
                         chain.disconnect().await;
                         return Err(classify_reverse(error));
                     }
                 }
             }
-            self.agent_relays = agent_relays;
             self.dialer.swap(chain);
             self.disconnects = Some(receiver);
             self.stack.ensure_server().await
@@ -1167,13 +1061,6 @@ impl OpenSshLink {
         let (tunnel, state) = watch::channel(TunnelState::Connecting);
         let base: Arc<dyn UpstreamDialer> = Arc::new(Socks5UpstreamDialer::new(state));
         let stack = ProxyStack::start(&profile, &vault, &logs, stats, listeners, base).await?;
-
-        for hop in profile.hops.iter().filter(|h| h.agent_forward) {
-            logs.push(&format!(
-                "notice: agent forwarding on hop {} is not applied by the OpenSSH engine",
-                hop.hop_id
-            ));
-        }
 
         Ok(Self {
             profile,
@@ -1660,26 +1547,6 @@ mod tests {
         assert_eq!(h.task.await.unwrap(), SessionState::Stopped);
     }
 
-    fn agent_hop(agent_forward: bool, keys: Vec<conduit_core::KeyId>) -> HopEntry {
-        HopEntry {
-            agent_forward,
-            agent_forward_keys: keys,
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn needs_secrets_only_for_agent_hops_with_keys() {
-        let key = conduit_core::KeyId::new();
-        let with = |hop| SessionProfile {
-            hops: vec![hop],
-            ..Default::default()
-        };
-        assert!(needs_secrets(&with(agent_hop(true, vec![key.clone()]))));
-        assert!(!needs_secrets(&with(agent_hop(true, Vec::new()))));
-        assert!(!needs_secrets(&with(agent_hop(false, vec![key]))));
-    }
-
     #[test]
     fn audit_line_survives_redaction_and_reports_the_outcome() {
         let mut event = SignAudit {
@@ -1754,7 +1621,7 @@ mod tests {
     #[test]
     fn probe_store_demotes_only_pins_without_a_usable_key() {
         use conduit_core::{HostKeyRecord, HostProfile, Timestamp};
-        let hop = |id: &str| HopEntry {
+        let hop = |id: &str| conduit_core::HopEntry {
             hop_id: id.into(),
             host: HostProfile {
                 host: "h".into(),

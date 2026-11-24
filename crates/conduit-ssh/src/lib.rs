@@ -1,5 +1,5 @@
 //! `conduit-ssh` — pure-Rust (`russh` + `ring`) multi-hop chain, host-key pinning, and
-//! scoped agent.
+//! scoped agent used to log into hops.
 //!
 //! Never reads `~/.ssh/config`, `~/.ssh/id_*`, `~/.ssh/known_hosts`, or `SSH_AUTH_SOCK`.
 
@@ -8,7 +8,6 @@
 #![allow(clippy::result_large_err)]
 
 pub mod agent;
-pub mod agent_relay;
 pub mod agent_wire;
 pub mod chain;
 pub mod dialer;
@@ -22,7 +21,6 @@ pub use agent::{
     AgentError, AgentIdentity, AgentRequest, AgentResponse, MutationOp, ScopedAgent, SignAudit,
     SignAuditFn,
 };
-pub use agent_relay::{agent_policy, AgentForwardRelay, AgentInbound, AgentRelayError};
 pub use chain::{
     connect_chain, test_chain, ChainOptions, ChainTestReport, HopAuth, HopDiagnostic, HopSpec,
     HopStatus, IpPreference, KeyboardAnswer, SshChain,

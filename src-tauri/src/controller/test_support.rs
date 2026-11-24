@@ -91,8 +91,6 @@ pub fn hop(hop_id: &str, port: u16, auth: Vec<AuthMethod>) -> HopEntry {
         hop_id: hop_id.into(),
         name: hop_id.into(),
         host: host(hop_id, port, auth),
-        agent_forward: false,
-        ..Default::default()
     }
 }
 

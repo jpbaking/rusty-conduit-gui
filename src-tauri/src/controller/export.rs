@@ -148,13 +148,6 @@ fn referenced_records(config: &AppConfig) -> BTreeSet<String> {
         };
     }
     for session in &config.sessions {
-        ids.extend(
-            session
-                .hops
-                .iter()
-                .flat_map(|h| &h.agent_forward_keys)
-                .map(ToString::to_string),
-        );
         if let Some(secret) = session.mitm.as_ref().and_then(|m| m.passphrase.as_ref()) {
             ids.insert(secret.to_string());
         }
@@ -225,11 +218,7 @@ fn strip_host(host: &mut HostProfile, trusted: Option<&HostProfile>) -> usize {
 
 fn strip_hop(hop: &mut HopEntry, trusted: Option<&HopEntry>) -> usize {
     let trusted = trusted.filter(|t| same_endpoint(&t.host, &hop.host));
-    let before = hop.agent_forward_keys.len();
-    hop.agent_forward_keys
-        .retain(|k| trusted.is_some_and(|t| t.agent_forward_keys.contains(k)));
-    let removed = before - hop.agent_forward_keys.len();
-    removed + strip_host(&mut hop.host, trusted.map(|t| &t.host))
+    strip_host(&mut hop.host, trusted.map(|t| &t.host))
 }
 
 /// Removes every credential reference a plain file is not entitled to. See the module docs.
@@ -281,7 +270,6 @@ fn merge(
     config: &mut AppConfig,
     incoming: AppConfig,
     replace: bool,
-    untrusted: bool,
 ) -> (ImportSummary, Vec<SessionProfile>) {
     let mut summary = ImportSummary::default();
     let mut touched = BTreeSet::new();
@@ -297,12 +285,6 @@ fn merge(
         }
         for session in &mut config.sessions {
             for hop in session.hops.iter_mut().filter(|h| h.host.id == host.id) {
-                // A linked hop follows its host, so its agent keys must not follow an
-                // endpoint change that came from an unauthenticated file.
-                if untrusted && !same_endpoint(&hop.host, &host) {
-                    summary.credentials_removed += hop.agent_forward_keys.len();
-                    hop.agent_forward_keys.clear();
-                }
                 hop.host = host.clone();
                 touched.insert(session.id);
             }
@@ -396,14 +378,6 @@ impl RestoredRecords {
         for session in &mut config.sessions {
             for hop in &mut session.hops {
                 removed += self.remap_auth(&mut hop.host.auth);
-                let before = hop.agent_forward_keys.len();
-                let mapped: Vec<KeyId> = hop
-                    .agent_forward_keys
-                    .iter()
-                    .filter_map(|k| self.keys.get(&k.to_string()).cloned())
-                    .collect();
-                removed += before - mapped.len();
-                hop.agent_forward_keys = mapped;
             }
             if let Some(mitm) = session.mitm.as_mut() {
                 if let Some(old) = mitm.passphrase.take() {
@@ -545,7 +519,7 @@ impl AppController {
         let (summary, changed) = self.mutate_config(move |config| {
             let removed = strip_untrusted_credentials(&mut incoming, config);
             neutralize_untrusted_paths(&mut incoming, config);
-            let (mut summary, changed) = merge(config, incoming, replace, true);
+            let (mut summary, changed) = merge(config, incoming, replace);
             summary.credentials_removed += removed;
             Ok((summary, changed))
         })?;
@@ -595,7 +569,7 @@ impl AppController {
                         config.keys.push(meta);
                     }
                 }
-                let (mut summary, changed) = merge(config, incoming, replace, false);
+                let (mut summary, changed) = merge(config, incoming, replace);
                 summary.credentials_removed += removed;
                 Ok((summary, changed))
             })
@@ -773,8 +747,6 @@ mod tests {
             AuthMethod::Key { key: key.id.clone() },
             AuthMethod::Password { secret: password.clone() },
         ];
-        session.hops[0].agent_forward = true;
-        session.hops[0].agent_forward_keys = vec![key.id.clone()];
         session.mitm = Some(MitmConfig {
             ca_mode: MitmCaMode::Pkcs12 { path: "/tmp/seed.p12".into() },
             ..MitmConfig::default()
@@ -899,7 +871,6 @@ mod tests {
         assert_ne!(new_key.id, seeded.key.id);
         assert_eq!(new_key.fingerprint_sha256, seeded.key.fingerprint_sha256);
         let hop = &config.sessions[0].hops[0];
-        assert_eq!(hop.agent_forward_keys, vec![new_key.id.clone()]);
         assert_eq!(config.hosts[0].auth, vec![AuthMethod::Key { key: new_key.id.clone() }]);
         let AuthMethod::Password { secret } = &hop.host.auth[1] else { panic!("password lost") };
         assert_ne!(*secret, seeded.password);
@@ -999,15 +970,14 @@ mod tests {
         let summary = t.import_config(&path, None, false).unwrap();
         assert!(!summary.encrypted);
         assert_eq!((summary.sessions_added, summary.hosts_added), (1, 1));
-        // Host key, hop key, hop password, agent key, and MITM passphrase.
-        assert_eq!(summary.credentials_removed, 5);
+        // Host key, hop key, hop password, and MITM passphrase.
+        assert_eq!(summary.credentials_removed, 4);
 
         let config = t.config_snapshot();
         assert!(config.keys.is_empty());
         assert!(config.hosts[0].auth.is_empty());
         let session = config.sessions.iter().find(|s| s.id == seeded.session).unwrap();
         assert!(session.hops[0].host.auth.is_empty());
-        assert!(session.hops[0].agent_forward_keys.is_empty());
         assert_eq!(session.mitm.as_ref().unwrap().passphrase, None);
     }
 
@@ -1043,12 +1013,11 @@ mod tests {
         let session = config.sessions.iter().find(|s| s.id == seeded.session).unwrap();
         assert_eq!(session.hops[0].host.host, "attacker.example");
         assert!(session.hops[0].host.auth.is_empty());
-        assert!(session.hops[0].agent_forward_keys.is_empty());
         assert_eq!(session.mitm.as_ref().unwrap().passphrase, None);
     }
 
     #[tokio::test]
-    async fn export_edited_host_cannot_redirect_a_linked_hops_agent_keys() {
+    async fn export_edited_host_cannot_redirect_a_linked_hops_credentials() {
         let dir = TempDir::new();
         let c = unlocked(&dir).await;
         let seeded = seed(&c);
@@ -1066,7 +1035,6 @@ mod tests {
         let hop = &config.sessions[0].hops[0];
         assert_eq!(hop.host.host, "attacker.example");
         assert!(hop.host.auth.is_empty());
-        assert!(hop.agent_forward_keys.is_empty());
     }
 
     /// Gives the seeded session a custom program and both log paths.

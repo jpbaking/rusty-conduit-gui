@@ -180,8 +180,6 @@ impl Fixture {
                     auth,
                     host_key_pin: None,
                 },
-                agent_forward: false,
-                ..Default::default()
             }],
             forward: ForwardConfig {
                 http_port: free_port(),
@@ -444,7 +442,6 @@ async fn generated_openssh_files_hold_no_secrets() {
                 user: "tester".into(),
                 identity_agent: Some(path_text("agent.sock")),
                 identity_files: vec![path_text("hop-0.pub")],
-                forward_agent: None,
             },
             ConfigHop {
                 hop_id: "hop-1".into(),
@@ -453,7 +450,6 @@ async fn generated_openssh_files_hold_no_secrets() {
                 user: "tester".into(),
                 identity_agent: None,
                 identity_files: Vec::new(),
-                forward_agent: None,
             },
         ],
         config_path: path_text("ssh_config"),
