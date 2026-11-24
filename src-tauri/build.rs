@@ -1,19 +1,26 @@
 fn main() {
-    tauri_build::build();
-
-    // `tauri-build` compiles the Windows resource (including the Common Controls v6 manifest)
-    // into `OUT_DIR` and links it into binaries only (`cargo:rustc-link-arg-bins`). On Windows,
-    // `tao` and `tray-icon` import Common Controls v6 symbols from `comctl32.dll`, so test
-    // binaries crash at startup with `0xc0000139` (`STATUS_ENTRYPOINT_NOT_FOUND`) unless they
-    // also link that compiled resource.
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
-        let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
-        for name in ["resource.lib", "libresource.a"] {
-            let res = out_dir.join(name);
-            if res.exists() {
-                println!("cargo:rustc-link-arg-tests={}", res.display());
-                break;
-            }
-        }
+    // On Windows MSVC, `tauri-build` embeds its default Common Controls v6 manifest into
+    // `resource.lib` and links it into binaries only (`cargo:rustc-link-arg-bins`), which
+    // leaves `cargo test --lib` binaries crashing at startup with `0xc0000139`
+    // (`STATUS_ENTRYPOINT_NOT_FOUND`). Passing the exact same dependency via MSVC
+    // `/MANIFEST:EMBED` + `/MANIFESTDEPENDENCY:` applies it to every linkable target (binaries,
+    // lib unit tests, and integration tests) while keeping the icon and version resources from
+    // `tauri-build`.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+        && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
+    {
+        tauri_build::try_build(
+            tauri_build::Attributes::new()
+                .windows_attributes(tauri_build::WindowsAttributes::new_without_app_manifest()),
+        )
+        .expect("failed to run tauri-build");
+        println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
+        println!(
+            "cargo:rustc-link-arg=/MANIFESTDEPENDENCY:type='win32' \
+             name='Microsoft.Windows.Common-Controls' version='6.0.0.0' \
+             processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'"
+        );
+    } else {
+        tauri_build::build();
     }
 }
