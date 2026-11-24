@@ -216,14 +216,21 @@ jobs:
           mkdir -p release-files
           out="$PWD/release-files"
           cd "$BUNDLE_DIR"
+          # The product name "Rusty Conduit (SSH)" names the installers. Release assets get a
+          # name without spaces or parentheses, which GitHub would otherwise rewrite.
+          asset_name() { basename "$1" | tr ' ' '-' | tr -d '()'; }
           for file in $ARTIFACTS; do
             if [ ! -f "$file" ]; then echo "::error::No file matches $file"; exit 1; fi
-            cp "$file" "$out/"
+            cp "$file" "$out/$(asset_name "$file")"
           done
           # An artifact upload drops symlinks and file modes, so the .app must travel as a tar.
           if [ "$RUNNER_OS" = "macOS" ]; then
+            apps=(macos/*.app)
+            if [ ${#apps[@]} -ne 1 ] || [ ! -d "${apps[0]}" ]; then
+              echo "::error::Expected one .app in macos/, found: ${apps[*]}"; exit 1
+            fi
             for dmg in dmg/*.dmg; do
-              tar -czf "$out/$(basename "$dmg" .dmg).app.tar.gz" -C macos rusty-conduit-ssh-gui.app
+              tar -czf "$out/$(asset_name "$dmg" | sed 's/\.dmg$//').app.tar.gz" -C macos "$(basename "${apps[0]}")"
             done
           fi
 

@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "rusty-conduit-ssh-gui",
+  "productName": "Rusty Conduit (SSH)",
   "version": "0.1.0",
   "identifier": "io.github.rusty-conduit-ssh-gui",
   "build": {
@@ -41,7 +41,9 @@
         "installMode": "currentUser",
         "installerHooks": "windows/nsis-hooks.nsh"
       },
-      "wix": {}
+      "wix": {
+        "upgradeCode": "170EC6F2-0F3E-494D-8108-CD16C7097A20"
+      }
     }
   }
 }
