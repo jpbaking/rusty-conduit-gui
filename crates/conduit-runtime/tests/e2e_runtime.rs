@@ -900,6 +900,13 @@ async fn http_connect(proxy: SocketAddr, host: &str, port: u16) -> (String, TcpS
 
 #[test]
 fn mitm_through_runtime_intercepts_https() {
+    // Upstream `rusty_conduit_ssh` verifies the origin with `rustls-platform-verifier`, which
+    // honors `SSL_CERT_FILE` on Linux only. macOS Security.framework and Windows CryptoAPI
+    // ignore `SSL_CERT_FILE`, so a hermetic throwaway origin CA cannot be trusted without
+    // mutating the OS trust store.
+    if !cfg!(target_os = "linux") {
+        return;
+    }
     e2e(async {
         let f = Fixture::new();
         let node = spawn_node(None).await;
