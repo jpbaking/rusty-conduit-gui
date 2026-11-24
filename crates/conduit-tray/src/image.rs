@@ -18,10 +18,8 @@ impl TrayImage {
 
     /// ARGB32 in network byte order, as the StatusNotifierItem `IconPixmap` property needs.
     pub fn to_argb32(&self) -> Vec<u8> {
-        self.rgba
-            .chunks_exact(4)
-            .flat_map(|p| [p[3], p[0], p[1], p[2]])
-            .collect()
+        let (pixels, _) = self.rgba.as_chunks::<4>();
+        pixels.iter().flat_map(|&[r, g, b, a]| [a, r, g, b]).collect()
     }
 }
 
