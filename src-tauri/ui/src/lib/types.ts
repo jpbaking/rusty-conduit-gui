@@ -159,6 +159,8 @@ export interface ReverseConfig {
   reverse_bind: string;
   reverse_http_port: number;
   reverse_socks_port: number;
+  /** Concurrent reverse proxy clients, 0 = unlimited. `null` uses the forward cap. */
+  reverse_max_connections: number | null;
   reverse_allow: string[];
   reverse_block: string[];
 }
@@ -207,6 +209,8 @@ export interface SessionProfile {
   id: Uuid;
   name: string;
   autostart: boolean;
+  /** `false` leaves the session out of Start All and autostart. It can still be started alone. */
+  enabled: boolean;
   engine: SshEngine;
   hops: HopEntry[];
   forward: ForwardConfig;
@@ -258,9 +262,13 @@ export interface SessionStatsSnapshot {
 export interface SessionSnapshot {
   id: Uuid;
   name: string;
+  enabled: boolean;
   state: SessionState;
   stats: SessionStatsSnapshot;
+  /** Proxy listeners bound on this computer. */
   listeners: ListenerInfo[];
+  /** Reverse proxy (-R) listeners bound on the target host, while connected. */
+  remote_listeners: ListenerInfo[];
 }
 
 export interface SessionView {
@@ -282,7 +290,7 @@ export interface LogLine {
   text: string;
 }
 
-export type HopTestStatus = "connected" | "failed" | "not_attempted";
+export type HopTestStatus = "connected" | "failed" | "host_key_unknown" | "not_attempted";
 
 export interface HopTestResult {
   hop_index: number;
@@ -292,6 +300,8 @@ export interface HopTestResult {
   status: HopTestStatus;
   error: string | null;
   elapsed_ms: number;
+  /** The key the hop presented when it is not trusted yet. Trusting it pins exactly this key. */
+  host_key: HostKeyPrompt | null;
 }
 
 export interface ChainTestResult {

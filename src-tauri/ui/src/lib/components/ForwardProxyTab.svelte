@@ -2,6 +2,7 @@
   import { api, errorMessage } from "../api";
   import { NEW_SESSION_ID, store } from "../stores.svelte";
   import type { ForwardConfig, PortConflict, SessionProfile } from "../types";
+  import { PortMux, shareablePort } from "../portMux.svelte";
   import { isIpAddress, isLoopback, isPort } from "../validate";
   import PortField from "./PortField.svelte";
 
@@ -12,30 +13,18 @@
   const errors = $derived(store.draftErrors);
   const forwardOn = $derived(forward.http_port !== 0 || forward.socks_port !== 0);
   const exposed = $derived(forwardOn && isIpAddress(forward.bind) && !isLoopback(forward.bind));
-  // `Object.is` so that clearing the shared field (NaN in both) does not end multiplexing.
-  const muxOn = $derived(Object.is(forward.http_port, forward.socks_port) && forward.http_port !== 0);
-  const muxPort = $derived(
-    [forward.http_port, forward.socks_port].find((port) => port !== 0 && isPort(port)) ?? null,
-  );
+  const mux = new PortMux(() => ({ http: forward.http_port, socks: forward.socks_port }));
+  const canShare = $derived(shareablePort({ http: forward.http_port, socks: forward.socks_port }) !== null);
 
   let conflicts = $state.raw<PortConflict[]>([]);
   let checkError = $state<string | null>(null);
-  /** The SOCKS port to restore when multiplexing is turned off. */
-  let separateSocksPort = 0;
-
   function setForward(patch: Partial<ForwardConfig>) {
     store.updateDraft((profile) => ({ ...profile, forward: { ...profile.forward, ...patch } }));
   }
 
   function setMux(on: boolean) {
-    if (on) {
-      if (muxPort === null) return;
-      separateSocksPort = forward.socks_port;
-      setForward({ http_port: muxPort, socks_port: muxPort });
-    } else {
-      const restored = separateSocksPort === forward.http_port ? 0 : separateSocksPort;
-      setForward({ socks_port: restored });
-    }
+    const ports = mux.toggle(on);
+    if (ports) setForward({ http_port: ports.http, socks_port: ports.socks });
   }
 
   $effect(() => {
@@ -67,7 +56,7 @@
   });
 </script>
 
-<section aria-labelledby={`${uid}-heading`}>
+<section class="card" aria-labelledby={`${uid}-heading`}>
   <h2 id={`${uid}-heading`}>Forward proxy <small class="muted">port 0 turns a listener off</small></h2>
   <div class="field-row">
     <div class="field grow">
@@ -85,21 +74,23 @@
         <span id={`${uid}-bind-error`} class="field-error">{errors["forward.bind"]}</span>
       {/if}
     </div>
-    <PortField
-      label={muxOn ? "Shared port" : "HTTP port"}
-      value={forward.http_port}
-      error={errors["forward.http"]}
-      onValue={(port) => setForward(muxOn ? { http_port: port, socks_port: port } : { http_port: port })}
-    />
-    {#if !muxOn}
+    <div class="port-group" bind:this={mux.group} onfocusout={mux.onFocusOut}>
       <PortField
-        label="SOCKS port"
-        value={forward.socks_port}
-        error={errors["forward.socks"]}
-        onValue={(socks_port) => setForward({ socks_port })}
+        label={mux.on ? "Shared port" : "HTTP port"}
+        value={forward.http_port}
+        error={errors["forward.http"]}
+        onValue={(port) => setForward(mux.on ? { http_port: port, socks_port: port } : { http_port: port })}
       />
-    {/if}
-    <div class="field port">
+      {#if !mux.on}
+        <PortField
+          label="SOCKS port"
+          value={forward.socks_port}
+          error={errors["forward.socks"]}
+          onValue={(socks_port) => setForward({ socks_port })}
+        />
+      {/if}
+    </div>
+    <div class="field cap" title="HTTP and SOCKS connections count together">
       <label class="field">
         Max connections
         <input
@@ -125,8 +116,8 @@
   <label class="check">
     <input
       type="checkbox"
-      checked={muxOn}
-      disabled={!muxOn && muxPort === null}
+      checked={mux.on}
+      disabled={!mux.on && !canShare}
       onchange={(e) => setMux(e.currentTarget.checked)}
     />
     Single-port multiplex <small class="muted">HTTP and SOCKS share one port</small>

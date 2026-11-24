@@ -7,6 +7,7 @@
 //! so locking the vault also stops future reconnects.
 
 use std::future::Future;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
@@ -32,6 +33,7 @@ use rusty_conduit_ssh::logging::{AccessLogConfig, AccessLogger, Logger};
 use rusty_conduit_ssh::mitm::MitmState;
 use rusty_conduit_ssh::net::{FilteredDialer, Socks5UpstreamDialer, TunnelState, UpstreamDialer};
 use rusty_conduit_ssh::reverse::ReverseProxy;
+use rusty_conduit_ssh::ssh::ReverseForward;
 use rusty_conduit_ssh::server::{ProtocolHandlers, Server, ShutdownReport};
 use rusty_conduit_ssh::EngineHandlers;
 use tokio::sync::{mpsc, watch};
@@ -106,6 +108,8 @@ pub(crate) struct SessionContext {
     pub(crate) logs: LogRingBuffer,
     pub(crate) stats: Arc<AtomicStats>,
     pub(crate) listeners: SharedListeners,
+    /// Reverse listeners on the target host. Set while connected, cleared on disconnect.
+    pub(crate) remote_listeners: SharedListeners,
 }
 
 /// Runs one session until it stops or halts, then records its final state.
@@ -118,6 +122,7 @@ pub(crate) async fn run_session(
 ) {
     let logs = ctx.logs.clone();
     let listeners = Arc::clone(&ctx.listeners);
+    let remote_listeners = Arc::clone(&ctx.remote_listeners);
     let backoff = Backoff::new(
         ctx.profile.tunnel.reconnect_initial_delay,
         ctx.profile.tunnel.reconnect_max_delay,
@@ -149,10 +154,9 @@ pub(crate) async fn run_session(
         }
         Err(error) => halt_state(error),
     };
-    listeners
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clear();
+    for shared in [&listeners, &remote_listeners] {
+        shared.lock().unwrap_or_else(PoisonError::into_inner).clear();
+    }
     logs.push(&format!("session ended: {}", describe(&final_state)));
     cell.set(final_state);
 }
@@ -794,6 +798,7 @@ struct RusshLink {
     stack: ProxyStack,
     dialer: Arc<RusshDialer>,
     relay: Option<ReverseRelay>,
+    remote_listeners: SharedListeners,
     agent_relays: Vec<AgentForwardRelay>,
     logs: LogRingBuffer,
     disconnects: Option<mpsc::UnboundedReceiver<DisconnectEvent>>,
@@ -808,6 +813,7 @@ impl RusshLink {
             logs,
             stats,
             listeners,
+            remote_listeners,
         } = ctx;
 
         validate(&profile).map_err(|e| LinkError::Fatal(e.to_string()))?;
@@ -839,6 +845,7 @@ impl RusshLink {
             stack,
             dialer,
             relay: None,
+            remote_listeners,
             agent_relays: Vec::new(),
             logs,
             disconnects: None,
@@ -850,6 +857,10 @@ impl RusshLink {
         // Dropping a relay stops serving and closes its session channel.
         self.agent_relays.clear();
         let relay = self.relay.take();
+        self.remote_listeners
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
         if let Some(chain) = self.dialer.detach() {
             if let Some(relay) = relay {
                 relay.stop(&chain).await;
@@ -860,6 +871,33 @@ impl RusshLink {
             }
         }
     }
+}
+
+/// Describes the reverse listeners bound on the target host.
+///
+/// `forwards` and `bound` are in the same order, because the relay binds all or nothing. The
+/// role comes from the configured ports, since one port serving both is multiplexed.
+fn remote_listener_info(
+    cfg: &conduit_core::ReverseConfig,
+    forwards: &[ReverseForward],
+    bound: &[(String, u32)],
+) -> Vec<ListenerInfo> {
+    forwards
+        .iter()
+        .zip(bound)
+        .map(|(forward, (address, port))| {
+            let configured = forward.remote.port();
+            let role = match (configured == cfg.reverse_http_port, configured == cfg.reverse_socks_port) {
+                (true, true) => "multiplexed HTTP/HTTPS + SOCKS4/4a/5",
+                (true, false) => "HTTP/HTTPS",
+                (false, true) => "SOCKS4/4a/5",
+                (false, false) => "reverse proxy",
+            };
+            let ip = address.parse().unwrap_or(forward.remote.ip());
+            let port = u16::try_from(*port).unwrap_or(configured);
+            ListenerInfo { role: role.to_string(), addr: SocketAddr::new(ip, port) }
+        })
+        .collect()
 }
 
 fn scrub_passphrase(cfg: &mut Config) {
@@ -931,7 +969,14 @@ impl Link for RusshLink {
             };
             if let (Some(reverse), Some(inbound)) = (&self.stack.reverse, inbound) {
                 match ReverseRelay::start(&chain, reverse.forwards(), inbound).await {
-                    Ok(relay) => self.relay = Some(relay),
+                    Ok(relay) => {
+                        *self
+                            .remote_listeners
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner) =
+                            remote_listener_info(&self.profile.reverse, reverse.forwards(), relay.bound());
+                        self.relay = Some(relay);
+                    }
                     Err(error) => {
                         drop(agent_relays);
                         chain.disconnect().await;
@@ -1100,6 +1145,8 @@ impl OpenSshLink {
             logs,
             stats,
             listeners,
+            // The OpenSSH engine does not report what `ssh -R` bound, so it shows none.
+            remote_listeners: _,
         } = ctx;
 
         validate(&profile).map_err(|e| LinkError::Fatal(e.to_string()))?;
@@ -1679,6 +1726,29 @@ mod tests {
             classify_openssh(OpenSshError::ProcessExited("exit 255".into())),
             LinkError::Transient { .. }
         ));
+    }
+
+    #[test]
+    fn remote_listener_info_names_roles_by_configured_port() {
+        let cfg = conduit_core::ReverseConfig {
+            reverse_http_port: 8080,
+            reverse_socks_port: 1080,
+            ..conduit_core::ReverseConfig::default()
+        };
+        let forward = |remote: &str| ReverseForward {
+            remote: remote.parse().unwrap(),
+            local: "127.0.0.1:50000".parse().unwrap(),
+        };
+        let forwards = [forward("127.0.0.1:8080"), forward("127.0.0.1:1080")];
+        let bound = [("127.0.0.1".to_string(), 8080), ("127.0.0.1".to_string(), 1080)];
+        let info = remote_listener_info(&cfg, &forwards, &bound);
+        assert_eq!(info[0].role, "HTTP/HTTPS");
+        assert_eq!(info[0].addr, "127.0.0.1:8080".parse().unwrap());
+        assert_eq!(info[1].role, "SOCKS4/4a/5");
+
+        let mux = conduit_core::ReverseConfig { reverse_socks_port: 8080, ..cfg };
+        let info = remote_listener_info(&mux, &forwards[..1], &bound[..1]);
+        assert_eq!(info[0].role, "multiplexed HTTP/HTTPS + SOCKS4/4a/5");
     }
 
     #[test]

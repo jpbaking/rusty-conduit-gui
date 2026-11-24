@@ -429,6 +429,12 @@ fn concurrent_sessions_stay_isolated() {
         assert_eq!(reverse_stats.total_connections, 0);
         assert_eq!(reverse_stats.bytes_received, 0);
         assert_eq!(f.manager.snapshot(forward_id).unwrap().listeners.len(), 2);
+        assert!(f.manager.snapshot(forward_id).unwrap().remote_listeners.is_empty());
+        // The reverse proxy reports the one multiplexed port it bound on the target host.
+        let remote = f.manager.snapshot(reverse_id).unwrap().remote_listeners;
+        assert_eq!(remote.len(), 1, "remote listeners: {remote:?}");
+        assert_eq!(remote[0].role, "multiplexed HTTP/HTTPS + SOCKS4/4a/5");
+        assert_eq!(remote[0].addr.port(), remote_port);
 
         // Stopping flushes the access logs into each session's own ring buffer.
         f.manager.stop_all().await;

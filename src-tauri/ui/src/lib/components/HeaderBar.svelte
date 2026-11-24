@@ -28,6 +28,9 @@
   {:else if store.isNew}
     <span class="pill idle">Not saved</span>
   {/if}
+  {#if store.selected && !store.selected.profile.enabled}
+    <span class="pill idle" title="Not included in Start All or autostart">Disabled</span>
+  {/if}
 
   <dl class="stats" aria-label="Live statistics">
     <div><dt>Conns</dt><dd>{runtime?.stats.active_connections ?? 0}</dd></div>

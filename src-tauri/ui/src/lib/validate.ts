@@ -287,6 +287,10 @@ export function sessionErrors(profile: SessionProfile): FieldErrors {
   if (!Number.isSafeInteger(forward.max_connections) || forward.max_connections < 0) {
     errors["forward.max_connections"] = "Use a whole number. 0 means unlimited.";
   }
+  const reverseCap = reverse.reverse_max_connections;
+  if (reverseCap !== null && (!Number.isSafeInteger(reverseCap) || reverseCap < 0)) {
+    errors["reverse.max_connections"] = "Use a whole number. 0 means unlimited.";
+  }
   if (Object.values(ports).every((port) => port === 0)) {
     errors.listeners = "Enable at least one forward or reverse port.";
   }

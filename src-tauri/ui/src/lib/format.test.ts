@@ -8,6 +8,7 @@ import {
   isActive,
   logLevel,
   passesLevel,
+  proxyUrls,
   stateReason,
   statusOf,
 } from "./format.ts";
@@ -85,6 +86,26 @@ describe("stateReason", () => {
     assert.equal(stateReason(states.failed), "Auth failed");
     assert.equal(stateReason(states.connected), null);
     assert.equal(stateReason(states.stopped), null);
+  });
+});
+
+describe("proxyUrls", () => {
+  test("maps each listener role to client URLs", () => {
+    assert.deepEqual(proxyUrls({ role: "HTTP/HTTPS", addr: "127.0.0.1:3128" }), [
+      { label: "HTTP", url: "http://127.0.0.1:3128" },
+    ]);
+    assert.deepEqual(proxyUrls({ role: "SOCKS4/4a/5", addr: "127.0.0.1:1080" }), [
+      { label: "SOCKS", url: "socks5h://127.0.0.1:1080" },
+    ]);
+    assert.deepEqual(proxyUrls({ role: "multiplexed HTTP/HTTPS + SOCKS4/4a/5", addr: "127.0.0.1:8080" }), [
+      { label: "HTTP", url: "http://127.0.0.1:8080" },
+      { label: "SOCKS", url: "socks5h://127.0.0.1:8080" },
+    ]);
+  });
+
+  test("points wildcard binds at loopback", () => {
+    assert.equal(proxyUrls({ role: "HTTP/HTTPS", addr: "0.0.0.0:3128" })[0]?.url, "http://127.0.0.1:3128");
+    assert.equal(proxyUrls({ role: "SOCKS4/4a/5", addr: "[::]:1080" })[0]?.url, "socks5h://[::1]:1080");
   });
 });
 

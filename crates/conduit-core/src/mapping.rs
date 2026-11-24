@@ -114,6 +114,10 @@ pub fn to_config(
         reverse_bind: profile.reverse.reverse_bind,
         reverse_http_port: profile.reverse.reverse_http_port,
         reverse_socks_port: profile.reverse.reverse_socks_port,
+        reverse_max_connections: profile
+            .reverse
+            .reverse_max_connections
+            .unwrap_or(profile.forward.max_connections),
         reverse_allow,
         reverse_block,
         mitm_ca_cert,
@@ -222,6 +226,24 @@ mod tests {
         assert_eq!(cfg.socks_port, 1080);
         assert_eq!(cfg.ssh_ip_version, SshIpVersion::V4);
         assert_eq!(p.engine, SshEngine::Russh);
+    }
+
+    #[test]
+    fn reverse_cap_follows_forward_cap_unless_set() {
+        let mut p = profile();
+        p.forward.max_connections = 100;
+        assert_eq!(to_config(&p, None).unwrap().reverse_max_connections, 100);
+        p.reverse.reverse_max_connections = Some(5);
+        let cfg = to_config(&p, None).unwrap();
+        assert_eq!((cfg.max_connections, cfg.reverse_max_connections), (100, 5));
+        p.reverse.reverse_max_connections = Some(0);
+        assert_eq!(to_config(&p, None).unwrap().reverse_max_connections, 0);
+    }
+
+    #[test]
+    fn reverse_cap_is_optional_in_saved_profiles() {
+        let reverse: ReverseConfig = serde_json::from_str(r#"{"reverse_http_port":8080}"#).unwrap();
+        assert_eq!(reverse.reverse_max_connections, None);
     }
 
     #[test]

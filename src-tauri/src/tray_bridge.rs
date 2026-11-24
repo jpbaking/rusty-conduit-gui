@@ -216,10 +216,14 @@ impl TrayBackend for NoTrayBackend {
 
 #[cfg(target_os = "linux")]
 fn platform_backend<R: Runtime>(
-    _app: &AppHandle<R>,
+    app: &AppHandle<R>,
     initial: TrayMenuModel,
 ) -> Result<Arc<dyn TrayBackend>, String> {
-    conduit_tray::KsniTrayBackend::spawn(initial)
+    // The app logo, already decoded by Tauri, so the tray needs no image decoder of its own.
+    let icon = app.default_window_icon().and_then(|icon| {
+        conduit_tray::TrayImage::new(icon.width(), icon.height(), icon.rgba().to_vec())
+    });
+    conduit_tray::KsniTrayBackend::spawn(initial, icon)
         .map(|backend| Arc::new(backend) as Arc<dyn TrayBackend>)
         .map_err(|error| error.to_string())
 }

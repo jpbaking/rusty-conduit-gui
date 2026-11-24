@@ -6,11 +6,11 @@ use std::sync::Arc;
 
 use conduit_core::{
     parse_openssh_known_hosts_for_host, validate, AppConfig, AuthMethod, HostKeyEntry, HostKeyLookup,
-    HostKeyRecord, HostProfile, SessionProfile, Timestamp,
+    HopEntry, HostKeyRecord, HostProfile, SessionProfile, Timestamp,
 };
-use conduit_runtime::{LogLine, SessionSnapshot};
+use conduit_runtime::{HostKeyPrompt, LogLine, SessionSnapshot};
 use conduit_ssh::{
-    test_chain, ChainOptions, ChannelPolicy, HopAuth, HopSpec, HopStatus, HostKeyVerifier,
+    test_chain, ChainOptions, ChannelPolicy, HopAuth, HopSpec, HopStatus, HostKeyVerifier, SshError,
 };
 use conduit_vault::{Vault, VaultError};
 use serde::Serialize;
@@ -43,10 +43,12 @@ pub struct HopTestResult {
     pub hop_id: String,
     pub host: String,
     pub port: u16,
-    /// `connected` | `failed` | `not_attempted`.
+    /// `connected` | `failed` | `host_key_unknown` | `not_attempted`.
     pub status: &'static str,
     pub error: Option<String>,
     pub elapsed_ms: u64,
+    /// The key the hop presented, when it is not pinned yet. The user may trust it, then retest.
+    pub host_key: Option<HostKeyPrompt>,
 }
 
 /// Result of probing a session's chain prefix by prefix.
@@ -209,14 +211,89 @@ impl AppController {
         Ok(saved)
     }
 
-    /// Stops a session and removes it.
+    /// Stops a session and removes it, with the host-key pins only its hops used.
     pub async fn delete_session(&self, id: Uuid) -> Result<(), AppError> {
-        self.session_profile(id)?;
+        let profile = self.session_profile(id)?;
         self.manager().remove_profile(id).await?;
-        self.mutate_config(|config| {
+        let remaining = self.mutate_config(|config| {
             config.sessions.retain(|s| s.id != id);
-            Ok(())
-        })
+            Ok(config.sessions.clone())
+        })?;
+        // Older configs may share a hop id between sessions; such a pin is still in use.
+        let in_use: HashSet<&str> = remaining
+            .iter()
+            .flat_map(|s| s.hops.iter().map(|h| h.hop_id.as_str()))
+            .collect();
+        let orphaned: HashSet<&str> = profile
+            .hops
+            .iter()
+            .map(|h| h.hop_id.as_str())
+            .filter(|hop_id| !in_use.contains(hop_id))
+            .collect();
+        let removed = {
+            let mut store = self
+                .known_hosts()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let before = store.entries.len();
+            store.entries.retain(|e| !orphaned.contains(e.key.hop_id.as_str()));
+            store.entries.len() != before
+        };
+        if removed {
+            self.persist_known_hosts()?;
+        }
+        Ok(())
+    }
+
+    /// Saves a copy of a saved session, named "<name> (copy)" and not started with the app.
+    ///
+    /// Hops get new ids, because a hop id keys its host-key pin, and each trusted pin is copied
+    /// to the new hop so the copy connects without asking again. Saved passwords and the MITM
+    /// passphrase are shared by reference; replacing either always writes a new record.
+    pub fn duplicate_session(&self, id: Uuid) -> Result<SessionProfile, AppError> {
+        let mut copy = self.session_profile(id)?;
+        copy.id = Uuid::nil();
+        copy.name = format!("{} (copy)", copy.name.trim());
+        copy.autostart = false;
+        let renamed: Vec<(String, HopEntry)> = copy
+            .hops
+            .iter_mut()
+            .map(|hop| {
+                let old = std::mem::replace(&mut hop.hop_id, Uuid::new_v4().to_string());
+                (old, hop.clone())
+            })
+            .collect();
+        let saved = self.upsert_session(copy)?;
+
+        let copied = {
+            let mut store = self
+                .known_hosts()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let pins: Vec<HostKeyEntry> = renamed
+                .iter()
+                .filter_map(|(old, hop)| {
+                    let record = store.get(old, &hop.host.host, hop.host.port)?;
+                    record.approved.then(|| HostKeyEntry {
+                        key: HostKeyLookup {
+                            hop_id: hop.hop_id.clone(),
+                            host: hop.host.host.clone(),
+                            port: hop.host.port,
+                        },
+                        record: record.clone(),
+                    })
+                })
+                .collect();
+            let copied = !pins.is_empty();
+            for pin in pins {
+                store.insert(pin.key, pin.record);
+            }
+            copied
+        };
+        if copied {
+            self.persist_known_hosts()?;
+        }
+        Ok(saved)
     }
 
     pub fn list_hosts(&self) -> Vec<HostProfile> {
@@ -427,8 +504,10 @@ impl AppController {
         Ok(entry)
     }
 
-    /// Probes the chain hop by hop. Never pins a key: an unknown key is a failed hop.
+    /// Probes the chain hop by hop. Never pins a key by itself: an unknown key stops the test,
+    /// and is kept so [`Self::trust_tested_host_key`] can pin exactly that key if the user agrees.
     pub async fn test_session_chain(&self, id: Uuid) -> Result<ChainTestResult, AppError> {
+        self.tested_host_keys().remove(&id);
         let profile = self.session_profile(id)?;
         validate(&profile)?;
         let options = ChainOptions::from_tunnel(&profile.tunnel)
@@ -439,14 +518,21 @@ impl AppController {
         let report = test_chain(&hops, &verifier, &options).await;
         drop(hops);
         let all_connected = report.all_connected();
+        let mut unknown_key = None;
         let hops = report
             .hops
             .into_iter()
             .map(|hop| {
-                let (status, error) = match hop.status {
-                    HopStatus::Connected => ("connected", None),
-                    HopStatus::Failed(error) => ("failed", Some(error.to_string())),
-                    HopStatus::NotAttempted => ("not_attempted", None),
+                let (status, error, host_key) = match hop.status {
+                    HopStatus::Connected => ("connected", None, None),
+                    HopStatus::Failed(error) => match unknown_host_key(&error) {
+                        Some(prompt) => {
+                            unknown_key = Some(prompt.clone());
+                            ("host_key_unknown", Some(error.to_string()), Some(prompt))
+                        }
+                        None => ("failed", Some(error.to_string()), None),
+                    },
+                    HopStatus::NotAttempted => ("not_attempted", None, None),
                 };
                 HopTestResult {
                     hop_index: hop.hop_index,
@@ -456,11 +542,76 @@ impl AppController {
                     status,
                     error,
                     elapsed_ms: u64::try_from(hop.elapsed.as_millis()).unwrap_or(u64::MAX),
+                    host_key,
                 }
             })
             .collect();
+        if let Some(prompt) = unknown_key {
+            self.tested_host_keys().insert(id, prompt);
+        }
         Ok(ChainTestResult { session_id: id, all_connected, hops })
     }
+
+    /// Pins the unknown key the latest chain test of `id` saw, and saves it.
+    ///
+    /// `sha256` must be the fingerprint the user saw. A pin that already holds a different key
+    /// is never replaced here: the user resets it explicitly first.
+    pub fn trust_tested_host_key(&self, id: Uuid, sha256: &str) -> Result<HostKeyEntry, AppError> {
+        let prompt = {
+            let mut tested = self.tested_host_keys();
+            match tested.get(&id) {
+                None => return Err(not_found("tested host key", id)),
+                Some(prompt) if prompt.sha256 != sha256 => {
+                    return Err(AppError::Invalid(
+                        "the host key changed since it was shown; test the chain again".into(),
+                    ));
+                }
+                Some(_) => tested.remove(&id).expect("checked above"),
+            }
+        };
+        let key = HostKeyLookup { hop_id: prompt.hop_id, host: prompt.host, port: prompt.port };
+        let record = {
+            let mut store = self
+                .known_hosts()
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let existing = store.get(&key.hop_id, &key.host, key.port);
+            if existing.is_some_and(|pin| pin.fingerprint_sha256 != prompt.sha256) {
+                return Err(AppError::Invalid(
+                    "this hop already has a different pinned key; reset it first".into(),
+                ));
+            }
+            let record = HostKeyRecord {
+                algorithm: prompt.algorithm,
+                fingerprint_sha256: prompt.sha256,
+                first_seen: existing.map_or_else(Timestamp::now, |pin| pin.first_seen),
+                approved: true,
+                public_key_openssh: prompt.public_key_openssh,
+            };
+            store.insert(key.clone(), record.clone());
+            record
+        };
+        self.persist_known_hosts()?;
+        Ok(HostKeyEntry { key, record })
+    }
+}
+
+/// The prompt for a hop that failed only because its key is not trusted yet.
+fn unknown_host_key(error: &SshError) -> Option<HostKeyPrompt> {
+    let SshError::HostKeyUnknown { hop_index, hop_id, host, port, algorithm, sha256, public_key_openssh } =
+        error
+    else {
+        return None;
+    };
+    Some(HostKeyPrompt {
+        hop_index: *hop_index,
+        hop_id: hop_id.clone(),
+        host: host.clone(),
+        port: *port,
+        algorithm: algorithm.clone(),
+        sha256: sha256.clone(),
+        public_key_openssh: public_key_openssh.clone(),
+    })
 }
 
 #[cfg(test)]
@@ -621,6 +772,65 @@ mod tests {
         assert!(matches!(c.upsert_session(dangling_secret), Err(AppError::NotFound { .. })));
 
         assert!(c.list_sessions().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sessions_duplicate_copies_settings_pins_and_secret_refs() {
+        let dir = TempDir::new();
+        let c = unlocked(&dir).await;
+        let secret = c.set_password_secret(None, SecretInput::new("pw")).unwrap().secret_ref;
+        let mut original = profile("work", 2222);
+        original.autostart = true;
+        original.hops[0].host.auth = vec![AuthMethod::Password { secret: secret.clone() }];
+        let original = c.upsert_session(original).unwrap();
+        let fake = "SHA256:original".to_string();
+        trust(&c, "hop-0", 2222, &fake);
+
+        let copy = c.duplicate_session(original.id).unwrap();
+        assert_ne!(copy.id, original.id);
+        assert_eq!(copy.name, "work (copy)");
+        assert!(!copy.autostart, "a copy must not start with the app beside the original");
+        assert_eq!(copy.forward, original.forward);
+        assert_eq!(copy.hops[0].host.auth, vec![AuthMethod::Password { secret }]);
+        let new_hop = copy.hops[0].hop_id.clone();
+        assert_ne!(new_hop, "hop-0", "hop ids key pins, so they must not be shared");
+
+        let store = c.known_hosts().read().unwrap().clone();
+        assert_eq!(store.get(&new_hop, "127.0.0.1", 2222).unwrap().fingerprint_sha256, fake);
+        assert!(store.get("hop-0", "127.0.0.1", 2222).is_some(), "the original keeps its pin");
+        assert_eq!(c.list_sessions().unwrap().len(), 2);
+        assert!(matches!(c.duplicate_session(Uuid::new_v4()), Err(AppError::NotFound { .. })));
+    }
+
+    #[tokio::test]
+    async fn sessions_delete_removes_only_its_own_pins() {
+        let dir = TempDir::new();
+        let c = controller(&dir);
+        let gone = c.upsert_session(profile("gone", 2222)).unwrap();
+        let mut kept = profile("kept", 2223);
+        kept.hops[0].hop_id = "hop-kept".into();
+        let kept = c.upsert_session(kept).unwrap();
+        trust(&c, "hop-0", 2222, "SHA256:gone");
+        trust(&c, "hop-kept", 2223, "SHA256:kept");
+
+        c.delete_session(gone.id).await.unwrap();
+        let store = c.known_hosts().read().unwrap().clone();
+        assert!(store.get("hop-0", "127.0.0.1", 2222).is_none());
+        assert!(store.get("hop-kept", "127.0.0.1", 2223).is_some());
+        assert_eq!(c.list_sessions().unwrap()[0].profile.id, kept.id);
+    }
+
+    fn trust(c: &AppController, hop_id: &str, port: u16, fingerprint: &str) {
+        c.known_hosts().write().unwrap().insert(
+            HostKeyLookup { hop_id: hop_id.into(), host: "127.0.0.1".into(), port },
+            HostKeyRecord {
+                algorithm: "ssh-ed25519".into(),
+                fingerprint_sha256: fingerprint.into(),
+                public_key_openssh: None,
+                first_seen: Timestamp(1),
+                approved: true,
+            },
+        );
     }
 
     #[tokio::test]
@@ -843,20 +1053,37 @@ mod tests {
         session.hops = vec![hop("hop-0", node.port, auth.clone()), hop("hop-1", node.port, auth)];
         let session = c.upsert_session(session).unwrap();
 
-        // Unknown key: the first hop fails, the second is not attempted, and nothing is pinned.
+        // Unknown key: the first hop stops with the key it saw, the second is not attempted, and
+        // nothing is pinned until the user trusts it.
         let report = c.test_session_chain(session.id).await.unwrap();
         assert!(!report.all_connected);
-        assert_eq!(report.hops[0].status, "failed");
+        assert_eq!(report.hops[0].status, "host_key_unknown");
         assert!(report.hops[0].error.as_deref().unwrap().contains("unknown host key"));
+        let seen = report.hops[0].host_key.clone().expect("the unknown key is reported");
+        assert_eq!(seen.hop_id, "hop-0");
+        assert_eq!(seen.sha256, node.fingerprint());
         assert_eq!(report.hops[1].status, "not_attempted");
         assert_eq!(report.hops[1].elapsed_ms, 0);
         assert!(c.known_hosts().read().unwrap().entries.is_empty());
 
-        // Only hop 0 pinned: the failure moves to hop 1.
-        pin(&c, "hop-0", &node);
+        // Only the fingerprint that was shown can be trusted.
+        assert!(matches!(
+            c.trust_tested_host_key(session.id, "SHA256:something-else"),
+            Err(AppError::Invalid(_))
+        ));
+        assert!(c.known_hosts().read().unwrap().entries.is_empty());
+
+        // Trusting hop 0 pins it, so the test moves on to hop 1's unknown key.
+        let entry = c.trust_tested_host_key(session.id, &seen.sha256).unwrap();
+        assert!(entry.record.approved);
+        assert_eq!(entry.key.hop_id, "hop-0");
+        assert!(matches!(
+            c.trust_tested_host_key(session.id, &seen.sha256),
+            Err(AppError::NotFound { .. })
+        ));
         let report = c.test_session_chain(session.id).await.unwrap();
         assert_eq!(report.hops[0].status, "connected");
-        assert_eq!(report.hops[1].status, "failed");
+        assert_eq!(report.hops[1].status, "host_key_unknown");
 
         pin(&c, "hop-1", &node);
         let report = c.test_session_chain(session.id).await.unwrap();

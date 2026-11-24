@@ -7,11 +7,13 @@
 use conduit_core as _;
 
 pub mod backend;
+pub mod image;
 #[cfg(target_os = "linux")]
 pub mod linux_ksni;
 pub mod model;
 
 pub use backend::{MockTrayBackend, TrayBackend, TrayError};
+pub use image::TrayImage;
 #[cfg(target_os = "linux")]
 pub use linux_ksni::KsniTrayBackend;
 pub use model::{

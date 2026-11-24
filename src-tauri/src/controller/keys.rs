@@ -440,6 +440,8 @@ impl AppController {
             }
         };
         self.sync_profiles([updated]);
+        // A duplicated session may still use the old record.
+        let previous = previous.filter(|old| usage_is_empty(&secret_usage(&self.config_snapshot(), old)));
         if let Some(previous) = previous {
             match self.vault_write().delete_secret(&previous.to_string()) {
                 Ok(()) | Err(VaultError::SecretNotFound { .. }) => {}
@@ -887,6 +889,22 @@ mod tests {
             c.set_mitm_passphrase(Uuid::new_v4(), SecretInput::new("x")),
             Err(AppError::NotFound { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn keys_mitm_passphrase_replace_keeps_a_record_another_session_uses() {
+        let dir = TempDir::new();
+        let c = unlocked(&dir).await;
+        let id = mitm_session(&c);
+        let shared = c.set_mitm_passphrase(id, SecretInput::new("one")).unwrap().secret_ref;
+        let copy = c.duplicate_session(id).unwrap();
+        assert_eq!(copy.mitm.as_ref().unwrap().passphrase.as_ref(), Some(&shared));
+
+        c.set_mitm_passphrase(id, SecretInput::new("two")).unwrap();
+        assert!(
+            c.vault_read().get_secret(&shared.to_string()).is_ok(),
+            "the copy still uses the old passphrase record"
+        );
     }
 
     #[tokio::test]

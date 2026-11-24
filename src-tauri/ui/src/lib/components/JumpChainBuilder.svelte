@@ -1,34 +1,29 @@
 <script lang="ts">
   import { tick } from "svelte";
-  import { hopBadge, hopRole, hopTitle, moved, newHop, NIL_UUID } from "../chain";
+  import { hopBadge, hopRole, hopTitle, moved, newHop } from "../chain";
   import { store } from "../stores.svelte";
   import type { HopEntry } from "../types";
-  import ModalDialog from "./ModalDialog.svelte";
 
   const hops = $derived(store.draft?.hops ?? []);
   const selected = $derived(store.selectedHop);
   const results = $derived(new Map((store.chainResult?.hops ?? []).map((r) => [r.hop_id, r])));
-  const failed = $derived(store.chainResult?.hops.find((r) => r.status === "failed") ?? null);
-  const linkedProfile = $derived(
-    selected ? (store.hosts.find((h) => h.id === selected.host.id) ?? null) : null,
+  // Only one hop's form shows at a time, so the route marks the others that have errors.
+  const invalidHops = $derived(
+    new Set(
+      Object.keys(store.draftErrors).flatMap((field) => {
+        const match = /^hop:([^:]+):/.exec(field);
+        return match ? [match[1]] : [];
+      }),
+    ),
   );
-
-  // A hop can only be promoted once it is saved, because the backend reads the saved session.
-  const promoteBlocker = $derived.by(() => {
-    if (!selected) return "Select a hop first.";
-    if (linkedProfile) return "This hop already uses a host profile.";
-    if (store.dirty || !store.selected) return "Save the session first.";
-    if (!selected.host.host.trim() || !selected.host.user.trim()) return "Enter a host and user first.";
-    return null;
-  });
+  const failed = $derived(
+    store.chainResult?.hops.find((r) => r.status === "failed" || r.status === "host_key_unknown") ?? null,
+  );
 
   let list = $state<HTMLOListElement>();
   let dragId = $state<string | null>(null);
   let dropIndex = $state<number | null>(null);
   let announcement = $state("");
-  let promoteName = $state("");
-  let promoting = $state(false);
-  let promoteOpen = $state(false);
 
   function setHops(edit: (current: HopEntry[]) => HopEntry[]) {
     store.updateDraft((profile) => ({ ...profile, hops: edit(profile.hops) }));
@@ -83,10 +78,7 @@
     let best = Infinity;
     list.querySelectorAll<HTMLElement>("[data-hop]").forEach((node, index) => {
       const box = node.getBoundingClientRect();
-      const distance = Math.hypot(
-        event.clientX - (box.left + box.width / 2),
-        event.clientY - (box.top + box.height / 2),
-      );
+      const distance = Math.abs(event.clientY - (box.top + box.height / 2));
       if (distance < best) {
         best = distance;
         dropIndex = index;
@@ -101,56 +93,33 @@
     dropIndex = null;
     if (commit && hop && to !== null) moveTo(hop, to);
   }
-
-  function applyProfile(id: string) {
-    const hop = selected;
-    if (!hop) return;
-    const profile = store.hosts.find((h) => h.id === id);
-    setHops((current) =>
-      current.map((h) => {
-        if (h.hop_id !== hop.hop_id) return h;
-        // Choosing "Inline" keeps the values and only removes the link.
-        return profile
-          ? { ...h, name: profile.name, host: profile }
-          : { ...h, host: { ...h.host, id: NIL_UUID } };
-      }),
-    );
-  }
-
-  function openPromote() {
-    promoteName = selected ? hopTitle(selected) : "";
-    promoteOpen = true;
-  }
-
-  async function promote() {
-    const name = promoteName.trim();
-    if (!selected || !name || promoting) return;
-    promoting = true;
-    const done = await store.promoteHop(selected.hop_id, name);
-    promoting = false;
-    if (done) promoteOpen = false;
-  }
 </script>
 
 <svelte:window onkeydown={(e) => e.key === "Escape" && dragId && endDrag(false)} />
 
-<section aria-labelledby="chain-heading">
-  <h2 id="chain-heading">Jump chain</h2>
+<section class="route" aria-labelledby="chain-heading">
+  <h2 id="chain-heading">Route</h2>
 
-  <ol class="chain-builder" bind:this={list} aria-label="Jump chain, from local to target">
-    <li class="chain-local">Local</li>
+  <ol class="route-list" bind:this={list} aria-label="Jump chain, from local to target">
+    <li class="route-stop route-local">
+      <span class="route-dot" aria-hidden="true"></span>
+      <span class="route-text"><span class="hop-name">Local</span><small>this computer</small></span>
+    </li>
     {#each hops as hop, index (hop.hop_id)}
       {@const result = results.get(hop.hop_id)}
       {@const badge = result ? hopBadge(result) : null}
+      {@const isTarget = index === hops.length - 1}
       <li
-        class="chain-node"
+        class="route-stop route-node"
+        class:target={isTarget}
+        class:invalid={invalidHops.has(hop.hop_id)}
         class:selected={selected?.hop_id === hop.hop_id}
         class:dragging={dragId === hop.hop_id}
         class:drop-target={dragId !== null && dropIndex === index && dragId !== hop.hop_id}
         data-hop={hop.hop_id}
       >
         <button
-          class="drag-handle"
+          class="route-dot drag-handle"
           tabindex="-1"
           aria-label="Drag {hopTitle(hop)} to reorder"
           title="Drag to reorder"
@@ -158,38 +127,41 @@
           onpointermove={onDragMove}
           onpointerup={() => endDrag(true)}
           onpointercancel={() => endDrag(false)}
-        >⠿</button>
+        ></button>
         <button
           class="hop-select"
           aria-pressed={selected?.hop_id === hop.hop_id}
           onclick={() => (store.selectedHopId = hop.hop_id)}
         >
-          <small>{hopRole(index, hops.length)}</small>
+          <small class="hop-role">
+            {hopRole(index, hops.length)}
+            {#if badge && result}
+              <span class="hop-badge {badge.tone}" title={badge.label}>
+                <span aria-hidden="true">{badge.glyph}</span>
+                {#if result.status === "connected"}{result.elapsed_ms} ms{/if}
+                <span class="sr-only">{badge.label}</span>
+              </span>
+            {/if}
+          </small>
           <span class="hop-name">{hopTitle(hop)}</span>
-          {#if hop.host.host}<small>{hop.host.host}:{hop.host.port}</small>{/if}
+          {#if invalidHops.has(hop.hop_id)}<span class="sr-only">, needs attention</span>{/if}
+          <small class="hop-addr">{hop.host.host ? `${hop.host.host}:${hop.host.port}` : "not set"}</small>
         </button>
-        {#if badge && result}
-          <span class="hop-badge {badge.tone}" title={badge.label}>
-            <span aria-hidden="true">{badge.glyph}</span>
-            {#if result.status === "connected"}{result.elapsed_ms} ms{/if}
-            <span class="sr-only">{badge.label}</span>
-          </span>
-        {/if}
         <span class="hop-actions">
           <button
             class="icon move-back"
             aria-label="Move {hopTitle(hop)} earlier"
-            title="Move earlier"
+            title="Move up"
             disabled={index === 0}
             onclick={() => moveByKey(hop, index, -1)}
-          >←</button>
+          >↑</button>
           <button
             class="icon move-forward"
             aria-label="Move {hopTitle(hop)} later"
-            title="Move later"
+            title="Move down"
             disabled={index === hops.length - 1}
             onclick={() => moveByKey(hop, index, 1)}
-          >→</button>
+          >↓</button>
           <button
             class="icon"
             aria-label="Remove {hopTitle(hop)}"
@@ -202,46 +174,18 @@
   </ol>
   <p class="sr-only" role="status">{announcement}</p>
 
-  {#if failed}
+  <button class="route-add" onclick={addJump}>{hops.length === 0 ? "+ Add target" : "+ Add jump"}</button>
+
+  {#if failed?.status === "host_key_unknown"}
+    <p class="reason" role="alert">
+      Hop {failed.hop_index + 1} ({failed.host}:{failed.port}): host key not trusted.
+      <button class="link-button" onclick={() => store.testSelected()}>Review again</button>
+    </p>
+  {:else if failed}
     <p class="reason" role="alert">
       Hop {failed.hop_index + 1} ({failed.host}:{failed.port}) failed: {failed.error ?? "unknown error"}
     </p>
   {:else if store.chainResult?.all_connected}
     <p class="ok" role="status">All hops connected.</p>
   {/if}
-
-  <div class="chain-toolbar">
-    <button onclick={addJump}>{hops.length === 0 ? "+ Add Target" : "+ Add Jump"}</button>
-    <label class="field-inline">
-      Host profile
-      <select
-        disabled={!selected}
-        value={linkedProfile?.id ?? ""}
-        onchange={(e) => applyProfile(e.currentTarget.value)}
-      >
-        <option value="">Inline (no profile)</option>
-        {#each store.hosts as host (host.id)}
-          <option value={host.id}>{host.name} ({host.user}@{host.host}:{host.port})</option>
-        {/each}
-      </select>
-    </label>
-    <button disabled={promoteBlocker !== null} title={promoteBlocker ?? undefined} onclick={openPromote}>
-      Save as Profile
-    </button>
-  </div>
 </section>
-
-{#if promoteOpen}
-  <ModalDialog title="Save as Host Profile" onDismiss={() => (promoteOpen = false)}>
-    <label class="field">
-      Profile name
-      <input bind:value={promoteName} />
-    </label>
-    {#snippet actions()}
-      <button onclick={() => (promoteOpen = false)}>Cancel</button>
-      <button class="primary" disabled={!promoteName.trim() || promoting} onclick={promote}>
-        {promoting ? "Saving…" : "Save"}
-      </button>
-    {/snippet}
-  </ModalDialog>
-{/if}

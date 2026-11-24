@@ -1,6 +1,6 @@
 // Pure display helpers shared by the shell components.
 
-import type { SessionState } from "./types";
+import type { ListenerInfo, SessionState } from "./types";
 
 export type StatusTone = "ok" | "busy" | "alert" | "idle";
 
@@ -36,6 +36,28 @@ export function statusOf(state: SessionState): StatusDisplay {
 /** True while a supervisor is running, so the session can be stopped. */
 export function isActive(state: SessionState): boolean {
   return !["stopped", "locked", "needs_attention", "failed"].includes(state.state);
+}
+
+export interface ProxyUrl {
+  label: "HTTP" | "SOCKS";
+  url: string;
+}
+
+// A wildcard bind address is not something a client can connect to.
+function clientAddr(addr: string): string {
+  if (addr.startsWith("0.0.0.0:")) return `127.0.0.1:${addr.slice("0.0.0.0:".length)}`;
+  if (addr.startsWith("[::]:")) return `[::1]:${addr.slice("[::]:".length)}`;
+  return addr;
+}
+
+/** Proxy URLs a client can use for a listener, matching the tray. SOCKS is `socks5h://` so DNS stays remote. */
+export function proxyUrls(listener: ListenerInfo): ProxyUrl[] {
+  const addr = clientAddr(listener.addr);
+  const role = listener.role.toLowerCase();
+  const urls: ProxyUrl[] = [];
+  if (role.includes("http")) urls.push({ label: "HTTP", url: `http://${addr}` });
+  if (role.includes("socks")) urls.push({ label: "SOCKS", url: `socks5h://${addr}` });
+  return urls;
 }
 
 export function stateReason(state: SessionState): string | null {

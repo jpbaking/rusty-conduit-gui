@@ -95,7 +95,7 @@
   }
 </script>
 
-<section aria-labelledby={`${uid}-logging`}>
+<section class="card" aria-labelledby={`${uid}-logging`}>
   <h2 id={`${uid}-logging`}>Logging</h2>
   <div class="field-row">
     <div class="field grow">
@@ -119,7 +119,7 @@
   </div>
   <div class="field-row">
     <label class="field grow">
-      HTTP access log file <small class="muted">optional</small>
+      <span>HTTP access log file <small class="muted">optional</small></span>
       <input
         value={logging.http_access_log ?? ""}
         spellcheck="false"
@@ -127,7 +127,7 @@
       />
     </label>
     <label class="field grow">
-      SOCKS log file <small class="muted">optional</small>
+      <span>SOCKS log file <small class="muted">optional</small></span>
       <input
         value={logging.socks_log ?? ""}
         spellcheck="false"
@@ -137,8 +137,17 @@
   </div>
 </section>
 
-<section aria-labelledby={`${uid}-openssh`}>
-  <h2 id={`${uid}-openssh`}>OpenSSH only <small class="muted">used when the engine is OpenSSH</small></h2>
+<section class="card" class:inactive={!usesOpenssh} aria-labelledby={`${uid}-openssh`}>
+  <h2 id={`${uid}-openssh`}>OpenSSH engine</h2>
+  {#if !usesOpenssh}
+    <p class="note">
+      Not used: this session runs on the built-in Rust SSH engine. Choose OpenSSH as the engine on
+      the Connection tab to edit these settings.
+    </p>
+  {/if}
+  <!-- A disabled fieldset turns off every control inside it, buttons included. -->
+  <fieldset class="card-body" disabled={!usesOpenssh}>
+  <legend class="sr-only">OpenSSH engine settings</legend>
   <div class="field-row">
     <div class="field grow">
       <label for={`${uid}-ssh-bin`}>ssh program</label>
@@ -197,7 +206,7 @@
   </div>
 
   <label class="field">
-    Extra arguments <small class="muted">one per line, passed to ssh as written</small>
+    <span>Extra arguments <small class="muted">one per line, passed to ssh as written</small></span>
     <textarea
       class="code-text"
       bind:value={argsText}
@@ -219,7 +228,8 @@
   {/each}
 
   <div class="field">
-    Command preview <small class="muted">values are hidden</small>
+    <span>Command preview <small class="muted">values are hidden</small></span>
     <code class="command-preview">{preview}</code>
   </div>
+  </fieldset>
 </section>

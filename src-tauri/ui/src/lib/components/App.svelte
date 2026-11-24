@@ -85,9 +85,9 @@
 
 {#if store.showUnlock}
   <VaultUnlockModal />
-{:else if store.pendingHostKey}
-  {@const pending = store.pendingHostKey}
-  {#key `${pending.sessionId}:${pending.prompt.hop_id}:${pending.prompt.sha256}`}
+{:else if store.pendingHostKey ?? store.testHostKey}
+  {@const pending = (store.pendingHostKey ?? store.testHostKey)!}
+  {#key `${pending.source}:${pending.sessionId}:${pending.prompt.hop_id}:${pending.prompt.sha256}`}
     <HostKeyModal {pending} />
   {/key}
 {/if}

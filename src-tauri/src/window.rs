@@ -185,6 +185,9 @@ fn set_dock_visible<R: Runtime>(app: &AppHandle<R>, visible: bool) {
 #[cfg(not(target_os = "macos"))]
 fn set_dock_visible<R: Runtime>(_app: &AppHandle<R>, _visible: bool) {}
 
+/// Logical width and height of the Manage Window. The UI is laid out for exactly this size.
+const MANAGE_WINDOW_SIZE: (f64, f64) = (1100.0, 720.0);
+
 /// Focuses the Manage Window, creating it if needed. Do not call from a synchronous command,
 /// where creating a window can deadlock on Windows.
 pub fn open_or_focus_manage_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
@@ -200,8 +203,10 @@ pub fn open_or_focus_manage_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Res
     set_dock_visible(app, true);
     let built = WebviewWindowBuilder::new(app, MAIN_WINDOW, WebviewUrl::App("index.html".into()))
         .title(conduit_tray::APP_TITLE)
-        .inner_size(1100.0, 720.0)
-        .min_inner_size(800.0, 520.0)
+        // Fixed size: the window is opened occasionally, and one layout keeps it predictable.
+        .inner_size(MANAGE_WINDOW_SIZE.0, MANAGE_WINDOW_SIZE.1)
+        .resizable(false)
+        .maximizable(false)
         .build();
     match built {
         Ok(window) => window.set_focus(),

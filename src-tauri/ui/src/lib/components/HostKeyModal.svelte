@@ -20,10 +20,18 @@
   /** Sends exactly the fingerprint on screen, so a changed key cannot be approved unseen. */
   async function decide(approve: boolean) {
     if (busy) return;
-    const { sessionId, prompt } = pending;
+    const { sessionId, prompt, source } = pending;
+    if (source === "test" && !approve) {
+      store.rejectTestedHostKey();
+      return;
+    }
     busy = true;
     error = null;
     try {
+      if (source === "test") {
+        await store.trustTestedHostKey(prompt.sha256);
+        return;
+      }
       await (approve ? api.approveHostKey(sessionId, prompt.sha256) : api.rejectHostKey(sessionId));
       await store.refresh();
     } catch (failure) {
@@ -34,9 +42,16 @@
   }
 </script>
 
-<!-- Escape does nothing: an unknown host key needs an explicit decision. -->
-<ModalDialog title="Verify host key" onDismiss={() => {}}>
-  <p><strong>{pending.sessionName}</strong> is connecting to a host it has not seen before.</p>
+<!-- Escape does nothing for a running session, which waits on the answer. A test can be
+     dismissed, which leaves the key untrusted. -->
+<ModalDialog
+  title="Verify host key"
+  onDismiss={() => pending.source === "test" && !busy && store.rejectTestedHostKey()}
+>
+  <p>
+    <strong>{pending.sessionName}</strong>
+    {pending.source === "test" ? "reached a host it has not seen before while testing the chain." : "is connecting to a host it has not seen before."}
+  </p>
   <dl class="fact-list">
     <dt>Hop</dt>
     <dd>{hopName} ({pending.prompt.hop_index + 1} of {Math.max(hops.length, pending.prompt.hop_index + 1)})</dd>
@@ -48,6 +63,9 @@
     <dd><code>{pending.prompt.sha256}</code></dd>
   </dl>
   <p class="muted">Trust this key only if the fingerprint matches the one from the server's administrator.</p>
+  {#if pending.source === "test"}
+    <p class="muted">Trusting pins the key for this hop and runs the test again.</p>
+  {/if}
   {#if error}<p class="reason" role="alert">{error}</p>{/if}
   {#snippet actions()}
     <button class="danger" disabled={busy} onclick={() => decide(false)}>Reject</button>

@@ -17,6 +17,7 @@ function validProfile(): SessionProfile {
     id: "00000000-0000-0000-0000-000000000001",
     name: "Work",
     autostart: false,
+    enabled: true,
     engine: "Russh",
     hops: [
       {
@@ -48,6 +49,7 @@ function validProfile(): SessionProfile {
       reverse_bind: "127.0.0.1",
       reverse_http_port: 0,
       reverse_socks_port: 0,
+      reverse_max_connections: null,
       reverse_allow: [],
       reverse_block: [],
     },
@@ -278,6 +280,17 @@ describe("sessionErrors", () => {
     const errors = sessionErrors(profile);
     assert.equal(errors["hop:hop-1:host"], "Enter a host name or IP address.");
     assert.equal(errors["hop:hop-1:port"], "Use a port from 1 to 65535.");
+  });
+
+  test("checks connection caps; an empty reverse cap is allowed", () => {
+    const profile = validProfile();
+    profile.forward.max_connections = -1;
+    profile.reverse.reverse_max_connections = 1.5;
+    const errors = sessionErrors(profile);
+    assert.equal(errors["forward.max_connections"], "Use a whole number. 0 means unlimited.");
+    assert.equal(errors["reverse.max_connections"], "Use a whole number. 0 means unlimited.");
+    profile.reverse.reverse_max_connections = null;
+    assert.equal(sessionErrors(profile)["reverse.max_connections"], undefined);
   });
 
   test("requires at least one listener port", () => {

@@ -139,20 +139,6 @@
 </script>
 
 <div class="hop-editor">
-  {#if hop}
-    <label class="field">
-      Hop label
-      <input
-        value={hop.name}
-        placeholder={host.host || "Optional"}
-        oninput={(e) => {
-          const name = e.currentTarget.value;
-          onHopChange?.((current) => ({ ...current, name }));
-        }}
-      />
-    </label>
-  {/if}
-
   {#if locked}
     <p class="muted">Connection details and sign-in come from the linked host profile. Edit them in Host Profiles.</p>
   {/if}
@@ -191,6 +177,9 @@
       </label>
       {#if err("port")}<span id={`${uid}-err-port`} class="field-error">{err("port")}</span>{/if}
     </div>
+  </div>
+
+  <div class="field-row">
     <div class="field grow">
       <label class="field">
       User
@@ -208,9 +197,22 @@
       </label>
       {#if err("user")}<span id={`${uid}-err-user`} class="field-error">{err("user")}</span>{/if}
     </div>
+    {#if hop}
+      <label class="field grow">
+        Label
+        <input
+          value={hop.name}
+          placeholder={host.host ? `Optional, defaults to ${host.host}` : "Optional"}
+          oninput={(e) => {
+            const name = e.currentTarget.value;
+            onHopChange?.((current) => ({ ...current, name }));
+          }}
+        />
+      </label>
+    {/if}
   </div>
 
-  <h3>Sign-in methods <small class="muted">tried in this order</small></h3>
+  <h3 class="hop-group">Sign-in <small class="muted">tried in this order</small></h3>
   {#if host.auth.length === 0}
     <p class="muted">No sign-in methods yet.</p>
   {:else}
@@ -287,7 +289,7 @@
   {/if}
 
   {#if hop}
-    <h3>Agent forwarding</h3>
+    <h3 class="hop-group">Agent forwarding</h3>
     <label class="check">
       <input
         type="checkbox"
@@ -330,7 +332,7 @@
         <p class="muted">No keys are checked, so no agent is forwarded to this hop.</p>
       {/if}
       <label class="field">
-        Remote Command <small class="muted">optional, runs on this hop while forwarding</small>
+        <span>Remote Command <small class="muted">optional, runs on this hop while forwarding</small></span>
         <input
           value={hop.agent_forward_command ?? ""}
           spellcheck="false"
@@ -344,24 +346,37 @@
       </label>
     {/if}
 
-    <h3>Host key</h3>
+    <h3 class="hop-group">Host key</h3>
     {#if pin}
-      <p>
-        <code>{pin.record.fingerprint_sha256}</code>
-        <span class="muted">{pin.record.algorithm}, first seen {new Date(pin.record.first_seen * 1000).toLocaleString()}</span>
-      </p>
+      <div class="host-key-row">
+        <div class="host-key-info">
+          <code>{pin.record.fingerprint_sha256}</code>
+          <small class="muted">{pin.record.algorithm} · first seen {new Date(pin.record.first_seen * 1000).toLocaleString()}</small>
+        </div>
+        {#if !confirmReset}
+          <button onclick={() => (confirmReset = true)}>Reset Pin</button>
+        {/if}
+        {#if !importing}
+          <button onclick={() => (importing = true)}>Import…</button>
+        {/if}
+      </div>
       {#if confirmReset}
         <p class="warning">The next connection will ask you to approve this host's key again.</p>
-        <button onclick={() => (confirmReset = false)}>Cancel</button>
-        <button class="danger" disabled={resetting} onclick={resetPin}>Confirm Reset</button>
-      {:else}
-        <button onclick={() => (confirmReset = true)}>Reset Pin</button>
+        <div class="button-row">
+          <button onclick={() => (confirmReset = false)}>Cancel</button>
+          <button class="danger" disabled={resetting} onclick={resetPin}>Confirm Reset</button>
+        </div>
       {/if}
     {:else}
-      <p class="muted">No key pinned yet. You will be asked to approve it on first connection.</p>
+      <div class="host-key-row">
+        <p class="muted host-key-info">No key pinned yet. You will be asked to approve it on first connection.</p>
+        {#if !importing}
+          <button onclick={() => (importing = true)}>Import…</button>
+        {/if}
+      </div>
     {/if}
     {#if importing}
-      <form onsubmit={importPin}>
+      <form class="modal-form" onsubmit={importPin}>
         <label class="field">
           OpenSSH known_hosts file
           <input
@@ -378,11 +393,11 @@
           is never read automatically.
         </p>
         {#if importError}<p class="reason" role="alert">{importError}</p>{/if}
-        <button type="button" onclick={cancelImport}>Cancel</button>
-        <button type="submit" disabled={importBusy || !importPath.trim() || !host.host}>Import</button>
+        <div class="button-row">
+          <button type="button" onclick={cancelImport}>Cancel</button>
+          <button type="submit" disabled={importBusy || !importPath.trim() || !host.host}>Import</button>
+        </div>
       </form>
-    {:else}
-      <button onclick={() => (importing = true)}>Import from file…</button>
     {/if}
   {/if}
 </div>

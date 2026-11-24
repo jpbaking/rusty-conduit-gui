@@ -76,6 +76,17 @@ pub struct TauriTrayBackend<R: Runtime> {
     subscribers: Subscribers,
 }
 
+/// The menu-bar icon. macOS draws a template image from its alpha channel alone, so it gets a
+/// version of the logo whose ring and bar are transparent cutouts; the colored app icon would
+/// show as a plain disc there. Other platforms show the app icon in color.
+fn tray_icon<R: Runtime>(app: &AppHandle<R>) -> Option<tauri::image::Image<'static>> {
+    if cfg!(target_os = "macos") {
+        Some(tauri::include_image!("icons/tray-template.png"))
+    } else {
+        app.default_window_icon().map(|icon| icon.clone().to_owned())
+    }
+}
+
 impl<R: Runtime> TauriTrayBackend<R> {
     pub fn spawn(app: &AppHandle<R>, initial: &TrayMenuModel) -> tauri::Result<Self> {
         let mut build = MenuBuild { app, actions: HashMap::new() };
@@ -96,8 +107,8 @@ impl<R: Runtime> TauriTrayBackend<R> {
                     lock(&event_subscribers).retain(|tx| tx.send(action.clone()).is_ok());
                 }
             });
-        if let Some(icon) = app.default_window_icon() {
-            builder = builder.icon(icon.clone());
+        if let Some(icon) = tray_icon(app) {
+            builder = builder.icon(icon);
         }
         let tray = builder.build(app)?;
 

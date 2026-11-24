@@ -14,7 +14,7 @@ fn ksni_without_dbus_reports_offline_and_shuts_down() {
         "unix:path=/nonexistent/conduit-tray-test-bus",
     );
 
-    let backend = KsniTrayBackend::spawn(TrayMenuModel::from_snapshots(&[], false)).unwrap();
+    let backend = KsniTrayBackend::spawn(TrayMenuModel::from_snapshots(&[], false), None).unwrap();
     let mut actions = backend.subscribe_actions();
 
     let deadline = Instant::now() + Duration::from_secs(5);

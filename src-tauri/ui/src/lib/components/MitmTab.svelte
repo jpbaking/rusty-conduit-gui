@@ -156,7 +156,7 @@
   </div>
 {/snippet}
 
-<section aria-labelledby={`${uid}-heading`}>
+<section class="card" aria-labelledby={`${uid}-heading`}>
   <h2 id={`${uid}-heading`}>HTTPS MITM <small class="muted">decrypts HTTPS using your own CA</small></h2>
 
   <div class="segmented" role="group" aria-label="MITM mode">
@@ -185,7 +185,35 @@
       {/if}
     </div>
 
-    <h3>CA passphrase <small class="muted">use a saved passphrase or a file, not both</small></h3>
+    <div class="inline-form">
+      <button type="button" disabled={!caReady || inspecting} onclick={inspect}>
+        {inspecting ? "Inspecting…" : "Inspect CA"}
+      </button>
+    </div>
+    <div role="status">
+      {#if caInfo}
+        <dl class="fact-list">
+          <dt>Subject</dt>
+          <dd>{caInfo.subject}</dd>
+          <dt>Expires</dt>
+          <dd>{new Date(caInfo.not_after).toLocaleString()}</dd>
+        </dl>
+        {#if caInfo.expired}
+          <p class="field-error">This CA has expired. Sessions using it will not start.</p>
+        {:else if caInfo.days_remaining <= EXPIRY_WARNING_DAYS}
+          <p class="warning">
+            This CA expires in {caInfo.days_remaining} {caInfo.days_remaining === 1 ? "day" : "days"}.
+          </p>
+        {/if}
+      {/if}
+      {#if inspectError}<p class="field-error">Could not read the CA: {inspectError}</p>{/if}
+    </div>
+  {/if}
+</section>
+
+{#if mitm}
+  <section class="card" aria-labelledby={`${uid}-passphrase`}>
+    <h2 id={`${uid}-passphrase`}>CA passphrase <small class="muted">use a saved passphrase or a file, not both</small></h2>
     {#if errors["mitm.passphrase"]}<p class="field-error">{errors["mitm.passphrase"]}</p>{/if}
     {#if mitm.passphrase}
       <p>
@@ -219,6 +247,10 @@
       />
     </label>
 
+  </section>
+
+  <section class="card" aria-labelledby={`${uid}-certs`}>
+    <h2 id={`${uid}-certs`}>Generated certificates</h2>
     <div class="field-row">
       <NumberField
         label="Certificate lifetime (seconds)"
@@ -246,28 +278,5 @@
       Block web ports over SOCKS <small class="muted">so web traffic must use the MITM HTTP proxy</small>
     </label>
 
-    <div class="inline-form">
-      <button type="button" disabled={!caReady || inspecting} onclick={inspect}>
-        {inspecting ? "Inspecting…" : "Inspect CA"}
-      </button>
-    </div>
-    <div role="status">
-      {#if caInfo}
-        <dl class="fact-list">
-          <dt>Subject</dt>
-          <dd>{caInfo.subject}</dd>
-          <dt>Expires</dt>
-          <dd>{new Date(caInfo.not_after).toLocaleString()}</dd>
-        </dl>
-        {#if caInfo.expired}
-          <p class="field-error">This CA has expired. Sessions using it will not start.</p>
-        {:else if caInfo.days_remaining <= EXPIRY_WARNING_DAYS}
-          <p class="warning">
-            This CA expires in {caInfo.days_remaining} {caInfo.days_remaining === 1 ? "day" : "days"}.
-          </p>
-        {/if}
-      {/if}
-      {#if inspectError}<p class="field-error">Could not read the CA: {inspectError}</p>{/if}
-    </div>
-  {/if}
-</section>
+  </section>
+{/if}

@@ -7,6 +7,7 @@ import type {
   ExportSummary,
   FilterTestResult,
   HostKeyEntry,
+  HostKeyPrompt,
   HostProfile,
   ImportSummary,
   KeyView,
@@ -48,6 +49,7 @@ function profile(id: string, name: string, host: string, httpPort: number): Sess
     id,
     name,
     autostart: false,
+    enabled: true,
     engine: "Russh",
     hops: [{ hop_id: `${id}-hop`, name, host: hostProfile, agent_forward: false, agent_forward_keys: [], agent_forward_command: null }],
     forward: {
@@ -62,6 +64,7 @@ function profile(id: string, name: string, host: string, httpPort: number): Sess
       reverse_bind: "127.0.0.1",
       reverse_http_port: 0,
       reverse_socks_port: 0,
+      reverse_max_connections: null,
       reverse_allow: [],
       reverse_block: [],
     },
@@ -80,11 +83,16 @@ function profile(id: string, name: string, host: string, httpPort: number): Sess
   };
 }
 
+function withReverse(p: SessionProfile, httpPort: number): SessionProfile {
+  return { ...p, reverse: { ...p.reverse, reverse_http_port: httpPort } };
+}
+
 function view(p: SessionProfile, state: SessionState, active = 0): SessionView {
   const connected = state.state === "connected";
   const runtime: SessionSnapshot = {
     id: p.id,
     name: p.name,
+    enabled: p.enabled,
     state,
     stats: connected
       ? {
@@ -96,14 +104,21 @@ function view(p: SessionProfile, state: SessionState, active = 0): SessionView {
         }
       : { ...IDLE_STATS },
     listeners: connected
-      ? [{ role: "http", addr: `${p.forward.bind}:${p.forward.http_port}` }]
+      ? [
+          { role: "HTTP/HTTPS", addr: `${p.forward.bind}:${p.forward.http_port}` },
+          { role: "SOCKS4/4a/5", addr: `${p.forward.bind}:${p.forward.socks_port}` },
+        ]
       : [],
+    remote_listeners:
+      connected && p.reverse.reverse_http_port
+        ? [{ role: "HTTP/HTTPS", addr: `${p.reverse.reverse_bind}:${p.reverse.reverse_http_port}` }]
+        : [],
   };
   return { profile: p, runtime };
 }
 
 const sessions: SessionView[] = [
-  view(profile("11111111-1111-4111-8111-111111111111", "Staging bastion", "192.0.2.10", 3128), { state: "connected" }, 3),
+  view(withReverse(profile("11111111-1111-4111-8111-111111111111", "Staging bastion", "192.0.2.10", 3128), 8080), { state: "connected" }, 3),
   view(profile("22222222-2222-4222-8222-222222222222", "Lab gateway", "198.51.100.7", 3130), {
     state: "reconnecting",
     attempt: 2,
@@ -132,6 +147,8 @@ let keys: KeyView[] = [
 ];
 let autostart = false;
 let hosts: HostProfile[] = [];
+const testedKeys = new Map<string, HostKeyPrompt>();
+
 let pins: HostKeyEntry[] = [
   {
     key: { hop_id: "11111111-1111-4111-8111-111111111111-hop", host: "192.0.2.10", port: 22 },
@@ -264,6 +281,7 @@ function dispatch(command: string, args?: Record<string, unknown>): unknown {
       session.runtime.state = { state: "stopped" };
       session.runtime.stats = { ...IDLE_STATS };
       session.runtime.listeners = [];
+      session.runtime.remote_listeners = [];
       return null;
     }
     case "upsert_session": {
@@ -278,21 +296,62 @@ function dispatch(command: string, args?: Record<string, unknown>): unknown {
       }
       return saved;
     }
-    case "test_chain": {
+    case "duplicate_session": {
+      const copy = structuredClone(find(args).profile);
+      copy.id = crypto.randomUUID();
+      copy.name = `${copy.name.trim()} (copy)`;
+      copy.autostart = false;
+      for (const hop of copy.hops) {
+        const old = hop.hop_id;
+        hop.hop_id = crypto.randomUUID();
+        const pin = pins.find(({ key }) => key.hop_id === old && key.host === hop.host.host && key.port === hop.host.port);
+        if (pin) pins = [...pins, { ...structuredClone(pin), key: { ...pin.key, hop_id: hop.hop_id } }];
+      }
+      sessions.push(view(copy, { state: "stopped" }));
+      return structuredClone(copy);
+    }
+    case "delete_session": {
       const session = find(args);
-      return {
-        session_id: session.profile.id,
-        all_connected: true,
-        hops: session.profile.hops.map((hop, hop_index) => ({
-          hop_index,
-          hop_id: hop.hop_id,
-          host: hop.host.host,
-          port: hop.host.port,
-          status: "connected",
-          error: null,
-          elapsed_ms: 25,
-        })),
+      sessions.splice(sessions.indexOf(session), 1);
+      const hopIds = new Set(session.profile.hops.map((hop) => hop.hop_id));
+      pins = pins.filter(({ key }) => !hopIds.has(key.hop_id));
+      return null;
+    }
+    case "test_chain": {
+      // Stops at the first hop without a pin, like the real test, offering a demo key to trust.
+      const session = find(args);
+      let broken = false;
+      const hops = session.profile.hops.map((hop, hop_index) => {
+        const base = { hop_index, hop_id: hop.hop_id, host: hop.host.host, port: hop.host.port };
+        if (broken) return { ...base, status: "not_attempted", error: null, elapsed_ms: 0, host_key: null };
+        const pinned = pins.some(
+          ({ key }) => key.hop_id === hop.hop_id && key.host === hop.host.host && key.port === hop.host.port,
+        );
+        if (pinned) return { ...base, status: "connected", error: null, elapsed_ms: 25, host_key: null };
+        broken = true;
+        const host_key = { ...base, algorithm: "ssh-ed25519", sha256: `SHA256:demoKey${hop_index}ForPreviewOnly`, public_key_openssh: null };
+        testedKeys.set(session.profile.id, host_key);
+        return { ...base, status: "host_key_unknown", error: "unknown host key", elapsed_ms: 20, host_key };
+      });
+      return { session_id: session.profile.id, all_connected: !broken, hops };
+    }
+    case "trust_tested_host_key": {
+      const seen = testedKeys.get(String(args?.id));
+      if (!seen) throw new ApiError("not_found", "tested host key not found");
+      if (seen.sha256 !== args?.sha256) throw new ApiError("invalid", "the host key changed since it was shown");
+      testedKeys.delete(String(args?.id));
+      const entry: HostKeyEntry = {
+        key: { hop_id: seen.hop_id, host: seen.host, port: seen.port },
+        record: {
+          algorithm: seen.algorithm,
+          fingerprint_sha256: seen.sha256,
+          first_seen: Math.floor(Date.now() / 1000),
+          approved: true,
+          public_key_openssh: null,
+        },
       };
+      pins = [...pins, entry];
+      return structuredClone(entry);
     }
     case "list_host_key_pins":
       return structuredClone(pins);

@@ -138,7 +138,7 @@
   });
 </script>
 
-<section aria-labelledby={`${uid}-heading`}>
+<section class="card" aria-labelledby={`${uid}-heading`}>
   <h2 id={`${uid}-heading`}>{title}</h2>
 
   <div class="segmented" role="group" aria-label={`${title} mode`}>
@@ -191,7 +191,7 @@
     {#if ruleError}<span class="field-error" role="alert">{ruleError}</span>{/if}
 
     <label class="field">
-      Bulk paste <small class="muted">one per line or comma separated</small>
+      <span>Bulk paste <small class="muted">one per line or comma separated</small></span>
       <textarea class="code-text" bind:value={bulkText} spellcheck="false"></textarea>
     </label>
     <div class="inline-form">

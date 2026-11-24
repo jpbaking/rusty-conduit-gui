@@ -31,6 +31,8 @@ export interface PendingHostKey {
   sessionId: Uuid;
   sessionName: string;
   prompt: HostKeyPrompt;
+  /** `session`: a running session waits for the answer. `test`: Test Chain stopped at the key. */
+  source: "session" | "test";
 }
 
 /** The id of a session that has not been saved yet. The backend assigns a real one. */
@@ -46,6 +48,7 @@ function blankProfile(): SessionProfile {
     id: NEW_SESSION_ID,
     name: "New session",
     autostart: false,
+    enabled: true,
     engine: "Russh",
     hops: [],
     forward: {
@@ -60,6 +63,7 @@ function blankProfile(): SessionProfile {
       reverse_bind: "127.0.0.1",
       reverse_http_port: 0,
       reverse_socks_port: 0,
+      reverse_max_connections: null,
       reverse_allow: [],
       reverse_block: [],
     },
@@ -175,8 +179,11 @@ class AppStore {
     const session = waiting.find((s) => s.profile.id === this.selectedId) ?? waiting[0];
     if (!session || session.runtime.state.state !== "awaiting_host_key") return null;
     const { state: _state, ...prompt } = session.runtime.state;
-    return { sessionId: session.profile.id, sessionName: session.profile.name, prompt };
+    return { sessionId: session.profile.id, sessionName: session.profile.name, prompt, source: "session" };
   });
+
+  /** An unknown key the latest Test Chain run stopped at, until the user trusts or rejects it. */
+  testHostKey = $state.raw<PendingHostKey | null>(null);
 
   #unlisten: (() => void) | null = null;
   #pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -384,6 +391,66 @@ class AppStore {
       this.drafts = { ...this.drafts, [NEW_SESSION_ID]: blankProfile() };
     }
     this.selectSession(NEW_SESSION_ID);
+  }
+
+  /** Saves a copy of a saved session and opens it. Unsaved edits to the original are not copied. */
+  async duplicateSession(id: Uuid): Promise<void> {
+    try {
+      const copy = await api.duplicateSession(id);
+      await this.refresh();
+      this.selectSession(copy.id);
+    } catch (error) {
+      this.notice = errorMessage(error);
+    }
+  }
+
+  /** Stops and deletes a saved session, then frees the saved passwords nothing else uses. */
+  async deleteSession(id: Uuid): Promise<void> {
+    const session = this.sessions.find((s) => s.profile.id === id);
+    if (!session) return;
+    try {
+      await api.deleteSession(id);
+      const draft = this.drafts[id];
+      this.#dropDraft(id);
+      [...profileRefs(session.profile), ...(draft ? profileRefs(draft) : [])].forEach((ref) =>
+        this.#orphanedSecrets.add(ref),
+      );
+      if (this.selectedId === id) this.chainResult = null;
+      await this.refresh();
+      await this.#deleteOrphanedSecrets();
+    } catch (error) {
+      this.notice = errorMessage(error);
+    }
+  }
+
+  /**
+   * Includes or leaves out a saved session from Start All and autostart. Saved right away, and
+   * carried into any unsaved edits so saving them later does not undo it.
+   */
+  async setSessionEnabled(id: Uuid, enabled: boolean): Promise<void> {
+    const session = this.sessions.find((s) => s.profile.id === id);
+    if (!session) return;
+    try {
+      await api.upsertSession({ ...session.profile, enabled });
+      const draft = this.drafts[id];
+      if (draft) this.drafts = { ...this.drafts, [id]: { ...draft, enabled } };
+      await this.refresh();
+      const latest = this.drafts[id];
+      const saved = this.sessions.find((s) => s.profile.id === id)?.profile;
+      if (latest && saved && sameProfile(saved, latest)) this.#dropDraft(id);
+    } catch (error) {
+      this.notice = errorMessage(error);
+    }
+  }
+
+  /** Throws away the unsaved new session. */
+  async discardNewSession(): Promise<void> {
+    const draft = this.drafts[NEW_SESSION_ID];
+    if (!draft) return;
+    this.#dropDraft(NEW_SESSION_ID);
+    profileRefs(draft).forEach((ref) => this.#orphanedSecrets.add(ref));
+    if (this.selectedId === NEW_SESSION_ID) this.selectedId = this.sessions[0]?.profile.id ?? null;
+    await this.#deleteOrphanedSecrets();
   }
 
   /** Applies an edit to the selected session. Undoing every change clears the draft. */
@@ -607,14 +674,35 @@ class AppStore {
     const id = session.profile.id;
     this.testing = true;
     this.chainResult = null;
+    this.testHostKey = null;
     try {
       const result = await api.testChain(id);
-      if (this.selectedId === id) this.chainResult = result;
+      if (this.selectedId !== id) return;
+      this.chainResult = result;
+      const prompt = result.hops.find((hop) => hop.host_key)?.host_key;
+      if (prompt) {
+        this.testHostKey = { sessionId: id, sessionName: session.profile.name, prompt, source: "test" };
+      }
     } catch (error) {
       this.notice = errorMessage(error);
     } finally {
       this.testing = false;
     }
+  }
+
+  /** Pins the key Test Chain stopped at, then tests again so the next hop gets checked. */
+  async trustTestedHostKey(sha256: string): Promise<void> {
+    const pending = this.testHostKey;
+    if (!pending) return;
+    await api.trustTestedHostKey(pending.sessionId, sha256);
+    this.testHostKey = null;
+    await this.refresh();
+    if (this.selectedId === pending.sessionId) await this.testSelected();
+  }
+
+  /** Leaves the key untrusted. The hop stays marked in the test result. */
+  rejectTestedHostKey(): void {
+    this.testHostKey = null;
   }
 
   #dropDraft(id: Uuid): void {

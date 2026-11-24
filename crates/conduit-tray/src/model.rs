@@ -125,7 +125,8 @@ impl TrayMenuModel {
             .iter()
             .filter(|s| needs_attention(&s.state))
             .count();
-        let any_startable = snapshots.iter().any(|s| s.state.is_terminal());
+        // Start All leaves disabled sessions out, so they do not make it clickable.
+        let any_startable = snapshots.iter().any(|s| s.enabled && s.state.is_terminal());
         let any_active = snapshots.iter().any(|s| !s.state.is_terminal());
 
         let mut start_all = TrayMenuItem::new("Start All", TrayAction::StartAll);
@@ -340,6 +341,7 @@ mod tests {
         SessionSnapshot {
             id: Uuid::new_v4(),
             name: name.into(),
+            enabled: true,
             state,
             stats: SessionStatsSnapshot::default(),
             listeners: listeners
@@ -349,6 +351,7 @@ mod tests {
                     addr: addr.parse().unwrap(),
                 })
                 .collect(),
+            remote_listeners: Vec::new(),
         }
     }
 
@@ -547,6 +550,11 @@ mod tests {
             TrayMenuModel::from_snapshots(&[snap("A", SessionState::Connected, &[])], false);
         assert!(!running.global_items[0].enabled);
         assert!(running.global_items[1].enabled);
+
+        let mut disabled = snap("A", SessionState::Stopped, &[]);
+        disabled.enabled = false;
+        let only_disabled = TrayMenuModel::from_snapshots(&[disabled], false);
+        assert!(!only_disabled.global_items[0].enabled, "Start All would start nothing");
     }
 
     #[test]

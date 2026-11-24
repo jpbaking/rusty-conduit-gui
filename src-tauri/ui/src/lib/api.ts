@@ -120,6 +120,7 @@ export const api = {
   listSessions: () => call<SessionView[]>("list_sessions"),
   upsertSession: (profile: SessionProfile) => call<SessionProfile>("upsert_session", { profile }),
   deleteSession: (id: Uuid) => call<void>("delete_session", { id }),
+  duplicateSession: (id: Uuid) => call<SessionProfile>("duplicate_session", { id }),
   listHosts: () => call<HostProfile[]>("list_hosts"),
   upsertHost: (host: HostProfile) => call<HostProfile>("upsert_host", { host }),
   deleteHost: (id: Uuid) => call<void>("delete_host", { id }),
@@ -139,6 +140,8 @@ export const api = {
   // Host keys and diagnostics.
   approveHostKey: (id: Uuid, sha256: string) => call<void>("approve_host_key", { id, sha256 }),
   rejectHostKey: (id: Uuid) => call<void>("reject_host_key", { id }),
+  trustTestedHostKey: (id: Uuid, sha256: string) =>
+    call<HostKeyEntry>("trust_tested_host_key", { id, sha256 }),
   listHostKeyPins: () => call<HostKeyEntry[]>("list_host_key_pins"),
   resetHostKey: (hopId: string, host: string, port: number) =>
     call<boolean>("reset_host_key", { hopId, host, port }),

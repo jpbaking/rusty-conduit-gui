@@ -13,7 +13,8 @@
   }
 </script>
 
-<section aria-labelledby={`${uid}-keepalive`}>
+<div class="card-grid">
+<section class="card" aria-labelledby={`${uid}-keepalive`}>
   <h2 id={`${uid}-keepalive`}>Keepalive</h2>
   <div class="field-row">
     <NumberField
@@ -33,7 +34,7 @@
   </div>
 </section>
 
-<section aria-labelledby={`${uid}-reconnect`}>
+<section class="card" aria-labelledby={`${uid}-reconnect`}>
   <h2 id={`${uid}-reconnect`}>Reconnect</h2>
   <label class="check">
     <input
@@ -62,8 +63,9 @@
     <p class="warning">An initial delay of 0 retries with no pause while the server is unreachable.</p>
   {/if}
 </section>
+</div>
 
-<section aria-labelledby={`${uid}-startup`}>
+<section class="card" aria-labelledby={`${uid}-startup`}>
   <h2 id={`${uid}-startup`}>Startup</h2>
   <div class="field-row">
     <NumberField
@@ -87,4 +89,7 @@
     />
     Start with the app
   </label>
+  {#if !draft.enabled}
+    <p class="note">This session is disabled, so it does not start with the app or with Start All. Enable it from the session list's right-click menu.</p>
+  {/if}
 </section>

@@ -163,6 +163,11 @@ pub async fn delete_session(c: Ctl<'_>, id: Uuid) -> CmdResult<()> {
 }
 
 #[tauri::command]
+pub async fn duplicate_session(c: Ctl<'_>, id: Uuid) -> CmdResult<SessionProfile> {
+    blocking(&c, move |c| c.duplicate_session(id)).await
+}
+
+#[tauri::command]
 pub async fn list_hosts(c: Ctl<'_>) -> CmdResult<Vec<HostProfile>> {
     blocking(&c, |c| Ok(c.list_hosts())).await
 }
@@ -236,6 +241,16 @@ pub async fn approve_host_key(c: Ctl<'_>, id: Uuid, sha256: String) -> CmdResult
 #[tauri::command]
 pub async fn reject_host_key(c: Ctl<'_>, id: Uuid) -> CmdResult<()> {
     blocking(&c, move |c| c.reject_host_key(id)).await
+}
+
+/// Pins the unknown key the latest Test Chain run of session `id` saw.
+#[tauri::command]
+pub async fn trust_tested_host_key(
+    c: Ctl<'_>,
+    id: Uuid,
+    sha256: String,
+) -> CmdResult<conduit_core::HostKeyEntry> {
+    blocking(&c, move |c| c.trust_tested_host_key(id, &sha256)).await
 }
 
 #[tauri::command]
@@ -439,6 +454,7 @@ macro_rules! ipc_handler {
             $crate::commands::list_sessions,
             $crate::commands::upsert_session,
             $crate::commands::delete_session,
+            $crate::commands::duplicate_session,
             $crate::commands::list_hosts,
             $crate::commands::upsert_host,
             $crate::commands::delete_host,
@@ -452,6 +468,7 @@ macro_rules! ipc_handler {
             $crate::commands::clear_session_logs,
             $crate::commands::approve_host_key,
             $crate::commands::reject_host_key,
+            $crate::commands::trust_tested_host_key,
             $crate::commands::list_host_key_pins,
             $crate::commands::reset_host_key,
             $crate::commands::import_known_host,
@@ -498,10 +515,11 @@ mod tests {
         "vault_status", "create_vault", "unlock_vault", "unlock_vault_keyring", "lock_vault",
         "import_key_pem", "generate_key", "rename_key", "delete_key", "list_keys",
         "set_password_secret", "set_mitm_passphrase", "delete_secret", "export_backup",
-        "import_backup", "get_state_summary", "list_sessions", "upsert_session", "delete_session",
+        "import_backup", "get_state_summary", "list_sessions", "upsert_session", "delete_session", "duplicate_session",
         "list_hosts", "upsert_host", "delete_host", "promote_hop_to_host", "start_session",
         "stop_session", "restart_session", "start_all", "stop_all", "get_session_logs",
-        "clear_session_logs", "approve_host_key", "reject_host_key", "list_host_key_pins",
+        "clear_session_logs", "approve_host_key", "reject_host_key", "trust_tested_host_key",
+        "list_host_key_pins",
         "reset_host_key", "import_known_host", "test_chain", "check_port_conflicts", "test_filter_rules",
         "inspect_mitm_ca", "check_openssh_binary", "export_config", "import_config",
         "get_autostart", "set_autostart", "shell_ready", "resolve_close",
@@ -758,7 +776,11 @@ mod tests {
         let report = ipc.ok("test_chain", json!({ "id": id }));
         assert_eq!(report["all_connected"], false);
         assert_eq!(report["hops"][0]["status"], "failed");
-        for field in ["hop_index", "hop_id", "host", "port", "error", "elapsed_ms"] {
+        assert_eq!(
+            ipc.err("trust_tested_host_key", json!({ "id": id, "sha256": "SHA256:none" }))["code"],
+            "not_found"
+        );
+        for field in ["hop_index", "hop_id", "host", "port", "error", "elapsed_ms", "host_key"] {
             assert!(report["hops"][0].get(field).is_some(), "missing {field}");
         }
 
@@ -859,6 +881,11 @@ mod tests {
         assert_eq!(ipc.ok("delete_secret", json!({ "secret": secret_ref }))["deleted"], false);
         assert_eq!(ipc.ok("delete_secret", json!({ "secret": secret_ref, "force": true }))["deleted"], true);
         ipc.ok("delete_host", json!({ "id": host["id"] }));
+
+        let copy = ipc.ok("duplicate_session", json!({ "id": id }));
+        assert!(copy["name"].as_str().unwrap().ends_with(" (copy)"));
+        assert_ne!(copy["id"], json!(id));
+        ipc.ok("delete_session", json!({ "id": copy["id"] }));
 
         // Read the files before the session is deleted, while they hold the most references.
         let on_disk: Vec<(String, Vec<u8>)> = ["config.json", "vault.bin", "backup.bundle", "config-plain.json", "config-bundle.json"]

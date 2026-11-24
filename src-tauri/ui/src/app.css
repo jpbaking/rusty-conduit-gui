@@ -70,6 +70,7 @@ button.danger { color: var(--alert); border-color: var(--alert); }
 .session-list { flex: 1; min-height: 0; overflow-y: auto; list-style: none; margin: 0; padding: 0; }
 .session-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .session-tag { color: var(--muted); font-size: 11px; }
+.disabled-session .session-name { color: var(--muted); }
 .empty { color: var(--muted); padding: 6px; }
 .glyph { width: 12px; text-align: center; font-weight: 700; }
 .ok { color: var(--ok); }
@@ -116,28 +117,62 @@ button.danger { color: var(--alert); border-color: var(--alert); }
 .log-row.warn .log-text { color: var(--busy); }
 .log-row.debug .log-text { color: var(--muted); }
 
+.context-menu { position: fixed; z-index: 20; display: flex; flex-direction: column; min-width: 160px; padding: 4px; background: var(--surface); border: 1px solid var(--border); border-radius: 7px; box-shadow: 0 8px 24px rgb(0 0 0 / 0.35); }
+.context-menu button { justify-content: flex-start; text-align: left; background: transparent; border-color: transparent; }
+.context-menu button:hover:not(:disabled), .context-menu button:focus-visible { background: var(--surface-2); border-color: transparent; outline: none; }
+.context-menu button.danger { border-color: transparent; }
 .modal { width: min(460px, calc(100vw - 32px)); padding: 16px; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 8px; }
 .modal::backdrop { background: rgb(0 0 0 / 0.5); }
 .modal h2 { margin: 0 0 10px; font-size: 15px; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 6px; margin-top: 12px; }
 .url-field { width: 100%; font-family: ui-monospace, Menlo, Consolas, monospace; }
 
-.chain-builder { display: flex; flex-wrap: wrap; align-items: stretch; gap: 8px 22px; list-style: none; margin: 0 0 8px; padding: 0; }
-.chain-local, .chain-node { position: relative; display: flex; align-items: center; gap: 4px; padding: 4px 6px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px; }
-.chain-local { padding: 4px 12px; font-weight: 600; }
-.chain-builder > li + li::before { content: "→"; position: absolute; left: -17px; top: 50%; transform: translateY(-50%); color: var(--muted); }
-.chain-node.selected { border-color: var(--accent); }
-.chain-node.dragging { opacity: 0.55; }
-.chain-node.drop-target { outline: 2px dashed var(--accent); outline-offset: 1px; }
-.drag-handle { min-height: 0; padding: 2px 3px; background: transparent; border-color: transparent; color: var(--muted); cursor: grab; touch-action: none; }
-.chain-node.dragging .drag-handle { cursor: grabbing; }
-.hop-select { display: flex; flex-direction: column; align-items: flex-start; max-width: 190px; padding: 2px 6px; line-height: 1.25; text-align: left; background: transparent; border-color: transparent; }
-.hop-select small { color: var(--muted); font-size: 11px; }
+/* Connection tab: the route (local → jumps → target) on the left, the selected hop on the right. */
+.connection-layout { display: grid; grid-template-columns: 248px minmax(0, 1fr); align-items: start; gap: 14px; }
+.hop-column { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.route-column { position: sticky; top: 0; display: flex; flex-direction: column; gap: 10px; }
+.hop-card { display: flex; flex-direction: column; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; }
+.hop-card .hop-editor { padding: 12px 14px 14px; background: transparent; border: 0; border-radius: 0; max-width: none; }
+.hop-empty { padding: 28px 16px; align-items: center; }
+.hop-head { display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-bottom: 1px solid var(--border); }
+.hop-head-title { flex: 1; min-width: 0; display: flex; flex-direction: column; line-height: 1.2; }
+.hop-head-title small { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
+.hop-head-title h2 { margin: 0; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hop-head select { max-width: 190px; }
+
+.route, .route-settings { display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; }
+.session-editor .route h2, .session-editor .route-settings h2 { margin: 0; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+.route-list { display: flex; flex-direction: column; gap: 14px; margin: 0; padding: 0; list-style: none; }
+.route-stop { position: relative; display: flex; align-items: center; gap: 6px; min-height: 40px; padding: 4px 4px 4px 6px; border: 1px solid transparent; border-radius: 6px; }
+/* Connector from each stop down to the next, drawn through the dot column. */
+.route-stop + .route-stop::before { content: ""; position: absolute; left: 13px; top: -15px; height: 15px; border-left: 2px solid var(--border); }
+.route-dot { flex: 0 0 auto; width: 14px; height: 14px; min-height: 0; padding: 0; margin: 0 2px; border-radius: 50%; background: var(--surface-2); border: 2px solid var(--muted); }
+.route-local .route-dot { background: var(--muted); }
+.route-local .route-text { display: flex; flex-direction: column; line-height: 1.25; padding: 2px 6px; }
+.route-local small, .hop-select small { color: var(--muted); font-size: 11px; }
+.route-node { background: var(--surface-2); border-color: var(--border); }
+.route-node.target .route-dot { border-color: var(--accent); background: var(--accent); }
+.route-node.selected { border-color: var(--accent); box-shadow: inset 3px 0 0 var(--accent); }
+.route-node.invalid { border-color: var(--alert); }
+.route-node.invalid .route-dot { border-color: var(--alert); }
+.route-node.invalid .hop-addr { color: var(--alert); }
+.route-node.dragging { opacity: 0.55; }
+.route-node.drop-target { outline: 2px dashed var(--accent); outline-offset: 1px; }
+.drag-handle { cursor: grab; touch-action: none; }
+.drag-handle:hover:not(:disabled) { border-color: var(--accent); }
+.route-node.dragging .drag-handle { cursor: grabbing; }
+.hop-select { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: flex-start; padding: 0 2px; line-height: 1.25; text-align: left; background: transparent; border-color: transparent; }
+.hop-select:hover:not(:disabled) { border-color: transparent; }
+.hop-role { display: flex; gap: 6px; align-items: baseline; }
 .hop-name { max-width: 100%; overflow: hidden; text-overflow: ellipsis; font-weight: 600; }
+.hop-addr { max-width: 100%; overflow: hidden; text-overflow: ellipsis; font-family: ui-monospace, Menlo, Consolas, monospace; }
 .hop-badge { display: inline-flex; gap: 3px; font-size: 11px; font-weight: 600; white-space: nowrap; }
-.hop-actions { display: inline-flex; gap: 2px; }
+.hop-actions { display: flex; opacity: 0; transition: opacity 0.12s; }
+.route-node:hover .hop-actions, .route-node.selected .hop-actions, .route-node:focus-within .hop-actions { opacity: 1; }
 button.icon { min-height: 22px; min-width: 22px; padding: 0 4px; background: transparent; border-color: transparent; }
-.chain-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.route-add { align-self: stretch; border-style: dashed; color: var(--muted); background: transparent; }
+.route .reason, .route .ok { margin: 0; font-size: 12px; }
+button.link-button { min-height: 0; padding: 0; color: var(--accent); background: none; border: 0; text-decoration: underline; }
 .field-inline { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }
 .field-inline select { max-width: 300px; color: var(--text); }
 .field { display: flex; flex-direction: column; gap: 3px; min-width: 0; color: var(--muted); }
@@ -147,30 +182,57 @@ button.icon { min-height: 22px; min-width: 22px; padding: 0 4px; background: tra
 
 .hop-editor { display: flex; flex-direction: column; gap: 8px; max-width: 760px; padding: 10px 12px; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; }
 .hop-editor h3 { margin: 6px 0 0; font-size: 12px; }
+.hop-editor h3.hop-group { margin-top: 8px; padding-top: 12px; border-top: 1px solid var(--border); }
+.hop-editor > button, .hop-editor > form > button { align-self: flex-start; }
+.button-row { display: flex; gap: 6px; }
+.host-key-row { display: flex; align-items: center; gap: 6px; }
+.host-key-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; margin: 0; }
 .field-row { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 8px; }
 .field.grow { flex: 1 1 170px; }
 .field.port { flex: 0 0 104px; }
+/* Groups the HTTP/SOCKS fields for focus tracking without changing the row layout. */
+.port-group { display: contents; }
+.field.cap { flex: 0 0 150px; }
 .auth-list { display: flex; flex-direction: column; gap: 4px; margin: 0; padding-left: 20px; }
 .auth-list li { padding: 1px 0; }
 .auth-list li > * { vertical-align: middle; margin-right: 3px; }
 .auth-label { display: inline-block; min-width: 190px; }
 .auth-add { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
 .password-form { display: inline-flex; flex-wrap: wrap; gap: 4px; }
+.hop-card .auth-add { flex-wrap: nowrap; gap: 8px; }
+.hop-card .auth-add select { max-width: 170px; }
+.hop-card .password-form { flex-wrap: nowrap; }
+.hop-card .password-form input { width: 150px; }
 .key-picker { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; margin: 0; padding: 6px 10px; border: 1px solid var(--border); border-radius: 5px; }
 .key-picker legend { padding: 0 4px; color: var(--muted); }
+.note { padding: 5px 8px; color: var(--muted); background: var(--surface-2); border-left: 3px solid var(--accent); font-size: 12px; }
 .warning { padding: 5px 8px; color: var(--text); background: var(--surface-2); border-left: 3px solid var(--busy); }
 
-.session-editor { display: flex; flex-direction: column; gap: 10px; max-width: 980px; }
-.session-editor section h2 { margin-top: 4px; }
+.listener-cards { display: flex; gap: 10px; }
+.listener-card { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; gap: 4px; padding: 7px 12px; background: var(--surface); border: 1px solid var(--border); border-left: 3px solid var(--ok); border-radius: 8px; }
+.listener-card header { display: flex; align-items: baseline; gap: 6px; }
+.listener-card header small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.listener-card ul { display: flex; flex-wrap: wrap; gap: 2px 16px; margin: 0; padding: 0; list-style: none; }
+.listener-card li { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+.listener-label { color: var(--muted); font-size: 11px; font-weight: 600; }
+.session-editor { display: flex; flex-direction: column; gap: 12px; max-width: 980px; }
 .session-editor section small { font-weight: 400; }
-.tab-list { display: flex; flex-wrap: wrap; gap: 2px; border-bottom: 1px solid var(--border); }
-.tab { display: inline-flex; align-items: center; gap: 5px; padding: 5px 10px; color: var(--muted); background: transparent; border: 0; border-bottom: 2px solid transparent; border-radius: 4px 4px 0 0; }
+.tab-list { display: flex; gap: 2px; border-bottom: 1px solid var(--border); }
+.tab { display: inline-flex; align-items: center; gap: 5px; padding: 6px 14px; color: var(--muted); background: transparent; border: 0; border-bottom: 2px solid transparent; border-radius: 4px 4px 0 0; }
 .tab.active { color: var(--text); border-bottom-color: var(--accent); font-weight: 600; }
 .tab-badge { min-width: 16px; padding: 0 4px; color: #fff; background: var(--alert); border-radius: 999px; font-size: 11px; line-height: 16px; text-align: center; }
-.tab-panel { display: flex; flex-direction: column; gap: 10px; }
+.tab-panel { display: flex; flex-direction: column; gap: 12px; }
 .tab-panel[hidden] { display: none; }
-.tab-panel > section { display: flex; flex-direction: column; align-items: stretch; gap: 8px; }
-.tab-panel > section > .check { align-self: flex-start; }
+/* Settings groups. Matches the Connection tab's route and hop cards. */
+.card, .card-body { display: flex; flex-direction: column; align-items: stretch; gap: 10px; min-width: 0; }
+.card { padding: 12px 14px 14px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; }
+.card-body { margin: 0; padding: 0; border: 0; }
+.card > h2 { margin: 0; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; }
+.card > h2 small { margin-left: 4px; text-transform: none; letter-spacing: 0; font-size: 11px; }
+.card > .check, .card-body > .check, .card > .segmented { align-self: flex-start; }
+.card .field-row { align-items: flex-start; }
+.card.inactive .card-body { opacity: 0.5; }
+.card-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; align-items: stretch; }
 .segmented { display: inline-flex; flex-wrap: wrap; gap: 2px; align-self: flex-start; }
 .segmented button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
 .inline-form { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 6px; }

@@ -16,7 +16,7 @@ function hop(name: string, host: string, auth: AuthMethod[] = []): HopEntry {
 }
 
 function result(status: HopTestResult["status"], error: string | null, elapsed_ms = 0): HopTestResult {
-  return { hop_index: 0, hop_id: "hop-1", host: "example.com", port: 22, status, error, elapsed_ms };
+  return { hop_index: 0, hop_id: "hop-1", host: "example.com", port: 22, status, error, elapsed_ms, host_key: null };
 }
 
 function profile(hops: HopEntry[], passphrase: string | null): SessionProfile {
@@ -24,6 +24,7 @@ function profile(hops: HopEntry[], passphrase: string | null): SessionProfile {
     id: "00000000-0000-0000-0000-000000000001",
     name: "Work",
     autostart: false,
+    enabled: true,
     engine: "Russh",
     hops,
     forward: {
@@ -38,6 +39,7 @@ function profile(hops: HopEntry[], passphrase: string | null): SessionProfile {
       reverse_bind: "127.0.0.1",
       reverse_http_port: 0,
       reverse_socks_port: 0,
+      reverse_max_connections: null,
       reverse_allow: [],
       reverse_block: [],
     },
@@ -109,6 +111,14 @@ describe("hopBadge", () => {
       tone: "alert",
     });
     assert.equal(hopBadge(result("failed", null)).label, "Failed");
+  });
+
+  test("flags a host key that is not trusted yet", () => {
+    assert.deepEqual(hopBadge(result("host_key_unknown", "unknown host key")), {
+      glyph: "!",
+      label: "Host key not trusted yet",
+      tone: "alert",
+    });
   });
 
   test("marks hops that were never tried", () => {

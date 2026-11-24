@@ -46,6 +46,8 @@ export function hopBadge(result: HopTestResult): HopBadge {
       return { glyph: "✓", label: `Connected in ${result.elapsed_ms} ms`, tone: "ok" };
     case "failed":
       return { glyph: "!", label: result.error ?? "Failed", tone: "alert" };
+    case "host_key_unknown":
+      return { glyph: "!", label: "Host key not trusted yet", tone: "alert" };
     case "not_attempted":
       return { glyph: "–", label: "Not attempted", tone: "idle" };
   }

@@ -66,6 +66,7 @@ struct Slot {
     logs: LogRingBuffer,
     stats: Arc<AtomicStats>,
     listeners: SharedListeners,
+    remote_listeners: SharedListeners,
     cell: Arc<StateCell>,
     control: Mutex<Option<mpsc::UnboundedSender<Control>>>,
     /// Serializes start and stop, so a session never has two supervisors.
@@ -84,9 +85,11 @@ impl Slot {
         SessionSnapshot {
             id: profile.id,
             name: profile.name.clone(),
+            enabled: profile.enabled,
             state: self.cell.get(),
             stats: SessionStatsSnapshot::from_stats(self.stats.snapshot(), self.cell.uptime_secs()),
             listeners: lock(&self.listeners).clone(),
+            remote_listeners: lock(&self.remote_listeners).clone(),
         }
     }
 }
@@ -153,6 +156,7 @@ impl SessionManager {
                     logs: LogRingBuffer::new(self.inner.config.log_capacity),
                     stats: Arc::new(AtomicStats::default()),
                     listeners: Arc::default(),
+                    remote_listeners: Arc::default(),
                     cell: Arc::new(StateCell::new(id, self.inner.events.clone())),
                     control: Mutex::new(None),
                     lifecycle: tokio::sync::Mutex::new(None),
@@ -203,6 +207,7 @@ impl SessionManager {
             logs: slot.logs.clone(),
             stats: Arc::clone(&slot.stats),
             listeners: Arc::clone(&slot.listeners),
+            remote_listeners: Arc::clone(&slot.remote_listeners),
         };
         let cancel = CancellationToken::new();
         let session = tokio::spawn(run_session(
@@ -243,10 +248,14 @@ impl SessionManager {
         self.start(id).await
     }
 
+    /// Starts every enabled session. Disabled ones are only started one at a time.
     pub async fn start_all(&self) {
         for id in self.ids() {
             // An id removed concurrently is simply skipped.
-            let _ = self.start(id).await;
+            let enabled = self.slot(id).is_ok_and(|slot| lock(&slot.profile).enabled);
+            if enabled {
+                let _ = self.start(id).await;
+            }
         }
     }
 
@@ -268,7 +277,7 @@ impl SessionManager {
             .values()
             .filter_map(|slot| {
                 let profile = lock(&slot.profile);
-                profile.autostart.then(|| (profile.name.clone(), profile.id))
+                (profile.autostart && profile.enabled).then(|| (profile.name.clone(), profile.id))
             })
             .collect();
         targets.sort();
@@ -536,6 +545,27 @@ mod tests {
         f.manager.stop_all().await;
         assert_eq!(f.state(a), SessionState::Stopped);
         assert_eq!(f.state(b), SessionState::Stopped);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn start_all_and_autostart_skip_disabled_sessions() {
+        let f = fixture();
+        let mut off = profile("off");
+        off.enabled = false;
+        off.autostart = true;
+        let (off, off_script) = f.add(off, vec![Ok(()), Ok(())]);
+        let (on, _) = f.add(profile("on"), vec![Ok(())]);
+        assert!(!f.manager.snapshot(off).unwrap().enabled);
+
+        f.manager.start_autostart_staggered().await;
+        f.manager.start_all().await;
+        f.until_state(on, SessionState::Connected).await;
+        assert_eq!(f.state(off), SessionState::Stopped);
+        assert_eq!(off_script.connects(), 0);
+
+        // Disabled only excludes it from bulk starts.
+        f.manager.start(off).await.unwrap();
+        f.until_state(off, SessionState::Connected).await;
     }
 
     #[tokio::test(start_paused = true)]

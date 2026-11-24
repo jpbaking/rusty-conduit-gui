@@ -11,6 +11,7 @@ pub mod sessions;
 #[cfg(test)]
 pub(crate) mod test_support;
 
+use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::future::Future;
@@ -21,7 +22,7 @@ use conduit_core::{
     load_app_config, load_known_hosts, save_app_config, save_known_hosts, AppConfig, KeyId,
     KnownHostsStore, SecretRef, SessionProfile, StorageError, ValidateError,
 };
-use conduit_runtime::{ManagerConfig, RuntimeError, RuntimeEvent, SessionManager};
+use conduit_runtime::{HostKeyPrompt, ManagerConfig, RuntimeError, RuntimeEvent, SessionManager};
 use conduit_vault::{Argon2Params, KeyringBackend, OsKeyringBackend, Vault, VaultError};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -187,6 +188,8 @@ struct Inner {
     known_hosts_save: Mutex<()>,
     /// Serializes vault creation and unlocking.
     vault_lifecycle: Mutex<()>,
+    /// The unknown key each session's latest chain test saw, so the user can trust exactly it.
+    tested_host_keys: Mutex<HashMap<Uuid, HostKeyPrompt>>,
 }
 
 /// The application backend. Cloning yields another handle to the same state.
@@ -283,8 +286,14 @@ impl AppController {
                 manager,
                 known_hosts_save: Mutex::new(()),
                 vault_lifecycle: Mutex::new(()),
+                tested_host_keys: Mutex::new(HashMap::new()),
             }),
         })
+    }
+
+    /// Unknown host keys seen by the latest chain test of each session.
+    pub(crate) fn tested_host_keys(&self) -> MutexGuard<'_, HashMap<Uuid, HostKeyPrompt>> {
+        lock(&self.inner.tested_host_keys)
     }
 
     pub(crate) fn manager(&self) -> &SessionManager {

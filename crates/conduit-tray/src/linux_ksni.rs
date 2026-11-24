@@ -9,11 +9,12 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use ksni::menu::{StandardItem, SubMenu};
-use ksni::{Category, Handle, MenuItem, OfflineReason, Status, Tray, TrayMethods};
+use ksni::{Category, Handle, Icon, MenuItem, OfflineReason, Status, Tray, TrayMethods};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use crate::backend::{ActionDispatcher, SharedHostStatus, TrayBackend, TrayError};
+use crate::image::TrayImage;
 use crate::model::{
     TrayAction, TrayHostStatus, TrayIconState, TrayMenuItem, TrayMenuModel, APP_TITLE,
 };
@@ -26,6 +27,8 @@ const DBUS_TIMEOUT: Duration = Duration::from_secs(3);
 
 struct ConduitTray {
     model: TrayMenuModel,
+    /// The app logo. Without one, the state icons from the desktop's theme are used.
+    icon: Option<TrayImage>,
     dispatcher: ActionDispatcher,
     status: SharedHostStatus,
     watcher_missing: Arc<AtomicBool>,
@@ -43,6 +46,14 @@ fn icon_name(icon: TrayIconState) -> &'static str {
         TrayIconState::Reconnecting => "view-refresh",
         TrayIconState::Attention => "dialog-warning",
         TrayIconState::Locked => "changes-prevent",
+    }
+}
+
+fn sni_icon(image: &TrayImage) -> Icon {
+    Icon {
+        width: i32::try_from(image.width).unwrap_or(i32::MAX),
+        height: i32::try_from(image.height).unwrap_or(i32::MAX),
+        data: image.to_argb32(),
     }
 }
 
@@ -121,7 +132,25 @@ impl Tray for ConduitTray {
     }
 
     fn icon_name(&self) -> String {
-        icon_name(self.model.icon).into()
+        // Hosts prefer a theme name over a pixmap, so leave it empty when there is a logo.
+        if self.icon.is_some() {
+            String::new()
+        } else {
+            icon_name(self.model.icon).into()
+        }
+    }
+
+    fn icon_pixmap(&self) -> Vec<Icon> {
+        self.icon.iter().map(sni_icon).collect()
+    }
+
+    /// Shown instead of the logo while the status is `NeedsAttention`.
+    fn attention_icon_name(&self) -> String {
+        if self.icon.is_some() {
+            icon_name(TrayIconState::Attention).into()
+        } else {
+            String::new()
+        }
     }
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
@@ -162,10 +191,15 @@ impl Drop for WorkerExit {
     }
 }
 
-async fn connect(model: &TrayMenuModel, shared: &Shared) -> Option<Handle<ConduitTray>> {
+async fn connect(
+    model: &TrayMenuModel,
+    icon: Option<&TrayImage>,
+    shared: &Shared,
+) -> Option<Handle<ConduitTray>> {
     let watcher_missing = Arc::new(AtomicBool::new(false));
     let tray = ConduitTray {
         model: model.clone(),
+        icon: icon.cloned(),
         dispatcher: shared.dispatcher.clone(),
         status: shared.status.clone(),
         watcher_missing: Arc::clone(&watcher_missing),
@@ -187,6 +221,7 @@ async fn connect(model: &TrayMenuModel, shared: &Shared) -> Option<Handle<Condui
 
 async fn run(
     mut model: TrayMenuModel,
+    icon: Option<TrayImage>,
     mut commands: mpsc::UnboundedReceiver<Command>,
     shared: Shared,
 ) {
@@ -199,7 +234,7 @@ async fn run(
             shared.status.set(TrayHostStatus::Offline);
         }
         if handle.is_none() && tokio::time::Instant::now() >= next_attempt {
-            handle = connect(&model, &shared).await;
+            handle = connect(&model, icon.as_ref(), &shared).await;
             next_attempt = tokio::time::Instant::now() + RETRY_INTERVAL;
         }
 
@@ -239,7 +274,9 @@ pub struct KsniTrayBackend {
 impl KsniTrayBackend {
     /// Starts the tray worker. This succeeds without D-Bus or a tray host: check
     /// [`TrayBackend::host_status`] for availability.
-    pub fn spawn(initial: TrayMenuModel) -> Result<Self, TrayError> {
+    ///
+    /// `icon` is the app logo. Without it, the desktop theme's state icons are shown instead.
+    pub fn spawn(initial: TrayMenuModel, icon: Option<TrayImage>) -> Result<Self, TrayError> {
         let (commands, receiver) = mpsc::unbounded_channel();
         let shared = Shared {
             status: SharedHostStatus::new(TrayHostStatus::Waiting),
@@ -256,7 +293,7 @@ impl KsniTrayBackend {
                 else {
                     return;
                 };
-                runtime.block_on(run(initial, receiver, worker_shared));
+                runtime.block_on(run(initial, icon, receiver, worker_shared));
             })?;
         Ok(Self {
             commands,
@@ -305,22 +342,42 @@ mod tests {
         SessionSnapshot {
             id: Uuid::new_v4(),
             name: name.into(),
+            enabled: true,
             state: SessionState::Connected,
             stats: SessionStatsSnapshot::default(),
             listeners: vec![ListenerInfo {
                 role: "SOCKS4/4a/5".into(),
                 addr: "127.0.0.1:1080".parse().unwrap(),
             }],
+            remote_listeners: Vec::new(),
         }
     }
 
     fn tray(model: TrayMenuModel) -> ConduitTray {
         ConduitTray {
             model,
+            icon: None,
             dispatcher: ActionDispatcher::default(),
             status: SharedHostStatus::new(TrayHostStatus::Waiting),
             watcher_missing: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    #[test]
+    fn ksni_logo_replaces_theme_icons_and_attention_uses_a_warning() {
+        let model = TrayMenuModel::from_snapshots(&[session("a")], false);
+        let plain = tray(model.clone());
+        assert_eq!(plain.icon_name(), "network-transmit-receive");
+        assert!(plain.icon_pixmap().is_empty());
+        assert!(plain.attention_icon_name().is_empty());
+
+        let logo = TrayImage::new(1, 1, vec![10, 20, 30, 255]).unwrap();
+        let branded = ConduitTray { icon: Some(logo), ..tray(model) };
+        assert_eq!(branded.icon_name(), "", "a theme name would win over the logo");
+        let pixmap = branded.icon_pixmap();
+        assert_eq!((pixmap[0].width, pixmap[0].height), (1, 1));
+        assert_eq!(pixmap[0].data, vec![255, 10, 20, 30]);
+        assert_eq!(branded.attention_icon_name(), "dialog-warning");
     }
 
     fn label(item: &MenuItem<ConduitTray>) -> &str {

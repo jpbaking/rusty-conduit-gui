@@ -70,7 +70,7 @@ impl SessionState {
     }
 }
 
-/// One bound local proxy listener.
+/// One bound proxy listener, on this computer or, for a reverse proxy, on the target host.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ListenerInfo {
     pub role: String,
@@ -105,9 +105,14 @@ impl SessionStatsSnapshot {
 pub struct SessionSnapshot {
     pub id: Uuid,
     pub name: String,
+    /// `false` when the session is left out of Start All and autostart.
+    pub enabled: bool,
     pub state: SessionState,
     pub stats: SessionStatsSnapshot,
+    /// Proxy listeners bound on this computer.
     pub listeners: Vec<ListenerInfo>,
+    /// Reverse proxy (`-R`) listeners bound on the target host, while connected.
+    pub remote_listeners: Vec<ListenerInfo>,
 }
 
 #[derive(Debug)]

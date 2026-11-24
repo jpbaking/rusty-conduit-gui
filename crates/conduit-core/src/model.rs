@@ -290,6 +290,9 @@ pub struct ReverseConfig {
     pub reverse_http_port: u16,
     #[serde(default)]
     pub reverse_socks_port: u16,
+    /// Concurrent reverse proxy clients (`0` = unlimited). `None` uses the forward cap.
+    #[serde(default)]
+    pub reverse_max_connections: Option<usize>,
     #[serde(default)]
     pub reverse_allow: Vec<String>,
     #[serde(default)]
@@ -302,6 +305,7 @@ impl Default for ReverseConfig {
             reverse_bind: default_reverse_bind(),
             reverse_http_port: 0,
             reverse_socks_port: 0,
+            reverse_max_connections: None,
             reverse_allow: Vec::new(),
             reverse_block: Vec::new(),
         }
@@ -495,6 +499,9 @@ pub struct SessionProfile {
     pub name: String,
     #[serde(default)]
     pub autostart: bool,
+    /// `false` leaves the session out of Start All and autostart. It can still be started alone.
+    #[serde(default = "enabled_by_default")]
+    pub enabled: bool,
     #[serde(default)]
     pub engine: SshEngine,
     pub hops: Vec<HopEntry>,
@@ -510,12 +517,17 @@ pub struct SessionProfile {
     pub openssh: OpenSshOptions,
 }
 
+fn enabled_by_default() -> bool {
+    true
+}
+
 impl Default for SessionProfile {
     fn default() -> Self {
         Self {
             id: Uuid::nil(),
             name: String::new(),
             autostart: false,
+            enabled: true,
             engine: SshEngine::default(),
             hops: Vec::new(),
             forward: ForwardConfig::default(),
