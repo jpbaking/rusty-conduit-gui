@@ -37,6 +37,10 @@
   let authError = $state<string | null>(null);
   let confirmReset = $state(false);
   let resetting = $state(false);
+  let importing = $state(false);
+  let importPath = $state("");
+  let importBusy = $state(false);
+  let importError = $state<string | null>(null);
 
   const pin = $derived(hop ? store.pinFor(hop) : null);
   const usedKeys = $derived(
@@ -112,6 +116,25 @@
     await store.resetPin(hop);
     resetting = false;
     confirmReset = false;
+  }
+
+  async function importPin(event: SubmitEvent) {
+    event.preventDefault();
+    const path = importPath.trim();
+    if (!hop || !path || importBusy) return;
+    importBusy = true;
+    importError = await store.importKnownHost(hop, path);
+    importBusy = false;
+    if (!importError) {
+      importing = false;
+      importPath = "";
+    }
+  }
+
+  function cancelImport() {
+    importing = false;
+    importPath = "";
+    importError = null;
   }
 </script>
 
@@ -336,6 +359,30 @@
       {/if}
     {:else}
       <p class="muted">No key pinned yet. You will be asked to approve it on first connection.</p>
+    {/if}
+    {#if importing}
+      <form onsubmit={importPin}>
+        <label class="field">
+          OpenSSH known_hosts file
+          <input
+            bind:value={importPath}
+            placeholder="/path/to/known_hosts"
+            autocomplete="off"
+            spellcheck="false"
+            aria-describedby="{uid}-import-help"
+          />
+        </label>
+        <p id="{uid}-import-help" class="muted">
+          Imports the key listed for {host.host || "this host"}:{host.port} and pins it for this hop,
+          replacing any current pin. Only the file you enter is read; <code>~/.ssh/known_hosts</code>
+          is never read automatically.
+        </p>
+        {#if importError}<p class="reason" role="alert">{importError}</p>{/if}
+        <button type="button" onclick={cancelImport}>Cancel</button>
+        <button type="submit" disabled={importBusy || !importPath.trim() || !host.host}>Import</button>
+      </form>
+    {:else}
+      <button onclick={() => (importing = true)}>Import from file…</button>
     {/if}
   {/if}
 </div>

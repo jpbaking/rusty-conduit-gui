@@ -291,6 +291,12 @@ impl AppController {
         &self.inner.manager
     }
 
+    /// Reports an OS wake so live sessions are recycled once the burst settles. Must be called
+    /// inside a Tokio runtime.
+    pub fn notify_system_wake(&self) {
+        self.inner.manager.notify_system_wake();
+    }
+
     /// A new stream of runtime events.
     pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<RuntimeEvent> {
         self.inner.manager.subscribe_events()
@@ -489,6 +495,16 @@ mod tests {
     use super::*;
     use conduit_core::{HostKeyLookup, HostKeyRecord, Timestamp};
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn notify_system_wake_is_callable_without_sessions() {
+        let dir = TempDir::new();
+        let c = controller(&dir);
+        c.notify_system_wake();
+        c.notify_system_wake();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(c.manager().snapshots().is_empty());
+    }
 
     #[tokio::test]
     async fn fresh_directory_has_no_vault_and_writes_nothing() {

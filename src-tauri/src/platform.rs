@@ -8,6 +8,10 @@ use std::process::Command;
 pub const FLAG_TRAY: &str = "--tray";
 pub const FLAG_SHOW: &str = "--show";
 pub const FLAG_SAFE_RENDERING: &str = "--safe-rendering";
+pub const FLAG_HELP: &str = "--help";
+pub const FLAG_HELP_SHORT: &str = "-h";
+pub const FLAG_VERSION: &str = "--version";
+pub const FLAG_VERSION_SHORT: &str = "-V";
 
 pub const ENV_DISABLE_DMABUF: &str = "WEBKIT_DISABLE_DMABUF_RENDERER";
 pub const ENV_DISABLE_COMPOSITING: &str = "WEBKIT_DISABLE_COMPOSITING_MODE";
@@ -23,6 +27,10 @@ pub struct CliFlags {
     pub tray: bool,
     pub show: bool,
     pub safe_rendering: bool,
+    /// `--help` / `-h`: print usage and exit without starting the GUI.
+    pub help: bool,
+    /// `--version` / `-V`: print the version and exit without starting the GUI.
+    pub version: bool,
 }
 
 impl CliFlags {
@@ -41,6 +49,10 @@ impl CliFlags {
                 flags.show = true;
             } else if arg == FLAG_SAFE_RENDERING {
                 flags.safe_rendering = true;
+            } else if arg == FLAG_HELP || arg == FLAG_HELP_SHORT {
+                flags.help = true;
+            } else if arg == FLAG_VERSION || arg == FLAG_VERSION_SHORT {
+                flags.version = true;
             }
         }
         flags
@@ -60,6 +72,33 @@ impl CliFlags {
     pub fn second_launch_opens_window(self) -> bool {
         !self.starts_hidden()
     }
+}
+
+/// The `--version` output: the binary name and its version.
+pub fn version_text() -> String {
+    format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+}
+
+/// The `--help` output: a usage line and every flag this app understands.
+pub fn help_text() -> String {
+    format!(
+        "{version}
+Desktop tray and Manage Window for Rusty Conduit SSH.
+
+Usage: {name} [OPTIONS]
+
+Options:
+  {FLAG_TRAY:<18}  Start in the tray with no window (used by login autostart)
+  {FLAG_SHOW:<18}  Open the window even when --tray is given
+  {FLAG_SAFE_RENDERING:<18}  Turn off WebKitGTK compositing to work around rendering glitches
+  {help:<18}  Print this help and exit
+  {ver:<18}  Print the version and exit
+",
+        version = version_text(),
+        name = env!("CARGO_PKG_NAME"),
+        help = format!("{FLAG_HELP_SHORT}, {FLAG_HELP}"),
+        ver = format!("{FLAG_VERSION_SHORT}, {FLAG_VERSION}"),
+    )
 }
 
 /// Whether the NVIDIA kernel driver is loaded. `root` is `/` outside tests.
@@ -149,8 +188,49 @@ mod tests {
         assert_eq!(parse(&["--nope", "tray", "--tray=1"]), CliFlags::default());
         assert_eq!(
             parse(&["--safe-rendering", "--show", "--tray"]),
-            CliFlags { tray: true, show: true, safe_rendering: true }
+            CliFlags { tray: true, show: true, safe_rendering: true, ..CliFlags::default() }
         );
+    }
+
+    #[test]
+    fn platform_parses_help_flags() {
+        assert!(parse(&["-h"]).help);
+        assert!(parse(&["--help"]).help);
+        assert!(!parse(&["--help"]).version);
+        assert!(!parse(&["-help", "help"]).help);
+    }
+
+    #[test]
+    fn platform_parses_version_flags() {
+        assert!(parse(&["-V"]).version);
+        assert!(parse(&["--version"]).version);
+        assert!(!parse(&["--version"]).help);
+        assert!(!parse(&["-v", "version"]).version);
+    }
+
+    #[test]
+    fn platform_version_text_names_package_and_version() {
+        let text = version_text();
+        assert_eq!(text, format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")));
+        assert!(text.starts_with("rusty-conduit-ssh-gui "));
+    }
+
+    #[test]
+    fn platform_help_text_lists_every_flag() {
+        let text = help_text();
+        assert!(text.starts_with(&version_text()));
+        assert!(text.contains("Usage: rusty-conduit-ssh-gui [OPTIONS]"));
+        for flag in [
+            FLAG_TRAY,
+            FLAG_SHOW,
+            FLAG_SAFE_RENDERING,
+            FLAG_HELP,
+            FLAG_HELP_SHORT,
+            FLAG_VERSION,
+            FLAG_VERSION_SHORT,
+        ] {
+            assert!(text.contains(flag), "{flag} missing from help text");
+        }
     }
 
     #[test]

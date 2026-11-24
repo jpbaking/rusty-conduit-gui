@@ -466,6 +466,20 @@ class AppStore {
     }
   }
 
+  /**
+   * Pins the hop's key from a `known_hosts` file at a path the user typed. Returns an error
+   * message, or `null` on success.
+   */
+  async importKnownHost(hop: HopEntry, path: string): Promise<string | null> {
+    try {
+      await api.importKnownHost(hop.hop_id, hop.host.host, hop.host.port, path);
+      await this.refresh();
+      return null;
+    } catch (error) {
+      return errorMessage(error);
+    }
+  }
+
   /** Saves a hop of the saved session as a reusable host and links the hop to it. */
   async promoteHop(hopId: string, name: string): Promise<boolean> {
     const session = this.selected;

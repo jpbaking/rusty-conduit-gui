@@ -142,6 +142,9 @@ export const api = {
   listHostKeyPins: () => call<HostKeyEntry[]>("list_host_key_pins"),
   resetHostKey: (hopId: string, host: string, port: number) =>
     call<boolean>("reset_host_key", { hopId, host, port }),
+  /** Pins a hop's key from a `known_hosts` file at `path`, which the user must type. */
+  importKnownHost: (hopId: string, host: string, port: number, path: string) =>
+    call<HostKeyEntry>("import_known_host", { hopId, host, port, path }),
   testChain: (id: Uuid) => call<ChainTestResult>("test_chain", { id }),
 
   // Session-editor helpers.

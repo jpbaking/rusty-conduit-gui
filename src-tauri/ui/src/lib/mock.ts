@@ -303,6 +303,28 @@ function dispatch(command: string, args?: Record<string, unknown>): unknown {
       );
       return pins.length !== before;
     }
+    case "import_known_host": {
+      // The preview cannot read files; any non-empty path imports a demo key.
+      if (!String(args?.path ?? "").trim()) throw new ApiError("io", "cannot read : no such file");
+      const entry: HostKeyEntry = {
+        key: { hop_id: String(args?.hopId), host: String(args?.host), port: Number(args?.port) },
+        record: {
+          algorithm: "ssh-ed25519",
+          fingerprint_sha256: "SHA256:demoImportedHostKeyForPreviewOnly",
+          first_seen: Math.floor(Date.now() / 1000),
+          approved: true,
+          public_key_openssh: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIMAKvbC1OkNvrNiAjJ6wli5nNQS5707OnbcrowxpV2Q",
+        },
+      };
+      pins = [
+        ...pins.filter(
+          ({ key }) =>
+            !(key.hop_id === entry.key.hop_id && key.host === entry.key.host && key.port === entry.key.port),
+        ),
+        entry,
+      ];
+      return structuredClone(entry);
+    }
     case "set_password_secret":
       return { secret_ref: crypto.randomUUID(), has_secret: true };
     case "set_mitm_passphrase": {

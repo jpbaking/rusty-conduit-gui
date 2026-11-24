@@ -82,6 +82,15 @@ pub fn run() {
     platform::harden_process();
     // Must happen here: before GTK initializes and before any other thread starts.
     let flags = CliFlags::from_env();
+    // Informational flags print and exit before any GUI or GTK initialization.
+    if flags.help {
+        print!("{}", platform::help_text());
+        return;
+    }
+    if flags.version {
+        println!("{}", platform::version_text());
+        return;
+    }
     platform::apply_rendering_env(flags);
 
     tauri::Builder::default()
@@ -108,6 +117,13 @@ pub fn run() {
             let controller = AppController::open(dir, ControllerOptions::default())?;
             tauri::async_runtime::spawn(controller.known_hosts_autosave());
             app.manage(controller.clone());
+
+            // Best-effort: with no OS wake source the handle does nothing. Kept for the app's life.
+            let wake_controller = controller.clone();
+            app.manage(conduit_runtime::spawn_wake_listener(Arc::new(move || {
+                let controller = wake_controller.clone();
+                tauri::async_runtime::spawn(async move { controller.notify_system_wake() });
+            })));
 
             let handle = app.handle().clone();
             app.manage(AutostartHandle::new(PluginAutostart(handle.clone())));

@@ -39,6 +39,7 @@ jobs:
 
       - run: npm ci
       - run: npm run check
+      - run: npm test
       - run: npm run build
 
   rust-and-e2e:

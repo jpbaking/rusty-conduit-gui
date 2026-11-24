@@ -940,7 +940,9 @@ dependencies = [
 name = "conduit-core"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "humantime",
+ "ring",
  "rusty-conduit-ssh",
  "serde",
  "serde_json",
@@ -969,11 +971,16 @@ dependencies = [
 name = "conduit-runtime"
 version = "0.1.0"
 dependencies = [
+ "block2",
  "conduit-core",
  "conduit-openssh",
  "conduit-ssh",
  "conduit-vault",
+ "futures-util",
  "libc",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
  "p12-keystore",
  "rcgen",
  "russh",
@@ -986,6 +993,8 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
  "uuid",
+ "windows-sys 0.61.2",
+ "zbus",
  "zeroize",
 ]
 

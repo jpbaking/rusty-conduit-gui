@@ -6,11 +6,13 @@
 //!
 //! See `docs/MASTER-PLAN.md` section 7 for the full data model.
 
+mod known_hosts_import;
 mod mapping;
 mod model;
 mod storage;
 mod validate;
 
+pub use known_hosts_import::{parse_openssh_known_hosts_for_host, ImportedHostKey};
 pub use mapping::{to_config, MappingError};
 pub use model::*;
 pub use storage::{

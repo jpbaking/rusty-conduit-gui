@@ -248,6 +248,21 @@ pub async fn reset_host_key(c: Ctl<'_>, hop_id: String, host: String, port: u16)
     blocking(&c, move |c| c.reset_host_key(&hop_id, &host, port)).await
 }
 
+/// Pins a hop's host key from a `known_hosts` file at a path the user typed. Never a default path.
+#[tauri::command]
+pub async fn import_known_host(
+    c: Ctl<'_>,
+    hop_id: String,
+    host: String,
+    port: u16,
+    path: String,
+) -> CmdResult<conduit_core::HostKeyEntry> {
+    blocking(&c, move |c| {
+        c.import_known_host_from_file(&hop_id, &host, port, std::path::Path::new(&path))
+    })
+    .await
+}
+
 #[tauri::command]
 pub async fn test_chain(c: Ctl<'_>, id: Uuid) -> CmdResult<ChainTestResult> {
     c.test_session_chain(id).await
@@ -439,6 +454,7 @@ macro_rules! ipc_handler {
             $crate::commands::reject_host_key,
             $crate::commands::list_host_key_pins,
             $crate::commands::reset_host_key,
+            $crate::commands::import_known_host,
             $crate::commands::test_chain,
             $crate::commands::check_port_conflicts,
             $crate::commands::test_filter_rules,
@@ -486,7 +502,7 @@ mod tests {
         "list_hosts", "upsert_host", "delete_host", "promote_hop_to_host", "start_session",
         "stop_session", "restart_session", "start_all", "stop_all", "get_session_logs",
         "clear_session_logs", "approve_host_key", "reject_host_key", "list_host_key_pins",
-        "reset_host_key", "test_chain", "check_port_conflicts", "test_filter_rules",
+        "reset_host_key", "import_known_host", "test_chain", "check_port_conflicts", "test_filter_rules",
         "inspect_mitm_ca", "check_openssh_binary", "export_config", "import_config",
         "get_autostart", "set_autostart", "shell_ready", "resolve_close",
     ];
@@ -716,6 +732,23 @@ mod tests {
         assert_eq!(ipc.err("reject_host_key", json!({ "id": id }))["code"], "runtime");
         assert_eq!(ipc.ok("list_host_key_pins", json!({})), json!([]));
         assert_eq!(ipc.ok("reset_host_key", json!({ "hopId": "h", "host": "x", "port": 22 })), false);
+        let user_known_hosts = dir.path().join("user-known_hosts");
+        std::fs::write(
+            &user_known_hosts,
+            "[x]:2222 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIMAKvbC1OkNvrNiAjJ6wli5nNQS5707OnbcrowxpV2Q\n",
+        )
+        .unwrap();
+        let imported = ipc.ok(
+            "import_known_host",
+            json!({ "hopId": "h", "host": "x", "port": 2222, "path": user_known_hosts }),
+        );
+        assert_eq!(imported["record"]["fingerprint_sha256"], "SHA256:9I6JDw93SZWDRe51mShFze57vAaKMdUWr3LkP0+FEEM");
+        assert_eq!(ipc.ok("list_host_key_pins", json!({})).as_array().unwrap().len(), 1);
+        assert_eq!(
+            ipc.err("import_known_host", json!({ "hopId": "h", "host": "y", "port": 22, "path": user_known_hosts }))["code"],
+            "not_found"
+        );
+        assert_eq!(ipc.ok("reset_host_key", json!({ "hopId": "h", "host": "x", "port": 2222 })), true);
         let report = ipc.ok("test_chain", json!({ "id": id }));
         assert_eq!(report["all_connected"], false);
         assert_eq!(report["hops"][0]["status"], "failed");

@@ -1,62 +1,51 @@
-# phase-0003 — Cross-platform CI & Release automation workflows
+# phase-0003 — Frontend unit tests & CI integration
 
 - Status: done
 - Owner: executor
-- Depends on: phase-0001, phase-0002
-- Goal: Add `.github/workflows/ci.yml` and `.github/workflows/release.yml` covering all Phase 5 CI gates and cross-platform packaging/signing targets.
-- Done when: Both workflow YAML files parse cleanly, cover Linux/macOS/Windows CI gates and Windows x64/arm64 + macOS Universal + Linux x64/arm64 (Ubuntu 22.04) release builds with conditional signing and smoke tests, and `python3 scripts/validate-release-config.py` exits 0.
-- Pattern to follow: `Cargo.toml:18-20` for sibling `../rusty-conduit-ssh` path dependency layout and `scripts/stage-worker.py` + `scripts/smoke-test-bundle.py` for build/smoke steps.
+- Depends on: phase-0002
+- Goal: Add automated unit tests for the frontend's pure TypeScript modules (`validate.ts`, `chain.ts`, `format.ts`) runnable via `npm test` with zero new npm dependencies, and wire `npm test` into CI and Release workflows.
+- Done when: `(cd src-tauri/ui && npm run check && npm test && npm run build) && python3 scripts/validate-release-config.py` exits 0 with passing unit tests and updated CI/release workflows.
+- Pattern to follow: `src-tauri/ui/src/lib/validate.ts`, `src-tauri/ui/src/lib/chain.ts`, `src-tauri/ui/src/lib/format.ts`, and `.github/workflows/ci.yml:20-43`.
 
 ## Context
-- `Cargo.toml` depends on `rusty-conduit-ssh = { path = "../rusty-conduit-ssh" }`. In GitHub Actions, check out this repo into `rusty-conduit-ssh-gui/` and check out `jpbaking/rusty-conduit-ssh` (configurable via env `UPSTREAM_REPO` / `UPSTREAM_REF`, defaulting to `jpbaking/rusty-conduit-ssh` at `main`) into `rusty-conduit-ssh/` so `../rusty-conduit-ssh` resolves identically on Linux, macOS, and Windows runners.
-- `.github/workflows/ci.yml` must run on `push` (to `main`) and `pull_request`:
-  - `frontend` job (Ubuntu 22.04, Node 22): `npm ci`, `npm run check`, `npm run build` in `src-tauri/ui`.
-  - `rust-and-e2e` matrix on `ubuntu-22.04`, `macos-latest`, and `windows-latest`:
-    - Linux installs `libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libdbus-1-dev libgtk-3-dev openssh-client`.
-    - Runs `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (which runs unit tests, multi-hop loopback E2E, `conduit-openssh` Windows named-pipe/askpass or Unix tests, and `secret_leak_scan`), `python3 scripts/check-pure-rust-crypto.py`, `python3 scripts/validate-release-config.py`, and on Linux also `RUSTFLAGS="--cfg conduit_check_tauri_tray" cargo check -p rusty-conduit-ssh-gui --tests`.
-- `.github/workflows/release.yml` must run on tag push `v*` and `workflow_dispatch` (with `dry_run` boolean input, default `true`):
-  - `verify` job running the CI/validation gates before packaging.
-  - `package` matrix:
-    - `linux-x64` (`ubuntu-22.04`, `x86_64-unknown-linux-gnu`) → `.deb`, `.rpm`, `.AppImage` (install `rpm` alongside WebKitGTK/Tauri Linux build deps so `.rpm` bundling and `smoke-test-bundle.py`'s `rpm -qlp` check succeed)
-    - `linux-arm64` (`ubuntu-22.04-arm`, `aarch64-unknown-linux-gnu`) → `.deb`, `.rpm`, `.AppImage` (also install `rpm`)
-    - `macos-universal` (`macos-latest`, `universal-apple-darwin`) → `.app` + `.dmg` using `scripts/stage-worker.py --universal-macos` and conditional Apple Developer ID signing/notarization when `APPLE_CERTIFICATE` secret is non-empty (falling back to unsigned/ad-hoc when unset)
-    - `windows-x64` (`windows-latest`, `x86_64-pc-windows-msvc`) → NSIS `.exe` + `.msi` with conditional Authenticode signing when `WINDOWS_CERTIFICATE` secret is non-empty
-    - `windows-arm64` (`windows-latest`, `aarch64-pc-windows-msvc` cross-target) → NSIS `.exe` + `.msi`
-  - Every package job stages `conduit-worker` via `scripts/stage-worker.py`, builds with `tauri build --config src-tauri/tauri.bundle.conf.json`, runs `scripts/smoke-test-bundle.py`, and uploads artifacts.
-  - `release` job downloads all artifacts, generates `SHA256SUMS.txt`, and creates a draft GitHub Release on `startsWith(github.ref, 'refs/tags/v')` (skipped on `workflow_dispatch` with `dry_run: true`).
-- Update `scripts/validate-release-config.py` if needed so it strictly asserts both `.github/workflows/ci.yml` and `.github/workflows/release.yml` exist and contain the expected matrix targets, secret-leak test invocation, pure-Rust crypto check, and smoke-test step.
+Currently `src-tauri/ui/package.json` has `check` (`svelte-check`) and `build` (`vite build`), but zero automated unit tests. Node 22+ (CI uses Node 22; local host has Node 26) includes `node:test` and `node:assert/strict` plus native TypeScript type-stripping (`node --experimental-strip-types --test` works on both Node 22.6+ and Node 26; note: avoid TypeScript syntax not supported by strip-types such as `enum` or parameter properties, and use `.ts` relative imports or explicit extensions only as compatible with `svelte-check` / `tsconfig.json` — verify `npm run check` and `npm run build` still pass cleanly!).
+Check `src-tauri/ui/tsconfig.json` before writing test imports so `svelte-check` and `node --test` both succeed with zero warnings.
+Planner decision (resolving sub-task 1 escalation): Approve option (b) so test files stay strictly type-checked by `svelte-check`. Add `"allowImportingTsExtensions": true` to `src-tauri/ui/tsconfig.json` (compatible with `"noEmit": true`) and add minimal ambient declarations for `node:test` and `node:assert/strict` in `src-tauri/ui/src/lib/node-test.d.ts` (both added to Scope: In). Do not use `// @ts-nocheck`.
 
 ## Scope
-- In: `.github/workflows/ci.yml`, `.github/workflows/release.yml`, `scripts/validate-release-config.py`
-- Out: `crates/**`, `src-tauri/**`, `docs/**`, `.gitignore`
+- In: `src-tauri/ui/package.json`, `src-tauri/ui/tsconfig.json`, `src-tauri/ui/src/lib/node-test.d.ts`, `src-tauri/ui/src/lib/validate.test.ts`, `src-tauri/ui/src/lib/chain.test.ts`, `src-tauri/ui/src/lib/format.test.ts`, `src-tauri/ui/dist/**`, `.github/workflows/ci.yml`, `.github/workflows/release.yml`, `scripts/validate-release-config.py`
+- Out: `src-tauri/ui/package-lock.json` (zero new npm dependencies), `docs/MASTER-PLAN.md`, `../rusty-conduit-ssh`, `crates/**`
 
 ## Sub-tasks
-1. [done] Create `.github/workflows/ci.yml` with sibling `rusty-conduit-ssh` checkout, frontend check/build job, 3-OS (`ubuntu-22.04`, `macos-latest`, `windows-latest`) Rust clippy + `cargo test --workspace` + `secret_leak_scan` + `check-pure-rust-crypto.py` + `validate-release-config.py` + Linux `conduit_check_tauri_tray` check — done when: YAML parses cleanly with `python3 -c "import yaml; yaml.safe_load(open('.github/workflows/ci.yml'))"`.
-2. [done] Create `.github/workflows/release.yml` with tag `v*` + `workflow_dispatch` trigger, `verify` gate, 5-target packaging matrix (`linux-x64`, `linux-arm64`, `macos-universal`, `windows-x64`, `windows-arm64`), `stage-worker.py`, `tauri build --config src-tauri/tauri.bundle.conf.json`, conditional Apple/Windows signing env wiring, `smoke-test-bundle.py`, `SHA256SUMS.txt`, and draft GitHub Release publishing — done when: YAML parses cleanly with `python3 -c "import yaml; yaml.safe_load(open('.github/workflows/release.yml'))"`.
-3. [done] Tighten `scripts/validate-release-config.py` to require `.github/workflows/ci.yml` and `.github/workflows/release.yml` and assert all required OS/arch targets, secret-leak scan, pure-Rust crypto check, and smoke-test invocations are present — done when: `python3 scripts/validate-release-config.py` exits 0.
+1. [done] Add `src-tauri/ui/src/lib/validate.test.ts` testing `isPort`, `isIpAddress` (IPv4, IPv6, compressed `::`, embedded IPv4, invalid inputs), `isLoopback`, `filterRuleError` (CIDR v4/v6, invalid prefixes, plain domains, `*.domain` wildcards, mid-wildcards, brackets), `denylistedFlag` (short flags `-F`, `-J`, `-i`, bundled flags `-vF`, `-oProxyCommand=foo`, case-insensitive options, allowed flags like `-C`, `-v`), `redactArgs` (flags, `=value`, `-o Name=value`, positional args), and `sessionErrors` (valid profile, missing name/hops, zero ports, allow+block conflict, MITM TTL < 10, reconnect initial > max, OpenSSH denylist). — done when: `node --test src-tauri/ui/src/lib/validate.test.ts` exits 0.
+2. [done] Add `src-tauri/ui/src/lib/chain.test.ts` (testing `moved`, `hopRole`, `hopTitle`, `hopBadge`, `authRefs`, `profileRefs`) and `src-tauri/ui/src/lib/format.test.ts` (testing `statusOf`, `isActive`, `stateReason`, `formatBytes`, `formatUptime`, `logLevel`, `passesLevel`). — done when: `node --test src-tauri/ui/src/lib/chain.test.ts src-tauri/ui/src/lib/format.test.ts` exits 0.
+3. [done] Add `"test": "node --experimental-strip-types --test src/lib/*.test.ts"` (or compatible Node 22+ command verified locally) to `src-tauri/ui/package.json`, add `- run: npm test` to the `frontend` job in `.github/workflows/ci.yml`, ensure `.github/workflows/release.yml` / `scripts/validate-release-config.py` remain valid (if `release.yml` runs frontend checks directly, add `npm test` there too; if it calls `ci.yml` via `workflow_call`, verify that), and include the rebuilt `src-tauri/ui/dist/` from `npm run build` in this phase's commit so the tracked bundle reflects phase-0002's `HopEditor.svelte` changes. — done when: all commands in `## Verify` exit 0.
 
 ## Verify
 ```sh
-python3 -c "import yaml; yaml.safe_load(open('.github/workflows/ci.yml')); yaml.safe_load(open('.github/workflows/release.yml')); print('YAML_OK')"
-python3 scripts/validate-release-config.py
+(cd src-tauri/ui && npm run check && npm test && npm run build) && python3 scripts/validate-release-config.py
 ```
 
 ## Escalate when
-- A required workflow target or Tauri v2 action convention conflicts with `src-tauri/tauri.bundle.conf.json` → stop, set `Status: needs-human — reason: <exact conflict>`.
+- `tsconfig.json` / `svelte-check` conflicts with Node's `--experimental-strip-types` import resolution in a way that cannot be solved cleanly without changing production files → stop, set Status: needs-human — reason: <exact error>
 
 ## Log
 - (append-only, one line per event)
-- sub-task 1: added .github/workflows/ci.yml with sibling upstream checkout, frontend job, 3-OS rust-and-e2e matrix, and a workflow_call trigger so release.yml reuses the same gates
-- sub-task 2: added .github/workflows/release.yml with verify, 5-target package matrix, conditional Apple/Windows signing, smoke tests, SHA256SUMS.txt, and draft release; Tauri CLI pinned to 2.12.6 because the repo has no @tauri-apps/cli dependency
-- sub-task 3: tightened scripts/validate-release-config.py to require both workflows and assert triggers, matrix targets, gates, smoke test, signing, and draft-release condition
-- phase verify passed; workflows were not executed on GitHub runners (this repository has no git remote)
+- began phase; probed test-file setup with a throwaway src/lib/probe.test.ts (removed); blocked on svelte-check vs node:test import conflict (Escalate when #1)
+- planner unblocked phase-0003: approved option (b) — add allowImportingTsExtensions to tsconfig.json + minimal ambient declarations in src/lib/node-test.d.ts so tests remain type-checked; returned sub-task 1 to [todo]
+- resumed: added allowImportingTsExtensions to tsconfig.json and ambient src/lib/node-test.d.ts (approved option b); sub-task 1: added validate.test.ts (33 tests over isPort, isIpAddress, isLoopback, filterRuleError, denylistedFlag, redactArgs, sessionErrors)
+- sub-task 2: added chain.test.ts (moved, hopRole, hopTitle, hopBadge, authRefs, profileRefs) and format.test.ts (statusOf, isActive, stateReason, formatBytes, formatUptime, logLevel, passesLevel)
+- sub-task 3: added npm `test` script (node --experimental-strip-types --test src/lib/*.test.ts), `- run: npm test` in ci.yml frontend job, "npm test" in FRONTEND_COMMANDS of scripts/validate-release-config.py; release.yml unchanged (its verify job calls ci.yml via workflow_call, so npm test runs before packaging); rebuilt dist/
+- sub-task 3 fix: first Verify run failed svelte-check (validate.test.ts 276:5/277:5 "'hop' is possibly 'undefined'" — minimal assert.ok type does not narrow); replaced assert.ok(hop) with an explicit throw guard; Verify then passed
 
 ## Evidence
 - (append-only: command → observed result)
-- python3 -c "import yaml; yaml.safe_load(open('.github/workflows/ci.yml'))" → exit 0
-- python3 -c "import yaml; yaml.safe_load(open('.github/workflows/release.yml'))" → exit 0
-- python3 scripts/validate-release-config.py → RELEASE_CONFIG_OK, exit 0
-- ## Verify block → YAML_OK, RELEASE_CONFIG_OK, exit 0
-- bash -n on every non-pwsh run block → ci 13 and release 12 checked, no syntax errors
-- validator mutation test on a scratch copy (removed secret-leak step, crypto check, windows-latest, smoke test, arm runner, dry_run guard, release.yml) → all 7 rejected, exit 1 for the 6 measured mutations and a missing-file error for release.yml
-- tauri-cli 2.12.6 / tauri-bundler 2.10.6 source → --config is repeatable, Apple variables are checked with var_os (empty counts as set), identity "-" is handled as ad-hoc, MSI and NSIS support arm64
+- `node --experimental-strip-types --test src/lib/probe.test.ts` (Node v26.13.0) → pass 1, fail 0
+- `npx svelte-check --tsconfig ./tsconfig.json --fail-on-warnings` with probe → 3 ERRORS (node:test, node:assert/strict not found; TS5097 .ts extension import)
+- same with `// @ts-nocheck` line 1 of probe → 0 ERRORS 0 WARNINGS
+- `ls node_modules/@types` → estree only (no @types/node)
+- `node --test src-tauri/ui/src/lib/validate.test.ts` → tests 33, pass 33, fail 0, exit 0
+- `node --test src-tauri/ui/src/lib/chain.test.ts src-tauri/ui/src/lib/format.test.ts` → tests 22, pass 22, fail 0, exit 0
+- first `(cd src-tauri/ui && npm run check && npm test && npm run build)` → svelte-check 2 ERRORS (validate.test.ts 276:5, 277:5 'hop' is possibly 'undefined')
+- after fix `(cd src-tauri/ui && npm run check && npm test && npm run build) && python3 scripts/validate-release-config.py` → exit 0: svelte-check 162 FILES 0 ERRORS 0 WARNINGS; npm test tests 55, suites 20, pass 55, fail 0; vite build ✓ built in 1.98s (dist/assets/index-CShC_wSH.js); RELEASE_CONFIG_OK
+- `grep -n 'uses: ./.github/workflows/ci.yml' .github/workflows/release.yml` → 26 (verify job reuses ci.yml, which now runs npm test)

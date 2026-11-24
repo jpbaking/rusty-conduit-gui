@@ -17,7 +17,7 @@ REQUIRED_JOBS = {
     "release.yml": {"verify", "package", "release"},
 }
 CI_OSES = {"ubuntu-22.04", "macos-latest", "windows-latest"}
-FRONTEND_COMMANDS = ("npm ci", "npm run check", "npm run build")
+FRONTEND_COMMANDS = ("npm ci", "npm run check", "npm test", "npm run build")
 CI_COMMANDS = (
     "cargo clippy --workspace --all-targets -- -D warnings",
     "cargo test --workspace",

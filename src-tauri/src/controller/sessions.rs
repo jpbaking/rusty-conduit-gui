@@ -1,9 +1,13 @@
 //! Session, host-profile, runtime, and host-key operations.
 
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::Arc;
 
-use conduit_core::{validate, AppConfig, AuthMethod, HostProfile, SessionProfile};
+use conduit_core::{
+    parse_openssh_known_hosts_for_host, validate, AppConfig, AuthMethod, HostKeyEntry, HostKeyLookup,
+    HostKeyRecord, HostProfile, SessionProfile, Timestamp,
+};
 use conduit_runtime::{LogLine, SessionSnapshot};
 use conduit_ssh::{
     test_chain, ChainOptions, ChannelPolicy, HopAuth, HopSpec, HopStatus, HostKeyVerifier,
@@ -388,6 +392,41 @@ impl AppController {
         Ok(removed)
     }
 
+    /// Pins the key for `(hop_id, host, port)` from an OpenSSH `known_hosts` file the user chose.
+    ///
+    /// Reads only `path`, which the user supplies explicitly; `~/.ssh/known_hosts` is never read
+    /// or used as a default. The first matching key replaces any existing pin and is saved.
+    pub fn import_known_host_from_file(
+        &self,
+        hop_id: &str,
+        host: &str,
+        port: u16,
+        path: &Path,
+    ) -> Result<HostKeyEntry, AppError> {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| AppError::Io(format!("cannot read {}: {e}", path.display())))?;
+        let imported = parse_openssh_known_hosts_for_host(&content, host, port)
+            .into_iter()
+            .next()
+            .ok_or_else(|| not_found("known_hosts entry", format!("{host}:{port} in {}", path.display())))?;
+        let entry = HostKeyEntry {
+            key: HostKeyLookup { hop_id: hop_id.to_string(), host: host.to_string(), port },
+            record: HostKeyRecord {
+                algorithm: imported.algorithm,
+                fingerprint_sha256: imported.fingerprint_sha256,
+                first_seen: Timestamp::now(),
+                approved: true,
+                public_key_openssh: Some(imported.public_key),
+            },
+        };
+        self.known_hosts()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(entry.key.clone(), entry.record.clone());
+        self.persist_known_hosts()?;
+        Ok(entry)
+    }
+
     /// Probes the chain hop by hop. Never pins a key: an unknown key is a failed hop.
     pub async fn test_session_chain(&self, id: Uuid) -> Result<ChainTestResult, AppError> {
         let profile = self.session_profile(id)?;
@@ -429,7 +468,7 @@ mod tests {
     use super::super::test_support::*;
     use super::super::SecretInput;
     use super::*;
-    use conduit_core::{load_known_hosts, HostKeyLookup, HostKeyRecord, KeyId, SecretRef, Timestamp};
+    use conduit_core::{load_known_hosts, KeyId, SecretRef};
     use conduit_runtime::{RuntimeError, SessionState};
 
     fn pin(c: &AppController, hop_id: &str, node: &Node) {
@@ -452,6 +491,84 @@ mod tests {
         let mut session = node.session(name);
         session.hops[0].host.auth = vec![AuthMethod::Password { secret: secret.secret_ref }];
         c.upsert_session(session).unwrap()
+    }
+
+    // Generated with `ssh-keygen -t ed25519`; fingerprint from `ssh-keygen -l`; hashed with
+    // `ssh-keygen -H` for `example.com` (port 22).
+    const IMPORT_KEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIMAKvbC1OkNvrNiAjJ6wli5nNQS5707OnbcrowxpV2Q";
+    const IMPORT_FP: &str = "SHA256:9I6JDw93SZWDRe51mShFze57vAaKMdUWr3LkP0+FEEM";
+    const IMPORT_HASHED_22: &str = "|1|P/k1CxSv4YGoqUDOlqdNkrBY8L4=|RBraJUa1OYhkRqoJgqCS5mwsc94=";
+
+    fn write_known_hosts(dir: &TempDir, content: &str) -> std::path::PathBuf {
+        let path = dir.path().join("user-known_hosts");
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn import_known_host_plain_entry_pins_and_persists() {
+        let dir = TempDir::new();
+        let c = controller(&dir);
+        let path = write_known_hosts(&dir, &format!("# comment\n[example.com]:2222 {IMPORT_KEY}\n"));
+
+        let entry = c.import_known_host_from_file("hop-1", "example.com", 2222, &path).unwrap();
+        assert_eq!(entry.key, HostKeyLookup { hop_id: "hop-1".into(), host: "example.com".into(), port: 2222 });
+        assert_eq!(entry.record.algorithm, "ssh-ed25519");
+        assert_eq!(entry.record.fingerprint_sha256, IMPORT_FP);
+        assert_eq!(entry.record.public_key_openssh.as_deref(), Some(IMPORT_KEY));
+        assert!(entry.record.approved);
+        assert!(entry.record.first_seen.0 > 0);
+
+        let saved = load_known_hosts(&dir.path().join("known_hosts.json")).unwrap();
+        assert_eq!(saved.get("hop-1", "example.com", 2222), Some(&entry.record));
+        assert_eq!(c.list_host_key_pins(), vec![entry]);
+    }
+
+    #[test]
+    fn import_known_host_hashed_entry_replaces_existing_pin() {
+        let dir = TempDir::new();
+        let c = controller(&dir);
+        c.known_hosts().write().unwrap().insert(
+            HostKeyLookup { hop_id: "hop-1".into(), host: "example.com".into(), port: 22 },
+            HostKeyRecord {
+                algorithm: "ssh-rsa".into(),
+                fingerprint_sha256: "SHA256:old".into(),
+                first_seen: Timestamp(1),
+                approved: true,
+                public_key_openssh: None,
+            },
+        );
+        let path = write_known_hosts(&dir, &format!("{IMPORT_HASHED_22} {IMPORT_KEY}\n"));
+
+        let entry = c.import_known_host_from_file("hop-1", "example.com", 22, &path).unwrap();
+        assert_eq!(entry.record.fingerprint_sha256, IMPORT_FP);
+        let saved = load_known_hosts(&dir.path().join("known_hosts.json")).unwrap();
+        assert_eq!(saved.entries.len(), 1);
+        assert_eq!(saved.get("hop-1", "example.com", 22).unwrap().fingerprint_sha256, IMPORT_FP);
+    }
+
+    #[test]
+    fn import_known_host_without_match_is_not_found_and_pins_nothing() {
+        let dir = TempDir::new();
+        let c = controller(&dir);
+        let path = write_known_hosts(&dir, &format!("other.com {IMPORT_KEY}\n@revoked example.com {IMPORT_KEY}\n"));
+
+        let err = c.import_known_host_from_file("hop-1", "example.com", 22, &path).unwrap_err();
+        assert!(matches!(err, AppError::NotFound { .. }), "{err:?}");
+        assert!(c.known_hosts().read().unwrap().entries.is_empty());
+        assert!(!dir.path().join("known_hosts.json").exists());
+    }
+
+    #[test]
+    fn import_known_host_missing_file_is_an_io_error() {
+        let dir = TempDir::new();
+        let c = controller(&dir);
+        let err = c
+            .import_known_host_from_file("hop-1", "example.com", 22, &dir.path().join("missing"))
+            .unwrap_err();
+        assert!(matches!(err, AppError::Io(_)), "{err:?}");
+        assert!(c.known_hosts().read().unwrap().entries.is_empty());
     }
 
     #[tokio::test]
