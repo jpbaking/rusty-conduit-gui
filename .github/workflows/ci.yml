@@ -115,4 +115,4 @@ jobs:
 
       - name: Tauri tray compile check
         if: runner.os == 'Linux'
-        run: RUSTFLAGS="--cfg conduit_check_tauri_tray" cargo check -p rusty-conduit-ssh-gui --tests
+        run: RUSTFLAGS="--cfg conduit_check_tauri_tray" cargo check -p rusty-conduit-ssh-gui --tests --features tauri/tray-icon

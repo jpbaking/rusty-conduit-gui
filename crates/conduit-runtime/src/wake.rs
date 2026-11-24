@@ -344,8 +344,9 @@ mod macos {
         WakeHandle {
             active: Arc::new(AtomicBool::new(true)),
             stop: Some(Box::new(move || {
+                let token: &objc2::runtime::AnyObject = (*observer.token).as_ref();
                 // SAFETY: `token` was returned by this center's `addObserverForName:...`.
-                unsafe { observer.center.removeObserver(&observer.token) };
+                unsafe { observer.center.removeObserver(token) };
             })),
         }
     }

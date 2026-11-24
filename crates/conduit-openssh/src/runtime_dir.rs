@@ -84,6 +84,7 @@ pub fn write_private_file(path: &Path, contents: &[u8]) -> io::Result<()> {
 }
 
 fn create_private_dir(path: &Path) -> io::Result<()> {
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
     {
@@ -99,6 +100,7 @@ fn is_short_and_space_free(path: &Path, max_len: usize) -> bool {
 }
 
 /// Uses `$XDG_RUNTIME_DIR` when it is absolute, space-free, and short. Otherwise `fallback`.
+#[cfg(any(unix, test))]
 fn select_linux_base(xdg: Option<&Path>, fallback: &Path) -> PathBuf {
     match xdg {
         Some(dir) if dir.is_absolute() && is_short_and_space_free(dir, MAX_BASE_LEN) => {
