@@ -4,10 +4,16 @@
 import { ApiError } from "./api";
 import type {
   DeleteResult,
+  ExportSummary,
+  FilterTestResult,
   HostKeyEntry,
   HostProfile,
+  ImportSummary,
   KeyView,
   LogLine,
+  MitmCaInfo,
+  PortConflict,
+  PortConflictReport,
   SessionProfile,
   SessionSnapshot,
   SessionState,
@@ -42,7 +48,7 @@ function profile(id: string, name: string, host: string, httpPort: number): Sess
     name,
     autostart: false,
     engine: "Russh",
-    hops: [{ hop_id: `${id}-hop`, name, host: hostProfile, agent_forward: false }],
+    hops: [{ hop_id: `${id}-hop`, name, host: hostProfile, agent_forward: false, agent_forward_keys: [], agent_forward_command: null }],
     forward: {
       bind: "127.0.0.1",
       http_port: httpPort,
@@ -149,6 +155,54 @@ function find(args?: Record<string, unknown>): SessionView {
   return session;
 }
 
+const WILDCARD_BINDS = new Set(["0.0.0.0", "::"]);
+const bindsOverlap = (a: string, b: string) =>
+  a === b || WILDCARD_BINDS.has(a) || WILDCARD_BINDS.has(b);
+
+function mockPortConflicts(args?: Record<string, unknown>): PortConflictReport {
+  const bind = String(args?.bind);
+  const ports = new Set([Number(args?.httpPort), Number(args?.socksPort)].filter((p) => p !== 0));
+  const conflicts: PortConflict[] = [];
+  for (const port of ports) {
+    for (const { profile: other } of sessions) {
+      if (other.id === args?.sessionId || !bindsOverlap(bind, other.forward.bind)) continue;
+      for (const [role, used] of [["HTTP", other.forward.http_port], ["SOCKS", other.forward.socks_port]] as const) {
+        if (used === port) {
+          conflicts.push({
+            port,
+            kind: "session",
+            detail: `session "${other.name}" uses ${other.forward.bind}:${port} for ${role}`,
+          });
+        }
+      }
+    }
+  }
+  return { conflicts };
+}
+
+/** A rough stand-in for the engine: exact names and `*.domain` only, no CIDR matching. */
+function mockFilterTest(args?: Record<string, unknown>): FilterTestResult {
+  const rules = (args?.rules as string[] | undefined) ?? [];
+  const target = String(args?.target ?? "").trim();
+  const rule_errors = rules.flatMap((rule, index) =>
+    rule.trim() === "" || /\s/.test(rule) ? [{ index, rule, message: "invalid rule" }] : [],
+  );
+  if (rule_errors.length > 0) {
+    return { valid: false, allowed: null, reason: `${rule_errors.length} rule(s) could not be parsed`, rule_errors };
+  }
+  if (!target) {
+    return { valid: false, allowed: null, reason: "enter an IP address or domain to test", rule_errors };
+  }
+  if (rules.length === 0) {
+    return { valid: true, allowed: true, reason: "no rules are set, so every destination is allowed", rule_errors };
+  }
+  const matched = rules.some((rule) =>
+    rule.startsWith("*.") ? target.endsWith(rule.slice(1)) : rule === target,
+  );
+  const allowed = args?.mode === "allow" ? matched : !matched;
+  return { valid: true, allowed, reason: `preview: destination ${target} ${matched ? "matches" : "does not match"} the rules`, rule_errors };
+}
+
 function dispatch(command: string, args?: Record<string, unknown>): unknown {
   switch (command) {
     case "shell_ready":
@@ -225,6 +279,13 @@ function dispatch(command: string, args?: Record<string, unknown>): unknown {
     }
     case "set_password_secret":
       return { secret_ref: crypto.randomUUID(), has_secret: true };
+    case "set_mitm_passphrase": {
+      const session = sessions.find((s) => s.profile.id === args?.sessionId);
+      if (!session?.profile.mitm) throw new ApiError("invalid", "this session has no MITM configuration");
+      const secret_ref = crypto.randomUUID();
+      session.profile.mitm.passphrase = secret_ref;
+      return { secret_ref, has_secret: true };
+    }
     case "delete_secret":
       return { deleted: true, used_by: 0, usage: { hosts: [], sessions: [] } } satisfies DeleteResult;
     case "upsert_host": {
@@ -312,6 +373,44 @@ function dispatch(command: string, args?: Record<string, unknown>): unknown {
       return { path: String(args?.path), key_count: keys.length };
     case "import_backup":
       return { imported: [], skipped: keys.length };
+    case "check_port_conflicts":
+      return mockPortConflicts(args);
+    case "test_filter_rules":
+      return mockFilterTest(args);
+    case "inspect_mitm_ca":
+      return {
+        subject: "CN=Preview CA",
+        not_after: new Date(Date.now() + 90 * 86_400_000).toISOString(),
+        expired: false,
+        days_remaining: 90,
+      } satisfies MitmCaInfo;
+    case "export_config": {
+      const encrypted = Boolean(args?.includeSecrets);
+      return {
+        path: String(args?.path),
+        encrypted,
+        session_count: sessions.length,
+        host_count: hosts.length,
+        key_count: keys.length,
+        secret_count: encrypted ? keys.length : 0,
+        missing_secrets: 0,
+      } satisfies ExportSummary;
+    }
+    case "import_config":
+      return {
+        encrypted: args?.passphrase != null,
+        sessions_added: 0,
+        sessions_updated: 0,
+        sessions_skipped: sessions.length,
+        hosts_added: 0,
+        hosts_updated: 0,
+        hosts_skipped: hosts.length,
+        keys_added: 0,
+        secrets_added: 0,
+        known_hosts_added: 0,
+        known_hosts_updated: 0,
+        credentials_removed: 0,
+      } satisfies ImportSummary;
     case "approve_host_key":
       find(args).runtime.state = { state: "connected" };
       return null;

@@ -217,6 +217,12 @@ pub struct HopEntry {
     pub host: HostProfile,
     #[serde(default)]
     pub agent_forward: bool,
+    /// Vault keys exposed to this hop when `agent_forward` is on. Nothing else is ever exposed.
+    #[serde(default)]
+    pub agent_forward_keys: Vec<KeyId>,
+    /// Optional command run on this hop's agent-forwarding session channel.
+    #[serde(default)]
+    pub agent_forward_command: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -599,4 +605,23 @@ impl KnownHostsStore {
 
 fn default_host_port() -> u16 {
     22
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hop_entry_without_agent_forward_fields_deserializes() {
+        let json = r#"{
+            "hop_id": "target",
+            "name": "target",
+            "host": { "name": "h", "host": "10.0.0.1", "user": "root", "auth": [] },
+            "agent_forward": true
+        }"#;
+        let hop: HopEntry = serde_json::from_str(json).unwrap();
+        assert!(hop.agent_forward);
+        assert!(hop.agent_forward_keys.is_empty());
+        assert_eq!(hop.agent_forward_command, None);
+    }
 }

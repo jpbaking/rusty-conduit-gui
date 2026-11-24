@@ -18,9 +18,9 @@ use super::{
     SecretInput, SecretMeta,
 };
 
-const KEY_RECORD: &str = "key";
-const PASSWORD_RECORD: &str = "password";
-const PASSPHRASE_RECORD: &str = "passphrase";
+pub(super) const KEY_RECORD: &str = "key";
+pub(super) const PASSWORD_RECORD: &str = "password";
+pub(super) const PASSPHRASE_RECORD: &str = "passphrase";
 
 /// A host or session that references a key or secret.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -95,7 +95,14 @@ fn usage_of(config: &AppConfig, uses: impl Fn(&AuthMethod) -> bool) -> Usage {
 }
 
 fn key_usage(config: &AppConfig, id: &KeyId) -> Usage {
-    usage_of(config, |m| matches!(m, AuthMethod::Key { key } if key == id))
+    let mut usage = usage_of(config, |m| matches!(m, AuthMethod::Key { key } if key == id));
+    for session in &config.sessions {
+        let forwarded = session.hops.iter().any(|hop| hop.agent_forward_keys.contains(id));
+        if forwarded && !usage.sessions.iter().any(|u| u.id == session.id) {
+            usage.sessions.push(UsageRef { id: session.id, name: session.name.clone() });
+        }
+    }
+    usage
 }
 
 fn mitm_uses(session: &SessionProfile, secret: &SecretRef) -> bool {
@@ -158,7 +165,7 @@ fn parse_source(label: &str) -> KeySource {
 }
 
 /// Writes `bytes` beside `path`, owner-only, then renames over it.
-fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
+pub(super) fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
     use std::io::Write;
     let io_error = |e: std::io::Error| AppError::Io(format!("failed to write {}: {e}", path.display()));
     let dir = path
@@ -311,9 +318,22 @@ impl AppController {
         }
         let changed = self.mutate_config(|config| {
             config.keys.retain(|k| k.id != *id);
-            Ok(edit_auth(config, |auth| {
+            let mut changed = edit_auth(config, |auth| {
                 auth.retain(|m| !matches!(m, AuthMethod::Key { key } if key == id));
-            }))
+            });
+            for session in &mut config.sessions {
+                let mut stripped = false;
+                for hop in &mut session.hops {
+                    let before = hop.agent_forward_keys.len();
+                    hop.agent_forward_keys.retain(|k| k != id);
+                    stripped |= hop.agent_forward_keys.len() != before;
+                }
+                if stripped {
+                    changed.retain(|s: &SessionProfile| s.id != session.id);
+                    changed.push(session.clone());
+                }
+            }
+            Ok(changed)
         })?;
         self.sync_profiles(changed);
         // The config no longer names this record, so a missing record is already the goal.
@@ -324,7 +344,7 @@ impl AppController {
         Ok(DeleteResult { deleted: true, used_by, usage })
     }
 
-    fn record_type(&self, id: &str) -> Option<String> {
+    pub(super) fn record_type(&self, id: &str) -> Option<String> {
         self.vault_read()
             .list_keys()
             .into_iter()
@@ -723,6 +743,55 @@ mod tests {
         assert!(config.hosts[0].auth.is_empty());
         assert!(config.sessions[0].hops[0].host.auth.is_empty());
         assert!(matches!(c.delete_key(&meta.id, true), Err(AppError::NotFound { .. })));
+    }
+
+    #[tokio::test]
+    async fn keys_agent_forward_assignment_counts_as_usage_and_is_stripped() {
+        let dir = TempDir::new();
+        let c = unlocked(&dir).await;
+        let kept = c.generate_key("kept", GenerateAlgorithm::Ed25519).unwrap();
+        let meta = c.generate_key("k", GenerateAlgorithm::Ed25519).unwrap();
+        let mut s = profile("agent", 22);
+        s.hops[0].agent_forward = true;
+        s.hops[0].agent_forward_keys = vec![kept.id.clone(), meta.id.clone()];
+        let id = s.id;
+        c.mutate_config(|config| {
+            config.sessions.push(s.clone());
+            Ok(())
+        })
+        .unwrap();
+        c.sync_profiles([s]);
+
+        let view = c.list_keys().into_iter().find(|k| k.meta.id == meta.id).unwrap();
+        assert_eq!(view.used_by, 1);
+        assert_eq!(view.usage.sessions[0].id, id);
+
+        let refused = c.delete_key(&meta.id, false).unwrap();
+        assert!(!refused.deleted);
+        assert_eq!(refused.usage.sessions[0].name, "agent");
+        assert_eq!(c.config_snapshot().sessions[0].hops[0].agent_forward_keys.len(), 2);
+
+        assert!(c.delete_key(&meta.id, true).unwrap().deleted);
+        assert_eq!(
+            c.config_snapshot().sessions[0].hops[0].agent_forward_keys,
+            vec![kept.id.clone()]
+        );
+    }
+
+    #[tokio::test]
+    async fn keys_session_using_key_for_auth_and_agent_is_counted_once() {
+        let dir = TempDir::new();
+        let c = unlocked(&dir).await;
+        let meta = c.generate_key("k", GenerateAlgorithm::Ed25519).unwrap();
+        let mut s = profile("both", 22);
+        s.hops[0].host.auth = vec![AuthMethod::Key { key: meta.id.clone() }];
+        s.hops[0].agent_forward_keys = vec![meta.id.clone()];
+        c.mutate_config(|config| {
+            config.sessions.push(s);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(c.list_keys()[0].used_by, 1);
     }
 
     #[tokio::test]

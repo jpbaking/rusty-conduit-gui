@@ -1,60 +1,52 @@
-# phase-0002 — src-tauri v2 scaffold, AppState & write-only secret IPC commands
+# phase-0002 — conduit-runtime: wire AgentForwardRelay, audit logs & E2E flake hardening
 
 - Status: done
 - Owner: executor
 - Depends on: phase-0001
-- Goal: Scaffold the Tauri v2 crate (`src-tauri/`) as a workspace member, implement `AppState` orchestrating `AppConfig`, `KnownHostsStore`, `Vault`, and `SessionManager`, and expose all write-only secret IPC commands with thorough Rust unit tests.
-- Done when: `cargo test -p rusty-conduit-ssh-gui && cargo clippy --workspace --all-targets -- -D warnings` exits 0 with unit tests verifying every IPC command handler and confirming raw passwords/private keys/passphrases never appear in any serialized IPC response.
-- Pattern to follow: `docs/MASTER-PLAN.md` Sections 4.1, 5.2, 5.3, and 7.2
+- Goal: Wire per-hop `AgentForwardRelay` into `conduit-runtime`'s `RusshLink` (loading only `hop.agent_forward_keys` from `Vault`, logging every agent signature audit event into `LogRingBuffer`, tearing down cleanly on disconnect/reconnect), add a runtime E2E test for scoped agent forwarding, and harden `e2e_runtime.rs` against transient ephemeral port collisions.
+- Done when: `cargo test -p conduit-runtime && cargo clippy --workspace --all-targets -- -D warnings` exits 0 with passing E2E tests for scoped agent forwarding (including audit log capture) and 10 consecutive flake-free runs of `e2e_runtime`.
+- Pattern to follow: `crates/conduit-runtime/src/runner.rs:726` (`RusshLink::connect` reverse relay wiring)
 
 ## Context
-`src-tauri/` is a thin adapter over `conduit-core`, `conduit-vault`, `conduit-ssh`, `conduit-runtime`, and `conduit-tray`.
+In Milestone 2 `phase-0006`, `concurrent_sessions_stay_isolated` hit a rare `Address already in use` flake because `free_port()` binds and drops a TCP socket before `SessionManager` later binds it. Also `runner.rs` currently leaves `hop.agent_forward` unwired.
 Key decisions already made:
-- Use **Tauri v2 stable** (`tauri = "2"`, `tauri-build = "2"`), NOT Tauri 3 alpha.
-- **Write-Only WebView Secret Fields:** Rust IPC commands accept raw secrets (`password`, `private_key_pem`, `passphrase`) on write, encrypt them into `vault.bin`, and return ONLY opaque metadata (`SecretRef`, `KeyId`, `VaultKeyMeta`, `has_secret: true`). Raw secrets are NEVER returned to the WebView.
-- Keep business logic inside pure testable Rust service methods (`AppController` in `src-tauri/src/controller.rs`) so `cargo test -p rusty-conduit-ssh-gui` tests every command cleanly without needing a live display/WebKit window!
-- Persist `config.json` and `known_hosts.json` atomically via `conduit-core::storage` whenever profiles, hosts, keys, or host-key approvals change.
-- Include `test_chain` IPC command calling `conduit_ssh::test_chain` prefix-by-prefix and returning structured per-hop diagnostics (`hop_index`, `hop_id`, `host`, `port`, `status`, `error`, `elapsed_ms`).
-- Include a minimal placeholder `src-tauri/ui/dist/index.html` (and minimal `src-tauri/icons/icon.png`) so `tauri::generate_context!()` compiles cleanly before `phase-0004` builds the full Svelte 5 frontend.
+- Only start `AgentForwardRelay` on hops where `hop.agent_forward == true` AND `!hop.agent_forward_keys.is_empty()`. (If `agent_forward == true` with empty keys, log a clear notice and do not open an agent channel.)
+- `needs_secrets(profile)` in `runner.rs` must also return `true` if any hop has `agent_forward && !agent_forward_keys.is_empty()` so a locked vault parks the session in `Locked`.
+- Every signature audit event from `ScopedAgent` (allowed or refused, including hop_id, key fingerprint, and algorithm — NEVER private key material) is pushed to the session's `LogRingBuffer` with prefix `[agent-audit]`.
+- On reconnect, build a fresh `agent_policy` and `AgentForwardRelay` per opted-in hop (just like `reverse_policy`), and stop/drop previous relays in `drop_connection()` / `shutdown()`.
 
 ## Scope
-- In: `Cargo.toml`, `Cargo.lock`, `src-tauri/**` (excluding `src-tauri/ui/src/**`, only minimal `src-tauri/ui/dist/index.html` placeholder if needed for `tauri.conf.json`)
-- Out: `crates/conduit-core/**`, `crates/conduit-vault/**`, `crates/conduit-ssh/**`, `crates/conduit-runtime/**`, `crates/conduit-tray/**`, `docs/MASTER-PLAN.md`
+- In: `crates/conduit-runtime/src/**`, `crates/conduit-runtime/tests/**`, `crates/conduit-ssh/src/agent.rs` (only to add `pub algorithm: String` to `SignAudit` and populate it in `ScopedAgent`)
+- Out: `crates/conduit-core/**`, `crates/conduit-vault/**`, `crates/conduit-ssh/**` (except `crates/conduit-ssh/src/agent.rs`), `crates/conduit-tray/**`, `src-tauri/**`, `docs/MASTER-PLAN.md`
 
 ## Sub-tasks
-1. [done] Add `src-tauri` to root `Cargo.toml` workspace members; create `src-tauri/Cargo.toml` (`name = "rusty-conduit-ssh-gui"`, `tauri = "2"`, `tauri-build = "2"`, `tauri-plugin-single-instance = "2"`, `tauri-plugin-autostart = "2"`, workspace crates), `src-tauri/build.rs`, `src-tauri/tauri.conf.json`, `src-tauri/capabilities/default.json`, a valid generated PNG icon in `src-tauri/icons/icon.png`, and a minimal `src-tauri/ui/dist/index.html` placeholder — done when: `cargo check -p rusty-conduit-ssh-gui` exits 0
-2. [done] Implement `src-tauri/src/controller.rs` (`AppController`) managing `app_data_dir`, `AppConfig`, `KnownHostsStore`, `Vault` (open/create/unlock with password or keyring/lock/status), and `SessionManager`, with atomic persistence on mutations and `KnownHostsChanged` auto-save — done when: `cargo test -p rusty-conduit-ssh-gui controller` exits 0
-3. [done] Implement key-vault and write-only secret methods on `AppController`: `import_key_pem`, `generate_key`, `rename_key`, `delete_key` (returning referencing host/session count & names, requiring `force: true` if referenced), `list_keys` (with `used_by` counts), `set_password_secret`, `set_mitm_passphrase`, `delete_secret`, and `export_backup` / `import_backup` — done when: `cargo test -p rusty-conduit-ssh-gui keys` exits 0
-4. [done] Implement session, host-profile, and runtime methods on `AppController`: `get_state_summary`, `list_sessions`, `upsert_session` (validating via `conduit_core::validate`), `delete_session`, `list_hosts`, `upsert_host`, `delete_host`, `promote_hop_to_host`, `start_session`, `stop_session`, `restart_session`, `start_all`, `stop_all`, `get_session_logs`, `clear_session_logs`, `approve_host_key`, `reject_host_key`, `reset_host_key`, and `test_session_chain` (prefix-by-prefix `conduit_ssh::test_chain`) — done when: `cargo test -p rusty-conduit-ssh-gui sessions` exits 0
-5. [done] Wire thin `#[tauri::command]` wrappers in `src-tauri/src/commands.rs` and add a security test verifying no serialized response struct or JSON output from `AppController` ever contains raw password/private-key/passphrase strings — done when: `cargo test -p rusty-conduit-ssh-gui && cargo clippy --workspace --all-targets -- -D warnings` exits 0
+1. [done] Update `crates/conduit-runtime/src/runner.rs`: include `agent_forward_keys` in `needs_secrets`, resolve vaulted keys for opted-in hops into `ScopedAgent` with a `LogRingBuffer` audit callback (`[agent-audit]`), attach `agent_policy` to each opted-in hop's `ChannelPolicy`, start `AgentForwardRelay`s after `connect_chain`, and cleanly stop/drop them on `drop_connection` and `shutdown` — done when: `cargo test -p conduit-runtime --lib` exits 0
+2. [done] Add E2E test `scoped_agent_forwarding_exposes_only_assigned_keys_and_audits_logs` in `crates/conduit-runtime/tests/e2e_runtime.rs` verifying: locked vault parks an agent-forwarding session, after unlock the remote server sees only the assigned key, signs cleanly, and `[agent-audit]` appears in `manager.logs(id)` without leaking private key material — done when: `cargo test -p conduit-runtime --test e2e_runtime scoped_agent_forwarding` exits 0
+3. [done] Harden `crates/conduit-runtime/tests/e2e_runtime.rs` against transient `free_port()` port collisions (e.g., use OS-assigned distinct loopback ports or retry-safe port allocation so parallel tests never collide on the same ephemeral port) and verify 10 consecutive runs pass with 0 failures — done when: `cargo test -p conduit-runtime && cargo clippy --workspace --all-targets -- -D warnings` exits 0
 
 ## Verify
 ```sh
-cargo test -p rusty-conduit-ssh-gui && cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p conduit-ssh -p conduit-runtime && cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 ## Escalate when
-- `tauri = "2"` fails to compile due to a missing system library or header on this Linux host → stop, set Status: needs-human — reason: exact missing library/header from `pkg-config` or linker
+- `SshChain` in `conduit-ssh` is missing a needed accessor for per-hop `Handle<HopHandler>` → stop, set Status: needs-human — reason: exact missing accessor in `conduit-ssh`
 
 ## Log
 - (append-only, one line per event)
-- sub-task 1: added src-tauri to the workspace with Cargo.toml, build.rs, tauri.conf.json, capabilities/default.json, generated 256x256 RGBA icon, and placeholder ui/dist/index.html
-- sub-task 2: implemented AppController (open, vault create/unlock/lock, atomic config and known_hosts saves, KnownHostsChanged autosave)
-- sub-task 3: implemented key-vault and write-only secret methods, including forced delete, password rotation, and encrypted backup export/import
-- sub-task 4: implemented session, host, runtime, host-key, and prefix-by-prefix chain-test methods
-- sub-task 5: wired 34 thin Tauri commands and added an IPC dispatch test covering all of them with secret-leak assertions
-- note: tauri.conf.json identifier io.github.rusty-conduit-ssh-gui was not specified by the plan and needs planner confirmation because it sets the app data directory
-- note: no code registers a keyring-core default store, so OS keyring create/unlock is expected to return KeyringUnavailable in the real app; keyring paths were tested with MemoryKeyringBackend only
-- note: real window launch not run because this host session has no DISPLAY, WAYLAND_DISPLAY, or xvfb-run
+- sub-task 1: read the phase-0001 agent API before editing and found SignAudit has no algorithm field; stopped with no code changes and escalated
+- planner approved Option A: added crates/conduit-ssh/src/agent.rs to Scope: In for SignAudit.algorithm and expanded Verify to include conduit-ssh; resumed sub-m3-phase-0002 from sub-task 1
+- sub-task 1: added SignAudit.algorithm; wired per-hop agents into RusshLink with [agent-audit] logging, fresh relays per connect, and teardown in drop_connection
+- sub-task 2: added scoped_agent_forwarding_exposes_only_assigned_keys_and_audits_logs covering locked vault, key scoping, signing, refusal audit, reconnect, and no key leakage
+- sub-task 3: replaced free_port in e2e_runtime.rs with a per-process counter in 20000-29999, below the OS ephemeral range, plus a bind probe
+- note for planner: a connected session keeps signing after the vault locks, because lock_vault leaves connected sessions up (src-tauri/src/controller.rs:463)
 
 ## Evidence
 - (append-only: command → observed result)
-- pkg-config --modversion webkit2gtk-4.1 gtk+-3.0 libsoup-3.0 → 2.52.6, 3.24.52, 3.6.6 (no missing Tauri system library)
-- cargo check -p rusty-conduit-ssh-gui → exit 0 (tauri 2.12.7); 3 unused-dependency manifest warnings for conduit-tray and the two plugins, which later phases wire
-- cargo test -p rusty-conduit-ssh-gui --lib controller → 40 passed, 0 failed
-- cargo test -p rusty-conduit-ssh-gui --lib keys → 14 passed, 0 failed
-- cargo test -p rusty-conduit-ssh-gui --lib sessions → 14 passed, 0 failed
-- cargo test -p rusty-conduit-ssh-gui && cargo clippy --workspace --all-targets -- -D warnings → exit 0, 43 passed, 0 failed
-- cargo test -p rusty-conduit-ssh-gui --lib (5 repeats) → 43 passed each run
-- cargo test --workspace → 257 passed, 0 failed
-- git diff --stat -- crates docs → empty (Scope: Out untouched)
+- `grep -rn -i "algorithm\|algo" crates/conduit-ssh/src/agent.rs crates/conduit-ssh/src/agent_relay.rs crates/conduit-ssh/src/agent_wire.rs` → no algorithm in SignAudit (agent.rs:59-64); only RSA flag handling in agent_wire.rs and test key generation in agent.rs
+- `grep -rn "SignAudit {" crates src-tauri --include=*.rs` (non-test paths) → the struct is built only at agent.rs:134 and agent.rs:153, so option A stays within agent.rs
+- `cargo test -p conduit-runtime --lib` → 48 passed, 0 failed
+- `cargo test -p conduit-runtime --test e2e_runtime scoped_agent_forwarding` → 1 passed, 0 failed
+- `cargo test -p conduit-runtime --test e2e_runtime` x10 consecutive → 10 of 10 runs passed, 8 passed and 0 failed each, no `Address already in use`
+- `cargo test -p conduit-ssh -p conduit-runtime` → exit 0 (runtime 48 + 8 E2E; ssh 63 + 5 agent loopback + 12 multihop)
+- `cargo clippy --workspace --all-targets -- -D warnings` → exit 0

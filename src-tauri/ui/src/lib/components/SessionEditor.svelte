@@ -1,30 +1,99 @@
 <script lang="ts">
+  import { tick } from "svelte";
+  import { hopTitle } from "../chain";
   import { stateReason } from "../format";
   import { store } from "../stores.svelte";
-  import type { ForwardConfig, HopEntry, ReverseConfig, SessionProfile } from "../types";
-  import { isIpAddress, isLoopback } from "../validate";
+  import type { HopEntry, SessionProfile } from "../types";
+  import type { FieldErrors } from "../validate";
+  import FiltersTab from "./FiltersTab.svelte";
+  import ForwardProxyTab from "./ForwardProxyTab.svelte";
   import HopEditor from "./HopEditor.svelte";
   import JumpChainBuilder from "./JumpChainBuilder.svelte";
+  import KeepaliveTab from "./KeepaliveTab.svelte";
+  import LoggingAdvancedTab from "./LoggingAdvancedTab.svelte";
+  import MitmTab from "./MitmTab.svelte";
+  import ReverseProxyTab from "./ReverseProxyTab.svelte";
+
+  const TABS = [
+    "Connection & Jump Chain",
+    "Forward Proxy",
+    "Reverse Proxy (-R)",
+    "Destination Filters",
+    "HTTPS MITM",
+    "Keepalive & Reconnect",
+    "Logging & Advanced",
+  ] as const;
+  const CONNECTION_TAB = 0;
+  const FORWARD_TAB = 1;
+  const REVERSE_TAB = 2;
+  const FILTERS_TAB = 3;
+  const MITM_TAB = 4;
+  const KEEPALIVE_TAB = 5;
+  const LOGGING_TAB = 6;
+
+  /** The tabs that show a field's error. "No listeners" can be fixed on either proxy tab. */
+  function tabsForField(field: string): number[] {
+    if (field === "hops" || field.startsWith("hop:") || field === "tunnel.ip_version") {
+      return [CONNECTION_TAB];
+    }
+    if (field.startsWith("forward.")) return [FORWARD_TAB];
+    if (field.startsWith("reverse.")) return [REVERSE_TAB];
+    if (field === "listeners") return [FORWARD_TAB, REVERSE_TAB];
+    if (field.startsWith("filters.")) return [FILTERS_TAB];
+    if (field.startsWith("mitm.")) return [MITM_TAB];
+    if (field.startsWith("tunnel.")) return [KEEPALIVE_TAB];
+    if (field.startsWith("logging.") || field.startsWith("openssh.")) return [LOGGING_TAB];
+    return [];
+  }
+
+  function countByTab(errors: FieldErrors): number[] {
+    const counts = TABS.map(() => 0);
+    for (const field of Object.keys(errors)) {
+      for (const tab of tabsForField(field)) counts[tab] = (counts[tab] ?? 0) + 1;
+    }
+    return counts;
+  }
 
   const uid = $props.id();
   const draft = $derived(store.draft as SessionProfile);
   const hop = $derived(store.selectedHop);
   const errors = $derived(store.draftErrors);
+  const errorCounts = $derived(countByTab(errors));
   const reason = $derived(store.selected ? stateReason(store.selected.runtime.state) : null);
   const locked = $derived(!!hop && store.hosts.some((h) => h.id === hop.host.id));
-  const forwardOn = $derived(draft.forward.http_port !== 0 || draft.forward.socks_port !== 0);
-  const reverseOn = $derived(
-    draft.reverse.reverse_http_port !== 0 || draft.reverse.reverse_socks_port !== 0,
-  );
-  const forwardExposed = $derived(
-    forwardOn && isIpAddress(draft.forward.bind) && !isLoopback(draft.forward.bind),
-  );
-  const reverseExposed = $derived(
-    reverseOn && isIpAddress(draft.reverse.reverse_bind) && !isLoopback(draft.reverse.reverse_bind),
+  // The hop form shows one hop at a time, so errors on the others need a way to reach them.
+  const otherInvalidHops = $derived(
+    draft.hops.filter(
+      (h) =>
+        h.hop_id !== hop?.hop_id && Object.keys(errors).some((field) => field.startsWith(`hop:${h.hop_id}:`)),
+    ),
   );
 
-  const toPort = (text: string) => (text === "" ? Number.NaN : Number(text));
-  const shownPort = (port: number) => (Number.isNaN(port) ? "" : port);
+  let activeTab = $state(CONNECTION_TAB);
+  let tabButtons = $state<HTMLButtonElement[]>([]);
+
+  const tabId = (index: number) => `${uid}-tab-${index}`;
+  const panelId = (index: number) => `${uid}-panel-${index}`;
+
+  async function focusTab(index: number) {
+    activeTab = index;
+    await tick();
+    tabButtons[index]?.focus();
+  }
+
+  function onTabKeydown(event: KeyboardEvent, index: number) {
+    const last = TABS.length - 1;
+    const targets: Record<string, number> = {
+      ArrowRight: index === last ? 0 : index + 1,
+      ArrowLeft: index === 0 ? last : index - 1,
+      Home: 0,
+      End: last,
+    };
+    const target = targets[event.key];
+    if (target === undefined) return;
+    event.preventDefault();
+    void focusTab(target);
+  }
 
   function editHop(id: string, edit: (hop: HopEntry) => HopEntry) {
     store.updateDraft((profile) => ({
@@ -32,151 +101,132 @@
       hops: profile.hops.map((h) => (h.hop_id === id ? edit(h) : h)),
     }));
   }
-
-  function setForward(patch: Partial<ForwardConfig>) {
-    store.updateDraft((profile) => ({ ...profile, forward: { ...profile.forward, ...patch } }));
-  }
-
-  function setReverse(patch: Partial<ReverseConfig>) {
-    store.updateDraft((profile) => ({ ...profile, reverse: { ...profile.reverse, ...patch } }));
-  }
 </script>
-
-{#snippet portField(label: string, value: number, field: string, onValue: (port: number) => void)}
-  <div class="field port">
-    <label class="field">
-    {label}
-    <input
-      type="number"
-      min="0"
-      max="65535"
-      value={shownPort(value)}
-      aria-invalid={!!errors[field]}
-      aria-describedby={errors[field] ? `${uid}-${field}` : undefined}
-      oninput={(e) => onValue(toPort(e.currentTarget.value))}
-    />
-    </label>
-    {#if errors[field]}<span id={`${uid}-${field}`} class="field-error">{errors[field]}</span>{/if}
-  </div>
-{/snippet}
 
 <div class="session-editor">
   {#if reason}<p class="reason" role="alert">{reason}</p>{/if}
   {#if errors.name}<p class="field-error">{errors.name}</p>{/if}
 
-  <JumpChainBuilder />
-  {#if errors.hops}<p class="field-error">{errors.hops}</p>{/if}
+  <div class="tab-list" role="tablist" aria-label="Session settings">
+    {#each TABS as title, index (title)}
+      {@const count = errorCounts[index] ?? 0}
+      <button
+        bind:this={tabButtons[index]}
+        type="button"
+        class="tab"
+        class:active={activeTab === index}
+        role="tab"
+        id={tabId(index)}
+        aria-selected={activeTab === index}
+        aria-controls={panelId(index)}
+        tabindex={activeTab === index ? 0 : -1}
+        onclick={() => (activeTab = index)}
+        onkeydown={(e) => onTabKeydown(e, index)}
+      >
+        {title}
+        {#if count > 0}
+          <span class="tab-badge" aria-hidden="true">{count}</span>
+          <span class="sr-only">, {count} {count === 1 ? "error" : "errors"}</span>
+        {/if}
+      </button>
+    {/each}
+  </div>
 
-  {#if hop}
-    {#key hop.hop_id}
-      <HopEditor
-        host={hop.host}
-        {hop}
-        {locked}
-        {errors}
-        errorPrefix={`hop:${hop.hop_id}:`}
-        onHostChange={(edit) => editHop(hop.hop_id, (h) => ({ ...h, host: edit(h.host) }))}
-        onHopChange={(edit) => editHop(hop.hop_id, edit)}
-      />
+  <!-- Panels stay mounted so a half-typed value survives switching tabs. -->
+  <div class="tab-panel" role="tabpanel" id={panelId(CONNECTION_TAB)} aria-labelledby={tabId(CONNECTION_TAB)} hidden={activeTab !== CONNECTION_TAB}>
+    <JumpChainBuilder />
+    {#if errors.hops}<p class="field-error">{errors.hops}</p>{/if}
+    {#if otherInvalidHops.length > 0}
+      <p class="field-error">
+        Other hops need attention:
+        {#each otherInvalidHops as invalid (invalid.hop_id)}
+          <button type="button" onclick={() => (store.selectedHopId = invalid.hop_id)}>{hopTitle(invalid)}</button>
+          {" "}
+        {/each}
+      </p>
+    {/if}
+
+    {#if hop}
+      {#key hop.hop_id}
+        <HopEditor
+          host={hop.host}
+          {hop}
+          {locked}
+          {errors}
+          errorPrefix={`hop:${hop.hop_id}:`}
+          onHostChange={(edit) => editHop(hop.hop_id, (h) => ({ ...h, host: edit(h.host) }))}
+          onHopChange={(edit) => editHop(hop.hop_id, edit)}
+        />
+      {/key}
+    {/if}
+
+    <section aria-labelledby={`${uid}-connection-heading`}>
+      <h2 id={`${uid}-connection-heading`}>Connection</h2>
+      <div class="field-row">
+        <label class="field">
+          IP version
+          <select
+            value={draft.tunnel.ip_version}
+            onchange={(e) => {
+              const ip_version = e.currentTarget.value;
+              store.updateDraft((p) => ({ ...p, tunnel: { ...p.tunnel, ip_version } }));
+            }}
+          >
+            <option value="4">IPv4</option>
+            <option value="6">IPv6</option>
+            <option value="auto">Auto</option>
+          </select>
+        </label>
+        <label class="field">
+          Engine
+          <select
+            value={draft.engine}
+            onchange={(e) => {
+              const engine = e.currentTarget.value as SessionProfile["engine"];
+              store.updateDraft((p) => ({ ...p, engine }));
+            }}
+          >
+            <option value="Russh">Built-in Rust SSH</option>
+            <option value="OpenSsh" disabled>OpenSSH (Phase 4)</option>
+          </select>
+        </label>
+      </div>
+      {#if errors["tunnel.ip_version"]}<p class="field-error">{errors["tunnel.ip_version"]}</p>{/if}
+    </section>
+  </div>
+
+  <div class="tab-panel" role="tabpanel" id={panelId(FORWARD_TAB)} aria-labelledby={tabId(FORWARD_TAB)} hidden={activeTab !== FORWARD_TAB}>
+    {#key store.selectedId}
+      <ForwardProxyTab />
     {/key}
-  {/if}
+  </div>
 
-  <section aria-labelledby="connection-heading">
-    <h2 id="connection-heading">Connection</h2>
-    <div class="field-row">
-      <label class="field">
-        IP version
-        <select
-          value={draft.tunnel.ip_version}
-          onchange={(e) => {
-            const ip_version = e.currentTarget.value;
-            store.updateDraft((p) => ({ ...p, tunnel: { ...p.tunnel, ip_version } }));
-          }}
-        >
-          <option value="4">IPv4</option>
-          <option value="6">IPv6</option>
-          <option value="auto">Auto</option>
-        </select>
-      </label>
-      <label class="field">
-        Engine
-        <select
-          value={draft.engine}
-          onchange={(e) => {
-            const engine = e.currentTarget.value as SessionProfile["engine"];
-            store.updateDraft((p) => ({ ...p, engine }));
-          }}
-        >
-          <option value="Russh">Built-in Rust SSH</option>
-          <option value="OpenSsh" disabled>OpenSSH (Phase 4)</option>
-        </select>
-      </label>
-      <label class="check autostart">
-        <input
-          type="checkbox"
-          checked={draft.autostart}
-          onchange={(e) => {
-            const autostart = e.currentTarget.checked;
-            store.updateDraft((p) => ({ ...p, autostart }));
-          }}
-        />
-        Start with the app
-      </label>
-    </div>
-  </section>
+  <div class="tab-panel" role="tabpanel" id={panelId(REVERSE_TAB)} aria-labelledby={tabId(REVERSE_TAB)} hidden={activeTab !== REVERSE_TAB}>
+    <ReverseProxyTab />
+  </div>
 
-  <section aria-labelledby="forward-heading">
-    <h2 id="forward-heading">Forward proxy <small class="muted">port 0 turns a listener off</small></h2>
-    <div class="field-row">
-      <div class="field grow">
-        <label class="field">
-        Bind address
-        <input
-          value={draft.forward.bind}
-          spellcheck="false"
-          aria-invalid={!!errors["forward.bind"]}
-          aria-describedby={errors["forward.bind"] ? `${uid}-errors-forward-bind` : undefined}
-          oninput={(e) => setForward({ bind: e.currentTarget.value.trim() })}
-        />
-        </label>
-        {#if errors["forward.bind"]}<span id={`${uid}-errors-forward-bind`} class="field-error">{errors["forward.bind"]}</span>{/if}
-      </div>
-      {@render portField("HTTP port", draft.forward.http_port, "forward.http", (http_port) => setForward({ http_port }))}
-      {@render portField("SOCKS port", draft.forward.socks_port, "forward.socks", (socks_port) => setForward({ socks_port }))}
+  <!-- Keyed so per-session editor state, such as a typed rule, never carries across sessions. -->
+  {#key store.selectedId}
+    <div class="tab-panel" role="tabpanel" id={panelId(FILTERS_TAB)} aria-labelledby={tabId(FILTERS_TAB)} hidden={activeTab !== FILTERS_TAB}>
+      <FiltersTab />
     </div>
-    {#if forwardExposed}
-      <p class="warning">This address is not loopback, so other devices on the network may reach this proxy.</p>
-    {/if}
-  </section>
 
-  <section aria-labelledby="reverse-heading">
-    <h2 id="reverse-heading">Reverse proxy <small class="muted">opened on the target host</small></h2>
-    <div class="field-row">
-      <div class="field grow">
-        <label class="field">
-        Remote bind address
-        <input
-          value={draft.reverse.reverse_bind}
-          spellcheck="false"
-          aria-invalid={!!errors["reverse.bind"]}
-          aria-describedby={errors["reverse.bind"] ? `${uid}-errors-reverse-bind` : undefined}
-          oninput={(e) => setReverse({ reverse_bind: e.currentTarget.value.trim() })}
-        />
-        </label>
-        {#if errors["reverse.bind"]}<span id={`${uid}-errors-reverse-bind`} class="field-error">{errors["reverse.bind"]}</span>{/if}
-      </div>
-      {@render portField("HTTP port", draft.reverse.reverse_http_port, "reverse.http", (reverse_http_port) => setReverse({ reverse_http_port }))}
-      {@render portField("SOCKS port", draft.reverse.reverse_socks_port, "reverse.socks", (reverse_socks_port) => setReverse({ reverse_socks_port }))}
+    <div class="tab-panel" role="tabpanel" id={panelId(MITM_TAB)} aria-labelledby={tabId(MITM_TAB)} hidden={activeTab !== MITM_TAB}>
+      <MitmTab />
     </div>
-    {#if reverseExposed}
-      <p class="warning">This address may expose the proxy to other hosts if the server allows GatewayPorts.</p>
-    {/if}
-    {#if errors.listeners}<p class="field-error">{errors.listeners}</p>{/if}
-  </section>
+
+    <div class="tab-panel" role="tabpanel" id={panelId(KEEPALIVE_TAB)} aria-labelledby={tabId(KEEPALIVE_TAB)} hidden={activeTab !== KEEPALIVE_TAB}>
+      <KeepaliveTab />
+    </div>
+
+    <div class="tab-panel" role="tabpanel" id={panelId(LOGGING_TAB)} aria-labelledby={tabId(LOGGING_TAB)} hidden={activeTab !== LOGGING_TAB}>
+      <LoggingAdvancedTab />
+    </div>
+  {/key}
 
   {#if store.selected?.runtime.listeners.length}
-    <section aria-labelledby="listeners-heading">
-      <h2 id="listeners-heading">Active listeners</h2>
+    <section aria-labelledby={`${uid}-listeners-heading`}>
+      <h2 id={`${uid}-listeners-heading`}>Active listeners</h2>
       <ul class="plain-list">
         {#each store.selected.runtime.listeners as listener (listener.role + listener.addr)}
           <li>{listener.role}: <code>{listener.addr}</code></li>

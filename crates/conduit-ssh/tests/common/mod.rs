@@ -10,7 +10,7 @@ use conduit_ssh::{ChainOptions, ChannelPolicy, HopAuth, HopSpec, HostKeyVerifier
 use conduit_vault::{generate_key, KeyGenAlgorithm};
 use russh::keys::{HashAlg, PrivateKey, PublicKey};
 use russh::server::{self, Auth, Response};
-use russh::{Channel, ChannelOpenFailure};
+use russh::{Channel, ChannelId, ChannelOpenFailure};
 use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
@@ -33,6 +33,10 @@ pub struct NodeState {
     pub keyboard_answers: AtomicUsize,
     /// Every `direct-tcpip` host, exactly as the client sent it.
     pub requested_hosts: Mutex<Vec<String>>,
+    /// `auth-agent-req@openssh.com` requests received.
+    pub agent_requests: AtomicUsize,
+    /// Every `exec` command received.
+    pub exec_commands: Mutex<Vec<String>>,
     session: Mutex<Option<server::Handle>>,
 }
 
@@ -40,6 +44,8 @@ struct NodeHandler {
     allowed_key: Option<PublicKey>,
     state: Arc<NodeState>,
     forwards: Vec<JoinHandle<()>>,
+    /// Accepted session channels, held open for the life of the connection.
+    sessions: Vec<Channel<server::Msg>>,
 }
 
 impl Drop for NodeHandler {
@@ -97,6 +103,41 @@ impl server::Handler for NodeHandler {
 
     async fn auth_succeeded(&mut self, session: &mut server::Session) -> Result<(), russh::Error> {
         *self.state.session.lock().unwrap() = Some(session.handle());
+        Ok(())
+    }
+
+    async fn channel_open_session(
+        &mut self,
+        channel: Channel<server::Msg>,
+        reply: server::ChannelOpenHandle,
+        _session: &mut server::Session,
+    ) -> Result<(), russh::Error> {
+        reply.accept().await;
+        self.sessions.push(channel);
+        Ok(())
+    }
+
+    async fn agent_request(
+        &mut self,
+        _channel: ChannelId,
+        _session: &mut server::Session,
+    ) -> Result<bool, russh::Error> {
+        self.state.agent_requests.fetch_add(1, Ordering::SeqCst);
+        Ok(true)
+    }
+
+    async fn exec_request(
+        &mut self,
+        channel: ChannelId,
+        data: &[u8],
+        session: &mut server::Session,
+    ) -> Result<(), russh::Error> {
+        self.state
+            .exec_commands
+            .lock()
+            .unwrap()
+            .push(String::from_utf8_lossy(data).to_string());
+        session.channel_success(channel)?;
         Ok(())
     }
 
@@ -188,6 +229,18 @@ impl Node {
         self.state.requested_hosts.lock().unwrap().clone()
     }
 
+    /// Opens an `auth-agent@openssh.com` channel back to the client, as a remote `ssh` would.
+    pub async fn open_agent_channel(&self) -> Result<Channel<server::Msg>, russh::Error> {
+        let handle = self
+            .state
+            .session
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("client authenticated");
+        handle.channel_open_agent().await
+    }
+
     /// Ends the authenticated client's session from the server side.
     pub async fn drop_session(&self) {
         let handle = self
@@ -227,6 +280,7 @@ pub async fn spawn_node(allowed_key: Option<PublicKey>) -> Node {
                 allowed_key: allowed_key.clone(),
                 state: Arc::clone(&accept_state),
                 forwards: Vec::new(),
+                sessions: Vec::new(),
             };
             let config = Arc::clone(&config);
             tokio::spawn(async move {

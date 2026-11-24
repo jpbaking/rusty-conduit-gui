@@ -1,53 +1,57 @@
-# phase-0003 — src-tauri desktop lifecycle, tray wiring, autostart & platform rules
+# phase-0003 — src-tauri: port conflicts, filter tester, MITM CA inspector & config export/import IPC
 
 - Status: done
 - Owner: executor
 - Depends on: phase-0001, phase-0002
-- Goal: Complete `src-tauri/` desktop application wiring: destroy-webview-on-close & recreate-on-demand, `conduit-tray` integration (Linux `ksni` + Windows/macOS Tauri tray), `tauri-plugin-single-instance`, `tauri-plugin-autostart` (`--tray` + `$APPIMAGE`), macOS `Accessory`/`Regular` Dock policy, NVIDIA WebKitGTK env mitigation, no-tray-host fallback, and Wayland clipboard fallback.
-- Done when: `cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings` exits 0 with unit tests covering CLI flag parsing (`--tray`, `--show`, `--safe-rendering`), NVIDIA/WebKitGTK env mitigation & child-env stripping, autostart command resolution (including `$APPIMAGE`), tray action dispatch, and no-tray-host fallback state.
-- Pattern to follow: `docs/MASTER-PLAN.md` Sections 4.1, 4.2, and 6.1
+- Goal: Implement the Phase 3 backend IPC commands in `src-tauri`: live port-conflict detection (`check_port_conflicts`), interactive filter rule tester (`test_filter_rules`), MITM CA certificate inspection (`inspect_mitm_ca`), and config export/import (`export_config` stripped-by-default or passphrase-encrypted full bundle, `import_config`) with full unit and secret-leak tests.
+- Done when: `cargo test -p rusty-conduit-ssh-gui && cargo clippy --workspace --all-targets -- -D warnings` exits 0 with all new commands covered by `every_ipc_command_works_and_no_response_or_file_leaks_a_secret`.
+- Pattern to follow: `src-tauri/src/commands.rs` and `src-tauri/src/controller/keys.rs`
 
 ## Context
-The Manage Window must never keep WebKitGTK / WebView2 / WKWebView helper processes alive in the background when closed: closing the Manage Window destroys the webview completely, while tunnels and tray stay running in Rust. Re-opening from the tray or launching a second instance (`--show`) recreates the window on demand.
+Master Plan Phase 3 requires 100% `rusty-conduit-ssh` option parity in the Manage Window plus safe config export/import.
 Key decisions already made:
-- CLI flags: `--tray` (start minimized to tray), `--show` (open/focus Manage Window), `--safe-rendering` (sets `WEBKIT_DISABLE_COMPOSITING_MODE=1` before GTK init).
-- NVIDIA + WebKitGTK mitigation (Linux only): detect NVIDIA (e.g., `/proc/driver/nvidia/version` or `/sys/module/nvidia`), apply `WEBKIT_DISABLE_DMABUF_RENDERER=1` before GTK init if not already set, and strip those WebKit env vars from any child/worker processes.
-- Linux no-tray-host fallback: wait up to 10s for `StatusNotifierWatcher`; if `TrayHostStatus::Offline`, open the Manage Window with `tray_available: false` so the UI shows the dismissible info banner and asks Keep running in background vs. Quit on close.
-- Wayland clipboard fallback: if copying a proxy URL from a windowless tray menu fails on Linux/Wayland, open the Manage Window with a `clipboard-fallback` event carrying the URL pre-selected.
-- macOS: `ActivationPolicy::Accessory` when no window is open, `ActivationPolicy::Regular` while the Manage Window is open.
-- Call `conduit_runtime::disable_core_dumps()` at startup.
+- **`check_port_conflicts(session_id: Option<Uuid>, bind: IpAddr, http_port: u16, socks_port: u16)`:**
+  - Checks each non-zero port against all *other* saved sessions' forward ports (same bind IP or either side is unspecified `0.0.0.0`/`::`) AND checks whether a live OS `TcpListener::bind((bind, port))` fails with `AddrInUse` (skipping the OS bind check if `session_id` is currently running and owns that listener!). Returns `PortConflictReport { conflicts: Vec<PortConflict> }` with `port`, `kind` (`"session"` | `"os_socket"`), and `detail`.
+- **`test_filter_rules(mode: "allow" | "block", rules: Vec<String>, target: String)`:**
+  - Parses each rule with `rusty_conduit_ssh::filter::FilterRule::from_str`, builds `HostFilter`, tests `target` (IP or domain), and returns `FilterTestResult { valid: bool, allowed: Option<bool>, reason: String, rule_errors: Vec<RuleError> }`.
+- **`inspect_mitm_ca(ca_mode: MitmCaMode, passphrase: Option<SecretInput>, passphrase_ref: Option<SecretRef>, passphrase_file: Option<PathBuf>)`:**
+  - Resolves passphrase (from inline `SecretInput`, or from unlocked `Vault` via `passphrase_ref`, or `passphrase_file`), validates & parses the CA via `rusty_conduit_ssh::mitm` / `x509-parser` (matching the engine's exact CA loader!), and returns `MitmCaInfo { subject: String, not_after: String, expired: bool, days_remaining: i64 }`. Never returns private key material or passphrase!
+- **`export_config(path: PathBuf, include_secrets: bool, passphrase: Option<SecretInput>)` & `import_config(path: PathBuf, passphrase: Option<SecretInput>, replace_existing: bool)`:**
+  - When `include_secrets == false` (default): writes a redacted JSON config export (`AppConfig` with `keys` metadata preserved or stripped as safe metadata, NO secret values, NO `vault.bin` bytes).
+  - When `include_secrets == true`: requires a non-empty `passphrase` and unlocked `Vault`; writes an `XChaCha20-Poly1305` + `Argon2id` encrypted full bundle containing `AppConfig` + `KnownHostsStore` + all referenced vault secrets (reusing `conduit_vault::crypto` primitives, zero plaintext secrets on disk!).
+  - `import_config` detects plain JSON vs. encrypted bundle, validates every imported session/host, skips or updates duplicates cleanly, and requires unlocked vault + passphrase when importing an encrypted bundle.
+- Update `keys.rs` usage tracking to also count `hop.agent_forward_keys` so deleting a key warns when it is assigned for agent forwarding!
 
 ## Scope
 - In: `src-tauri/src/**`, `src-tauri/Cargo.toml`, `Cargo.lock`
-- Out: `crates/conduit-core/**`, `crates/conduit-vault/**`, `crates/conduit-ssh/**`, `crates/conduit-runtime/**`, `src-tauri/ui/**`, `docs/MASTER-PLAN.md`
+- Out: `crates/**`, `src-tauri/ui/**`, `docs/MASTER-PLAN.md`
 
 ## Sub-tasks
-1. [done] Implement `src-tauri/src/platform.rs` covering: CLI flag parsing (`--tray`, `--show`, `--safe-rendering`), Linux NVIDIA detection & pre-GTK WebKitGTK env mitigation + child-env sanitization helper, AppImage `$APPIMAGE` autostart executable path resolution, and process hardening (`disable_core_dumps`) — done when: `cargo test -p rusty-conduit-ssh-gui platform` exits 0
-2. [done] Implement `src-tauri/src/window.rs` managing on-demand Manage Window creation (`open_or_focus_manage_window`), destroy-webview-on-close (`on_window_event(CloseRequested)`), macOS `ActivationPolicy::Accessory`/`Regular` switching (`#[cfg(target_os = "macos")]`), and `tray_available` / `clipboard-fallback` event payloads — done when: `cargo check -p rusty-conduit-ssh-gui` exits 0
-3. [done] Implement `src-tauri/src/tray_bridge.rs` bridging `AppController` + `RuntimeEvent`s to `conduit_tray::TrayBackend` (`KsniTrayBackend` on Linux; Tauri `tray-icon` adapter on Windows/macOS), handling all `TrayAction`s (start/stop/restart, copy HTTP/`socks5h://` URL with Wayland fallback, view logs, start/stop all, unlock vault, open Manage Window, quit), and implementing the 10-second watcher-online wait + automatic late-panel registration — done when: `cargo test -p rusty-conduit-ssh-gui tray_bridge` exits 0
-4. [done] Wire `src-tauri/src/lib.rs` and `src-tauri/src/main.rs` integrating `tauri-plugin-single-instance` (second launch / `--show` opens Manage Window), `tauri-plugin-autostart` (`--tray` + autostart get/set IPC commands), `RuntimeEvent` forwarding to open webviews, and staggered autostart on startup — done when: `cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings` exits 0
+1. [done] Update `src-tauri/src/controller/keys.rs` so key usage counting and forced deletion also track and strip `hop.agent_forward_keys` references — done when: `cargo test -p rusty-conduit-ssh-gui keys` exits 0
+2. [done] Implement `src-tauri/src/controller/parity.rs` with `check_port_conflicts`, `test_filter_rules`, and `inspect_mitm_ca` (reusing `rusty_conduit_ssh::filter` and `rusty_conduit_ssh::mitm` CA parsing) plus unit tests — done when: `cargo test -p rusty-conduit-ssh-gui parity` exits 0
+3. [done] Implement `src-tauri/src/controller/export.rs` with `export_config` (redacted JSON default + passphrase-encrypted full bundle using `conduit_vault::crypto`) and `import_config` (plain + encrypted auto-detect, validation, zero plaintext secret leakage) plus unit tests — done when: `cargo test -p rusty-conduit-ssh-gui export` exits 0
+4. [done] Expose `check_port_conflicts`, `test_filter_rules`, `inspect_mitm_ca`, `export_config`, and `import_config` in `src-tauri/src/commands.rs`, register them in `ipc_handler!` and `ALL_COMMANDS`, and extend `every_ipc_command_works_and_no_response_or_file_leaks_a_secret` to exercise all 44 commands and verify exported files contain zero plaintext secrets — done when: `cargo test -p rusty-conduit-ssh-gui && cargo clippy --workspace --all-targets -- -D warnings` exits 0
 
 ## Verify
 ```sh
-cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p rusty-conduit-ssh-gui && cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 ## Escalate when
-- `tauri-plugin-single-instance` or `tauri-plugin-autostart` v2 API conflicts with Tauri v2 features or requires an unsupported capability → stop, set Status: needs-human — reason: exact plugin version and API conflict
+- `rusty_conduit_ssh::mitm` does not expose a public helper to load/inspect a CA without building a full `MitmState` → stop, set Status: needs-human — reason: exact visibility in `../rusty-conduit-ssh/src/mitm/`
 
 ## Log
 - (append-only, one line per event)
-- sub-task 1: added platform.rs (CLI flags, NVIDIA/WebKitGTK env, child-env sanitizer, $APPIMAGE resolution, hardening)
-- sub-task 2: added window.rs (on-demand window, destroy on close, macOS policy, queued UI events, close decision)
-- sub-task 3: added tray_bridge.rs (all TrayActions, 10s host wait, late registration, clipboard fallback) and tray_tauri.rs (Windows/macOS adapter); added arboard for clipboard access
-- sub-task 4: wired lib.rs with single-instance, autostart, runtime event forwarding, staggered autostart; added get_autostart, set_autostart, shell_ready, resolve_close IPC commands
-- not run: real window launch (no headless display available) and Windows/macOS target builds (targets not installed)
+- sub-task 1: key usage now counts hop.agent_forward_keys (once per session) and forced delete strips them and re-syncs the session
+- sub-task 2: added parity.rs (port conflicts, filter tester using engine FilterRule/HostFilter, CA inspector using engine CaMaterial parsers so expired CAs are reported)
+- sub-task 3: added export.rs (redacted JSON, Argon2id + XChaCha20-Poly1305 bundle, auto-detecting atomic import; plain imports keep a credential ref only for the same host/port/user)
+- sub-task 4: exposed 5 commands, registered them in ipc_handler! and ALL_COMMANDS (44 total), extended the IPC leak test to both export files
+- phase verified and closed
 
 ## Evidence
 - (append-only: command → observed result)
-- `cargo test -p rusty-conduit-ssh-gui platform` → 12 passed, 0 failed
-- `cargo check -p rusty-conduit-ssh-gui` → Finished dev profile, exit 0 (window tests: 8 passed)
-- `cargo test -p rusty-conduit-ssh-gui tray_bridge` → 10 passed, 0 failed
-- `cargo test --workspace` → exit 0, 286 passed, 0 failed (72 in the src-tauri lib)
-- `cargo clippy --workspace --all-targets -- -D warnings` → exit 0
-- scratch copy with tauri `tray-icon` and `--cfg conduit_check_tauri_tray`: `cargo clippy -p rusty-conduit-ssh-gui --lib -- -D warnings` → exit 0 (adapter compiled against Linux types only)
+- `cargo test -p rusty-conduit-ssh-gui keys` → 16 passed; 0 failed
+- `cargo test -p rusty-conduit-ssh-gui parity` → 12 passed; 0 failed
+- `cargo test -p rusty-conduit-ssh-gui export` → 13 passed; 0 failed
+- `grep -c '$crate::commands::' src-tauri/src/commands.rs` → 44
+- `cargo test -p rusty-conduit-ssh-gui && cargo clippy --workspace --all-targets -- -D warnings` → exit 0; 99 passed, 0 failed, including every_ipc_command_works_and_no_response_or_file_leaks_a_secret; clippy clean

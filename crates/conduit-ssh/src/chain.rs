@@ -171,6 +171,11 @@ impl SshChain {
             .expect("connect_chain rejects an empty chain")
     }
 
+    /// The session of hop `index`, counted from the first hop.
+    pub fn hop(&self, index: usize) -> Option<&Handle<HopHandler>> {
+        self.handles.get(index)
+    }
+
     /// `true` once any hop's session has ended, which breaks the whole chain.
     pub fn is_closed(&self) -> bool {
         self.handles.iter().any(Handle::is_closed)

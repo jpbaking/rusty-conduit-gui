@@ -1,9 +1,9 @@
-# GOAL — Tauri v2 Shell, System Tray & Svelte 5 Manage Window
+# GOAL — Phase 3: Full Option Parity, Scoped Agent Forwarding & Config Export/Import
 
 ## Goal
-- Goal ID: 20261124-tauri-tray-svelte-ui
-- Outcome: Implement Master Plan Phase 2: `conduit-tray` (`ksni` pure-Rust D-Bus SNI on Linux + Tauri tray adapter on Windows/macOS + no-tray fallback), the Tauri v2 desktop shell (`src-tauri/` with write-only secret IPC, destroy-webview-on-close, single-instance, autostart `--tray`, and NVIDIA WebKitGTK mitigation), and the Svelte 5 + TypeScript core Manage Window (`src-tauri/ui/`).
-- Done when: `cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && (cd src-tauri/ui && npm run check && npm run build)` exits 0 with passing `conduit-tray` and `src-tauri` tests, clean Svelte 5 typecheck and production bundle, and zero raw secrets exposed to the WebView.
+- Goal ID: 20261124-phase3-parity-scoped-agent
+- Outcome: Implement Master Plan Phase 3: live per-hop Scoped Agent Forwarding (RFC/OpenSSH `ssh-agent` wire protocol over `ScopedAgent` with signature audit logging), full 7-Tab Session Editor (`rusty-conduit-ssh` 100% option parity with port-conflict detection, interactive filter tester, and MITM CA inspection), and Config Export/Import (secrets stripped by default; optional passphrase-encrypted full backup).
+- Done when: `cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && (cd src-tauri/ui && npm run check && npm run build)` exits 0 with passing loopback scoped-agent tests, parity IPC tests, zero secret leaks, and clean Svelte 5 typecheck and production bundle.
 - Goal status: completed
 - Goal status meaning: drafting | approved | executing | blocked-on-human | in-review | awaiting-acceptance | completed | abandoned
 - Last completed phase: phase-0006
@@ -18,49 +18,49 @@
 - Repository: yes
 - Strategy: isolated-branch
 - Starting branch: main
-- Work branch: goal/20261124-tauri-tray-svelte-ui
-- Baseline commit: 552b6fb5f129b7def92dd879bb1c4a780227c3da
+- Work branch: goal/20261124-phase3-parity-scoped-agent
+- Baseline commit: c95efbf86784c4b8c6473129e076232e76091a44
 - Starting upstream at start: none
 - Work upstream at start: none
 
 ## Phases
-- [done] phase-0001 — conduit-tray trait, menu model & pure-Rust Linux ksni backend
-- [done] phase-0002 — src-tauri v2 scaffold, AppState & write-only secret IPC commands
-- [done] phase-0003 — src-tauri desktop lifecycle, tray wiring, autostart & platform rules
-- [done] phase-0004 — src-tauri/ui Svelte 5 scaffold, typed IPC client, shell & live log drawer
-- [done] phase-0005 — src-tauri/ui Multi-Hop Jump Chain Builder & Host Profiles
-- [done] phase-0006 — src-tauri/ui Key Vault, Host-Key & Vault Unlock modals, Settings & E2E verify
+- [done] phase-0001 — conduit-core + conduit-ssh: scoped agent forwarding wire protocol & loopback tests
+- [done] phase-0002 — conduit-runtime: wire AgentForwardRelay, audit logs & E2E flake hardening
+- [done] phase-0003 — src-tauri: port conflicts, filter tester, MITM CA inspector & config export/import IPC
+- [done] phase-0004 — src-tauri/ui: 7-tab SessionEditor shell & Tabs 1-3 (Chain+Agent, Forward, Reverse)
+- [done] phase-0005 — src-tauri/ui: Tabs 4-7 (Filters, HTTPS MITM, Keepalive, Logging & Advanced)
+- [done] phase-0006 — src-tauri/ui: Config Export/Import UI in Settings & full cross-stack verification
 
 ## Handoff
 - Current position: completed
 - Next role: planner
 - Next action: none
-- Last verified evidence: cargo test --workspace (286 passed, 0 failed) && cargo clippy --workspace --all-targets -- -D warnings (exit 0) && (cd src-tauri/ui && npm run check && npm run build) (0 errors/0 warnings, 136.69 kB JS + 10.38 kB CSS); accepted and squashed
+- Last verified evidence: Gate D full verification exited 0 (333 Rust tests passed, clippy clean, svelte-check 0/0, vite build 176.85 kB JS / 12.43 kB CSS, PURE_RUST_CRYPTO_OK)
 - Blockers: none
 
 ## Review
-- Reviewed by: Gemini 4 Neon (Medium) (planner)
-- Verification result: pass — cargo test --workspace (286 passed, 0 failed: 33 conduit-core, 43 conduit-vault, 64 conduit-ssh, 53 conduit-runtime, 21 conduit-tray, 72 rusty-conduit-ssh-gui) && cargo clippy --workspace --all-targets -- -D warnings (exit 0) && (cd src-tauri/ui && npm run check && npm run build) (0 errors, 0 warnings, 136.69 kB JS + 10.38 kB CSS)
-- Diff reviewed: 552b6fb5f129b7def92dd879bb1c4a780227c3da..HEAD (reviewed across all 6 phase reviews; all changed paths within declared Scope: In)
-- Findings: none blocking (note: real Tauri window launch, OS keyring default-store registration, and Windows/macOS cross-builds were not run on this headless Linux host)
+- Reviewed by: Gemini 4 Neon (Medium) — planner Gate D review
+- Verification result: PASS — `cargo test --workspace` (333 passed, 0 failed), `cargo clippy --workspace --all-targets -- -D warnings` (0 warnings), `(cd src-tauri/ui && npm run check && npm run build)` (0 errors, 0 warnings), `PURE_RUST_CRYPTO_OK` (no aws-lc-sys/openssl-sys), headless Chromium mock-IPC smoke journey 69/69 passed
+- Diff reviewed: `c95efbf86784c4b8c6473129e076232e76091a44..75b3074` across all 6 phases; zero scope drift, zero edits to `docs/MASTER-PLAN.md` or `../rusty-conduit-ssh`
+- Findings: No blocking defects. Four non-blocking follow-up items tracked for Phase 4 (OpenSSH engine & hardening): (1) `conduit-core` `extra_args` denylist matches whole case-sensitive flags only (misses attached/case-variant options like `-oProxyCommand=x`); (2) plain config import preserves `logging.http_access_log`/`socks_log`/`openssh.ssh_bin` paths (inert until OpenSSH engine ships); (3) `ScopedAgent` RSA signing currently supports SHA-512 only (Ed25519/ECDSA unaffected); (4) `lock_vault` leaves already-connected sessions up so active agent relays keep signing until disconnect.
 
 ## Log
-- created Milestone 2 ledger with 6 phases for Master Plan Phase 2 (conduit-tray, Tauri v2 shell, Svelte 5 Manage Window) on branch goal/20261124-tauri-tray-svelte-ui from baseline 552b6fb5f129b7def92dd879bb1c4a780227c3da
-- delegated phase-0001 to claude (--model opus --effort medium) (sub-m2-phase-0001)
-- phase-0001 done: conduit-tray model, backend trait, mock, and ksni Linux backend verified
-- planner reviewed and accepted phase-0001; closed sub-m2-phase-0001; delegated phase-0002 to claude (--model opus --effort medium) (sub-m2-phase-0002)
-- phase-0002 done: src-tauri scaffold, AppController, and 34 write-only IPC commands verified; open items for planner are the app identifier, OS keyring store registration, and an unrun real-window launch
-- planner reviewed and accepted phase-0002; closed sub-m2-phase-0002; delegated phase-0003 to claude (--model opus --effort medium) (sub-m2-phase-0003)
-- phase-0003 done: desktop lifecycle, tray bridge, autostart and platform rules verified; real window launch and Windows/macOS target builds not run
-- planner reviewed and accepted phase-0003; closed sub-m2-phase-0003; added shell_ready/event contract to phase-0004 and delegated phase-0004 to claude (--model opus --effort medium) (sub-m2-phase-0004)
-- phase-0004 blocked at sub-task 1: svelte-check cannot type .svelte imports after two attempts; partial scaffold committed
-- planner answered phase-0004 escalation (allowJs+checkJs + <script lang="ts"> for svelte-check, commit ui/dist build output, keep TS ~5.9.3), returned phase-0004 to todo, and steered sub-m2-phase-0004
-- phase-0004 done: Svelte 5 shell, typed 38-command IPC client, stores and windowed log drawer verified; real Tauri window launch not run
-- planner reviewed and accepted phase-0004; closed sub-m2-phase-0004; added src-tauri/ui/dist/** to phase-0005/0006 scope and delegated phase-0005 to claude (--model opus --effort medium) (sub-m2-phase-0005)
-- phase-0005 blocked before sub-task 1: no IPC read path for pinned host-key fingerprints; no UI files changed
-- planner added read-only list_host_key_pins IPC command in src-tauri/src/commands.rs, answered phase-0005 escalation (pins apply to session hops), returned phase-0005 to todo, and steered sub-m2-phase-0005
-- phase-0005 done: jump chain builder, hop editor, session editor and host profiles wired to IPC; verified by check, build and mock-IPC browser run; real Tauri window and live SSH not run
-- planner reviewed and accepted phase-0005; closed sub-m2-phase-0005; delegated phase-0006 to claude (--model opus --effort medium) (sub-m2-phase-0006)
-- phase-0006 done: Key Vault, host-key and vault unlock modals, and Settings wired; full verification passed on rerun after one port-collision flake in conduit-runtime e2e; real Tauri window and live SSH not run
-- planner reviewed and accepted phase-0006; closed sub-m2-phase-0006; Gate D passed clean (286 Rust tests, clippy clean, svelte-check 0 errors/0 warnings, production bundle built); status set to awaiting-acceptance
-- user accepted goal and chose squash; soft-reset to baseline 552b6fb5f129b7def92dd879bb1c4a780227c3da and squashed into a single commit retaining .goal-ledger/
+- created Milestone 3 ledger with 6 phases for Master Plan Phase 3 (scoped agent forwarding, 7-tab option parity, config export/import) on branch goal/20261124-phase3-parity-scoped-agent from baseline c95efbf86784c4b8c6473129e076232e76091a44
+- delegated phase-0001 to sub-m3-phase-0001 (claude --model opus --effort medium)
+- phase-0001 blocked after sub-task 1: workspace clippy needs a one-line fix in out-of-scope src-tauri/src/controller/test_support.rs:90
+- planner unblocked phase-0001: added src-tauri/src/controller/test_support.rs to Scope: In and resumed sub-m3-phase-0001 from sub-task 2
+- phase-0001 done: scoped agent wire protocol, relay, and loopback tests verified
+- planner verified phase-0001 (34 core + 63 ssh + 5 agent loopback + 12 multihop tests, clippy clean) and delegated phase-0002 to sub-m3-phase-0002 (claude --model opus --effort medium)
+- phase-0002 blocked at sub-task 1 before any code change: SignAudit has no algorithm field and crates/conduit-ssh/** is Scope: Out
+- planner unblocked phase-0002 (Option A): added crates/conduit-ssh/src/agent.rs to Scope: In for SignAudit.algorithm and resumed sub-m3-phase-0002 from sub-task 1
+- phase-0002 done: per-hop scoped agent relays, agent-audit logs, E2E coverage, and port hardening verified
+- planner verified phase-0002 (48 runtime + 8 E2E + 63 ssh + 5 agent + 12 multihop tests, clippy clean) and delegated phase-0003 to sub-m3-phase-0003 (claude --model opus --effort medium)
+- phase-0003 done: port conflicts, filter tester, MITM CA inspector, config export/import, and agent-forward key tracking verified across 44 IPC commands
+- planner verified phase-0003 (99 src-tauri tests, 44 IPC commands + secret-leak test, clippy clean) and delegated phase-0004 to sub-m3-phase-0004 (claude --model opus --effort medium)
+- phase-0004 done: 7-tab SessionEditor, per-hop Forwarded Keys picker, Forward and Reverse Proxy tabs, and typed clients for the 5 Phase 3 commands verified
+- planner verified phase-0004 (svelte-check 0/0, vite build clean, ledger valid) and delegated phase-0005 to sub-m3-phase-0005 (claude --model opus --effort medium)
+- phase-0005 done: Tabs 4-7 wired with full validation; open finding: conduit-core extra_args denylist misses attached and case-variant ssh options
+- planner verified phase-0005 (svelte-check 0/0, vite build clean, ledger valid) and delegated phase-0006 to sub-m3-phase-0006 (claude --model opus --effort medium)
+- phase-0006 done: Settings config export/import wired; full cross-stack verification and mock-IPC smoke journey passed
+- planner Gate D review passed (333 tests, clippy clean, svelte-check 0/0, vite build clean, PURE_RUST_CRYPTO_OK); set status to awaiting-acceptance
+- user accepted Milestone 3 with squash; marked completed and squashed onto goal/20261124-phase3-parity-scoped-agent

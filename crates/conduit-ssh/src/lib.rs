@@ -8,6 +8,8 @@
 #![allow(clippy::result_large_err)]
 
 pub mod agent;
+pub mod agent_relay;
+pub mod agent_wire;
 pub mod chain;
 pub mod dialer;
 pub mod error;
@@ -20,6 +22,7 @@ pub use agent::{
     AgentError, AgentIdentity, AgentRequest, AgentResponse, MutationOp, ScopedAgent, SignAudit,
     SignAuditFn,
 };
+pub use agent_relay::{agent_policy, AgentForwardRelay, AgentInbound, AgentRelayError};
 pub use chain::{
     connect_chain, test_chain, ChainOptions, ChainTestReport, HopAuth, HopDiagnostic, HopSpec,
     HopStatus, IpPreference, KeyboardAnswer, SshChain,

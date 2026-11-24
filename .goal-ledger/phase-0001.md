@@ -1,55 +1,55 @@
-# phase-0001 — conduit-tray trait, menu model & pure-Rust Linux ksni backend
+# phase-0001 — conduit-core + conduit-ssh: scoped agent forwarding wire protocol & loopback tests
 
 - Status: done
 - Owner: executor
 - Depends on: none
-- Goal: Implement `crates/conduit-tray` with the UI-agnostic `TrayBackend` trait, menu state model (`TrayMenuModel` built from `SessionSnapshot` + vault lock status), pure-Rust Linux `ksni` D-Bus SNI backend with watcher online/offline status, and unit tests.
-- Done when: `cargo test -p conduit-tray && cargo clippy --workspace --all-targets -- -D warnings` exits 0 with unit tests verifying menu construction, `socks5h://` URL formatting, vault-locked state, tray action dispatch, and no-tray-host fallback state.
-- Pattern to follow: `docs/MASTER-PLAN.md` Sections 4.2 and 8.1
+- Goal: Extend `HopEntry` with per-hop `agent_forward_keys` / `agent_forward_command` (`#[serde(default)]`) and implement `AgentForwardRelay` in `conduit-ssh` serving the read-only OpenSSH `ssh-agent` wire protocol over `ScopedAgent` with signature audit callbacks and loopback tests.
+- Done when: `cargo test -p conduit-core -p conduit-ssh && cargo clippy --workspace --all-targets -- -D warnings` exits 0 with a loopback test proving an opted-in hop exposes ONLY its explicitly assigned key(s) over `auth-agent@openssh.com`, refuses mutating agent requests, and invokes the audit callback on every sign request.
+- Pattern to follow: `crates/conduit-ssh/src/agent.rs` and `crates/conduit-ssh/src/reverse.rs`
 
 ## Context
-`conduit-tray` abstracts system tray operations across platforms so Linux uses pure-Rust D-Bus `StatusNotifierItem` (`ksni` — zero GTK3 / `libappindicator` dependency) while Windows/macOS will plug in Tauri v2's `tray-icon` adapter in `src-tauri/`.
+`conduit-ssh` already has `ScopedAgent` (sealed read-only key set with `list_identities`, `sign`, and audit callback) and `HopHandler` (which accepts `server_channel_open_agent_forward` only when `ChannelPolicy::agent_channels` is `Some`).
 Key decisions already made:
-- Menu-first tray: never hide a required action behind left-click; every action lives in the tray menu.
-- Always format SOCKS proxy URLs as `socks5h://` (never `socks5://`) so DNS resolution stays remote.
-- Menu layout follows `docs/MASTER-PLAN.md` Section 8.1: summary header (`N connected · M needs attention`), per-session entries (`●`/`◐`/`!`/`○`) with Stop/Restart/Start, Copy HTTP Proxy URL, Copy SOCKS Proxy URL (`socks5h://`), View Logs; then `Start All`, `Stop All`, conditional `Unlock Vault…` (only when locked), `Open Manage Window…`, and `Quit`.
-- Expose `TrayHostStatus` (`Online`, `Offline`, `Waiting`) so `src-tauri/` can implement the 10-second login wait + no-tray-host fallback banner cleanly.
+- Backwards-compatible `conduit-core` schema: add `#[serde(default)] pub agent_forward_keys: Vec<KeyId>` and `#[serde(default)] pub agent_forward_command: Option<String>` to `HopEntry` so existing `config.json` files deserialize cleanly.
+- OpenSSH `ssh-agent` wire protocol (`draft-miller-ssh-agent`): 4-byte big-endian length prefix + 1-byte message type + payload:
+  - `SSH_AGENTC_REQUEST_IDENTITIES` (11) → `SSH_AGENT_IDENTITIES_ANSWER` (12) containing ONLY the keys assigned to that hop's `ScopedAgent`.
+  - `SSH_AGENTC_SIGN_REQUEST` (13) → `SSH_AGENT_SIGN_RESPONSE` (14) on valid signature, or `SSH_AGENT_FAILURE` (5) if key is not in `ScopedAgent` or signing fails; ALWAYS invokes `ScopedAgent`'s audit callback.
+  - Every other message type (including `ADD_IDENTITY` 17, `REMOVE_IDENTITY` 18, `REMOVE_ALL` 19, `LOCK` 22, `UNLOCK` 23, `ADD_ID_CONSTRAINED` 25) → `SSH_AGENT_FAILURE` (5), never mutating state.
+  - Enforce a sane max packet length (e.g., 256 KiB) to prevent memory exhaustion from a hostile remote host.
+- Tunnel-only SSH (`ssh -N`) does not open a session channel, so `AgentForwardRelay::start(handle, hop_index, agent, agent_channels, remote_command)` opens a session channel on that hop's `Handle<HopHandler>`, calls `request_agent_forwarding(true)` (and runs `remote_command` if provided, or keeps the session channel alive cleanly), and spawns a relay task serving every accepted `Channel<Msg>` from `agent_channels` over `ScopedAgent`.
 
 ## Scope
-- In: `Cargo.toml`, `Cargo.lock`, `crates/conduit-tray/**`
-- Out: `crates/conduit-core/**`, `crates/conduit-vault/**`, `crates/conduit-ssh/**`, `crates/conduit-runtime/**`, `docs/MASTER-PLAN.md`
+- In: `crates/conduit-core/src/model.rs`, `crates/conduit-ssh/src/**`, `crates/conduit-ssh/tests/**`, `crates/conduit-ssh/Cargo.toml`, `Cargo.lock`, `src-tauri/src/controller/test_support.rs` (only to add `..Default::default()` to the `HopEntry` test helper literal)
+- Out: `crates/conduit-vault/**`, `crates/conduit-runtime/**`, `crates/conduit-tray/**`, `src-tauri/**` (except `src-tauri/src/controller/test_support.rs`), `docs/MASTER-PLAN.md`
 
 ## Sub-tasks
-1. [done] Add `crates/conduit-tray` to root `Cargo.toml` workspace members and create `crates/conduit-tray/Cargo.toml` (depending on `conduit-core`, `conduit-runtime`, `tokio`, `thiserror`, `uuid`, and on `#[cfg(target_os = "linux")]` `ksni = "0.3"`) — done when: `cargo check -p conduit-tray` exits 0
-2. [done] Implement `crates/conduit-tray/src/model.rs` defining `TrayAction` (Start/Stop/Restart session, CopyHttpUrl, CopySocksUrl, ViewLogs, StartAll, StopAll, UnlockVault, OpenManageWindow, Quit), `TrayIconState` (Idle, Connected, Reconnecting, Attention, Locked), `TrayHostStatus`, and `TrayMenuModel::from_snapshots(snapshots, vault_locked)` formatting `http://...` and `socks5h://...` URLs accurately — done when: `cargo test -p conduit-tray model` exits 0
-3. [done] Implement `crates/conduit-tray/src/backend.rs` defining the `TrayBackend` trait (`update(&self, model: TrayMenuModel)`, `host_status(&self) -> TrayHostStatus`, `subscribe_actions(&self)`, `shutdown(self)`) plus a `MockTrayBackend` for deterministic tests — done when: `cargo test -p conduit-tray backend` exits 0
-4. [done] Implement `crates/conduit-tray/src/linux_ksni.rs` (`#[cfg(target_os = "linux")]`) implementing `ksni::Tray` and `KsniTrayBackend` wrapping `ksni::TrayService` / `ksni::blocking::TrayMethods` (or async handle), translating `TrayMenuModel` into `ksni::MenuItem` trees, dispatching `TrayAction`s over an `mpsc` channel, and tracking `TrayHostStatus` gracefully when D-Bus or `StatusNotifierWatcher` is absent (never panicking in headless/no-DBus environments) — done when: `cargo test -p conduit-tray` exits 0
-5. [done] Fix-up: replace the `&[s.clone()]` test argument in `crates/conduit-tray/src/model.rs` that fails `clippy::cloned_ref_to_slice_refs` — done when: the `## Verify` command exits 0
+1. [done] Add `#[serde(default)] pub agent_forward_keys: Vec<KeyId>` and `#[serde(default)] pub agent_forward_command: Option<String>` to `HopEntry` in `crates/conduit-core/src/model.rs` and add a serde backwards-compatibility unit test confirming old `HopEntry` JSON without those fields deserializes cleanly — done when: `cargo test -p conduit-core` exits 0
+2. [done] Implement `crates/conduit-ssh/src/agent_wire.rs` encoding/decoding `ssh-agent` wire messages (`REQUEST_IDENTITIES`, `SIGN_REQUEST`, `IDENTITIES_ANSWER`, `SIGN_RESPONSE`, `FAILURE`), enforcing max packet size, delegating exclusively to `ScopedAgent`, and refusing all mutating/unknown opcodes — done when: `cargo test -p conduit-ssh agent_wire` exits 0
+3. [done] Implement `AgentForwardRelay` and `agent_policy(capacity)` in `crates/conduit-ssh/src/agent_relay.rs` (wired into `lib.rs` and `SshChain::hop(index)` accessor) opening the session channel + `agent_forward_request` (+ optional `exec` remote command) on an opted-in hop and serving accepted agent channels via `agent_wire` — done when: `cargo test -p conduit-ssh agent_relay` exits 0
+4. [done] Extend `crates/conduit-ssh/tests/common/mod.rs` and add loopback integration tests in `crates/conduit-ssh/tests/loopback_agent_forward.rs` proving: (a) opted-in hop exposes ONLY its assigned key(s) (1 of 2 keys) and completes a real signature roundtrip verified against the public key, (b) mutating agent opcodes return `SSH_AGENT_FAILURE`, (c) audit callback records the signature event, and (d) non-opted-in hops reject `server_channel_open_agent_forward` — done when: `cargo test -p conduit-core -p conduit-ssh && cargo clippy --workspace --all-targets -- -D warnings` exits 0
 
 ## Verify
 ```sh
-cargo test -p conduit-tray && cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p conduit-core -p conduit-ssh && cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 ## Escalate when
-- `ksni = "0.3"` pulls GTK or C system libraries (`libappindicator`) or fails to compile on this Linux host → stop, set Status: needs-human — reason: exact `ksni` feature/dependency issue
+- `russh` 0.65.4 `Channel` lacks `agent_forward_request` or server-side `channel_open_agent_forward` cannot be triggered in the test harness → stop, set Status: needs-human — reason: exact `russh` 0.65.4 API gap
 
 ## Log
 - (append-only, one line per event)
-- sub-task 1: added crates/conduit-tray to the workspace with its manifest and ksni 0.3 on Linux
-- sub-task 2: implemented TrayAction, TrayIconState, TrayHostStatus, and TrayMenuModel::from_snapshots, including multiplexed listeners and wildcard-to-loopback URLs
-- sub-task 3: implemented TrayBackend, TrayError, and MockTrayBackend
-- sub-task 4: implemented KsniTrayBackend on a dedicated worker thread with retry, watcher tracking, and a no-D-Bus integration test
-- sub-task 5 (fix-up): first Verify failed on one clippy error in a test; replaced the clone with std::slice::from_ref
+- sub-task 1: added agent_forward_keys and agent_forward_command to HopEntry plus a serde backwards-compatibility test in crates/conduit-core/src/model.rs
+- escalated before sub-task 2: required workspace clippy cannot pass without editing src-tauri, which is Scope: Out; sub-tasks 2-4 not started
+- planner approved adding src-tauri/src/controller/test_support.rs to Scope: In (for ..Default::default() on HopEntry literal) and confirmed russh 0.65.4 uses Channel::agent_forward(want_reply) and server channel_open_agent; resumed phase-0001 from sub-task 2
+- sub-task 2: added agent_wire.rs with framing, a 256 KiB limit, read-only dispatch to ScopedAgent, and audit of unparseable sign requests
+- sub-task 3: added agent_relay.rs (AgentForwardRelay, agent_policy) and SshChain::hop(index), using russh Channel::agent_forward as approved
+- sub-task 4: extended the test harness and added 5 loopback tests; added the approved `..Default::default()` to test_support.rs; moved the dead_code allowance onto `mod common` in both conduit-ssh test binaries
 
 ## Evidence
 - (append-only: command → observed result)
-- `cargo check -p conduit-tray` → exit 0; ksni 0.3.7 resolved
-- `cargo tree -p ksni -e normal` filtered for -sys/gtk/gdk/glib/appindicator/dbus/cairo/pango → only linux-raw-sys (pure-Rust bindings), so the GTK escalation condition did not occur
-- `cargo test -p conduit-tray model` → 10 passed, 0 failed
-- `cargo test -p conduit-tray backend` → 5 passed, 0 failed
-- `cargo test -p conduit-tray` → 20 unit + 1 integration passed, 0 failed
-- first Verify → exit 101: clippy `unnecessary use of clone to create a slice from a reference` at crates/conduit-tray/src/model.rs:464
-- `cargo test -p conduit-tray && cargo clippy --workspace --all-targets -- -D warnings` → exit 0 (20 unit + 1 integration passed, clippy clean)
-- `dbus-run-session` with throwaway probe and fake StatusNotifierWatcher (not committed) → Offline, then Online when watcher appeared, full menu read via dbusmenu GetLayout including socks5h:// URL, Offline when watcher left, clean shutdown (exit 0)
-- not tested: a real desktop panel (XFCE, KDE, Waybar) rendering the icon
+- cargo test -p conduit-core → exit 0, 34 passed, 0 failed, including model::tests::hop_entry_without_agent_forward_fields_deserializes
+- cargo clippy --workspace --all-targets --keep-going -- -D warnings → exit 101, only error: E0063 missing fields agent_forward_command and agent_forward_keys at src-tauri/src/controller/test_support.rs:90:5
+- cargo test -p conduit-ssh agent_wire → exit 0, 8 passed
+- cargo test -p conduit-ssh agent_relay → exit 0, 3 passed
+- cargo test -p conduit-ssh --test loopback_agent_forward (10 repeats) → 0 failures, 5 tests each
+- cargo test -p conduit-core -p conduit-ssh && cargo clippy --workspace --all-targets -- -D warnings → exit 0; 34 core, 63 ssh unit, 5 agent loopback, 12 multihop loopback passed

@@ -18,6 +18,16 @@
   let backupError = $state<string | null>(null);
   let backupResult = $state<string | null>(null);
 
+  // Config passphrases stay in their DOM inputs and are never copied into component state.
+  let configExportPath = $state("");
+  let configImportPath = $state("");
+  let includeSecrets = $state(false);
+  let replaceExisting = $state(false);
+  let configBusy = $state(false);
+  let configError = $state<string | null>(null);
+  let configResult = $state.raw<string[]>([]);
+  let configWarning = $state<string | null>(null);
+
   const unlocked = $derived(store.vault.initialized && store.vault.unlocked);
   const vaultLabel = $derived(
     !store.vault.initialized ? "Not created" : store.vault.unlocked ? "Unlocked" : "Locked",
@@ -102,6 +112,94 @@
       return `Imported ${imported.length}, skipped ${skipped} already in the vault.`;
     });
   }
+
+  /** Reads a password input and empties it in the same step. */
+  function takeSecret(form: HTMLFormElement, name: string): string {
+    const input = form.elements.namedItem(name);
+    if (!(input instanceof HTMLInputElement)) return "";
+    const value = input.value;
+    input.value = "";
+    return value;
+  }
+
+  const plural = (count: number, noun: string) => `${count} ${noun}${count === 1 ? "" : "s"}`;
+
+  function showConfigError(message: string) {
+    configResult = [];
+    configWarning = null;
+    configError = message;
+  }
+
+  async function runConfig(action: () => Promise<void>) {
+    configBusy = true;
+    configError = null;
+    configWarning = null;
+    configResult = [];
+    try {
+      await action();
+    } catch (error) {
+      configError = errorMessage(error);
+    } finally {
+      configBusy = false;
+    }
+  }
+
+  async function submitConfigExport(event: SubmitEvent) {
+    event.preventDefault();
+    const form = event.currentTarget as HTMLFormElement;
+    const passphrase = takeSecret(form, "config-export-passphrase");
+    const repeated = takeSecret(form, "config-export-confirmation");
+    if (configBusy) return;
+    const path = configExportPath.trim();
+    const withSecrets = includeSecrets;
+    if (!isAbsolutePath(path)) return showConfigError("Enter a full file path.");
+    if (withSecrets) {
+      if (!unlocked) return showConfigError("Unlock the vault to include secrets.");
+      if (!passphrase) return showConfigError("Enter a passphrase for the encrypted backup.");
+      if (passphrase !== repeated) {
+        return showConfigError("The passphrases do not match. Enter them again.");
+      }
+    }
+    await runConfig(async () => {
+      const summary = await api.exportConfig(path, withSecrets, withSecrets ? passphrase : null);
+      configResult = [
+        withSecrets ? "Exported an encrypted full backup." : "Exported config without secrets.",
+        `${plural(summary.session_count, "session")}, ${plural(summary.host_count, "host")}, ${plural(summary.key_count, "key")}.`,
+        ...(withSecrets ? [`${plural(summary.secret_count, "secret")} encrypted.`] : []),
+      ];
+      if (summary.missing_secrets > 0) {
+        configWarning = `${plural(summary.missing_secrets, "saved secret")} could not be included because the vault no longer has them.`;
+      }
+    });
+  }
+
+  async function submitConfigImport(event: SubmitEvent) {
+    event.preventDefault();
+    const form = event.currentTarget as HTMLFormElement;
+    const passphrase = takeSecret(form, "config-import-passphrase");
+    if (configBusy) return;
+    const path = configImportPath.trim();
+    if (!isAbsolutePath(path)) return showConfigError("Enter a full file path.");
+    const replace = replaceExisting;
+    await runConfig(async () => {
+      const summary = await api.importConfig(path, passphrase || null, replace);
+      configResult = [
+        summary.encrypted ? "Imported an encrypted backup." : "Imported config.",
+        `Sessions: ${summary.sessions_added} added, ${summary.sessions_updated} updated, ${summary.sessions_skipped} skipped.`,
+        `Hosts: ${summary.hosts_added} added, ${summary.hosts_updated} updated, ${summary.hosts_skipped} skipped.`,
+        ...(summary.encrypted
+          ? [
+              `Vault: ${plural(summary.keys_added, "key")} and ${plural(summary.secrets_added, "secret")} added.`,
+              `Known hosts: ${summary.known_hosts_added} added, ${summary.known_hosts_updated} updated.`,
+            ]
+          : []),
+      ];
+      if (summary.credentials_removed > 0) {
+        configWarning = `${plural(summary.credentials_removed, "credential link")} removed because the file could not vouch for them. Add them again where needed.`;
+      }
+      await store.refresh();
+    });
+  }
 </script>
 
 <main class="content">
@@ -181,6 +279,70 @@
 
       {#if backupError}<p class="reason" role="alert">{backupError}</p>{/if}
       {#if backupResult}<p class="ok-text" role="status">{backupResult}</p>{/if}
+    </section>
+
+    <section aria-labelledby="settings-config">
+      <h2 id="settings-config">Config export and import</h2>
+
+      <form onsubmit={submitConfigExport} autocomplete="off" aria-label="Export config">
+        <label class="field">
+          Export to file (full path)
+          <input bind:value={configExportPath} spellcheck="false" />
+        </label>
+        <label class="check">
+          <input type="checkbox" bind:checked={includeSecrets} />
+          Include secrets (encrypted full backup)
+        </label>
+        {#if includeSecrets}
+          {#if !unlocked}<p class="muted">Unlock the vault to include secrets.</p>{/if}
+          <label class="field">
+            Backup passphrase
+            <input name="config-export-passphrase" type="password" disabled={!unlocked} autocomplete="new-password" />
+          </label>
+          <label class="field">
+            Confirm backup passphrase
+            <input name="config-export-confirmation" type="password" disabled={!unlocked} autocomplete="new-password" />
+          </label>
+        {:else}
+          <p class="muted">Passwords and private keys are left out.</p>
+        {/if}
+        <p class="muted">An existing file at this path is replaced.</p>
+        <div class="form-actions">
+          <button type="submit" disabled={configBusy || !configExportPath.trim() || (includeSecrets && !unlocked)}>
+            Export Config
+          </button>
+        </div>
+      </form>
+
+      <form onsubmit={submitConfigImport} autocomplete="off" aria-label="Import config">
+        <label class="field">
+          Import from file (full path)
+          <input bind:value={configImportPath} spellcheck="false" />
+        </label>
+        <label class="field">
+          Backup passphrase (encrypted backups only)
+          <input name="config-import-passphrase" type="password" autocomplete="off" />
+        </label>
+        <p class="muted">Encrypted backups need an unlocked vault.</p>
+        <label class="check">
+          <input type="checkbox" bind:checked={replaceExisting} />
+          Replace existing
+        </label>
+        <p class="muted">
+          {replaceExisting ? "Matching sessions and hosts are overwritten." : "Matching sessions and hosts are skipped."}
+        </p>
+        <div class="form-actions">
+          <button type="submit" disabled={configBusy || !configImportPath.trim()}>Import Config</button>
+        </div>
+      </form>
+
+      {#if configError}<p class="reason" role="alert">{configError}</p>{/if}
+      {#if configResult.length}
+        <div class="ok-text" role="status">
+          {#each configResult as line}<p>{line}</p>{/each}
+        </div>
+      {/if}
+      {#if configWarning}<p class="reason" role="alert">{configWarning}</p>{/if}
     </section>
   </div>
 </main>

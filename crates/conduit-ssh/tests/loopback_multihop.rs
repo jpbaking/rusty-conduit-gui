@@ -1,5 +1,7 @@
 //! End-to-end loopback tests: real `rusty_conduit_ssh` engines over in-process SSH servers.
 
+// Each test binary uses a different subset of the shared helpers.
+#[allow(dead_code)]
 mod common;
 
 use std::io;

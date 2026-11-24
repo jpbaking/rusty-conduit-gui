@@ -1,29 +1,25 @@
-# phase-0006 — src-tauri/ui Key Vault, Host-Key & Vault Unlock modals, Settings & E2E verify
+# phase-0006 — src-tauri/ui: Config Export/Import UI in Settings & full cross-stack verification
 
 - Status: done
 - Owner: executor
 - Depends on: phase-0005
-- Goal: Complete the remaining Phase 2 Manage Window views and modals (Key Vault with upload/paste/generate/copy-pubkey/delete-impact warning, Host-Key Approval modal, Vault Unlock modal, Settings view) and run full Rust + frontend verification.
-- Done when: `cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && (cd src-tauri/ui && npm run check && npm run build)` exits 0 with all Phase 2 views wired cleanly.
-- Pattern to follow: `docs/MASTER-PLAN.md` Sections 5.3, 5.4, and 8.2
+- Goal: Wire Config Export/Import (redacted JSON by default; optional passphrase-encrypted full backup) into `SettingsView.svelte` and run full cross-stack Rust + frontend + headless browser verification for Milestone 3.
+- Done when: `cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && (cd src-tauri/ui && npm run check && npm run build)` exits 0 with all Phase 3 features verified end-to-end and zero secret leaks.
+- Pattern to follow: `src-tauri/ui/src/lib/components/SettingsView.svelte`
 
 ## Context
-Every secret-ingestion surface in the UI must be strictly write-only: pasted keys, uploaded key passphrases, and master passwords are cleared from Svelte component state immediately upon submit, and the backend never returns private key material back to JS.
+Settings currently has Key-only backup export/import. Phase 3 adds full **Config Export / Import** with secrets omitted by default and an explicit opt-in passphrase-encrypted full backup (config + known hosts + vault secrets).
 Key decisions already made:
-- Key Vault view: lists saved keys with friendly name, algorithm, SHA-256 fingerprint, created date, and `"Used by N hosts/sessions"` badge; supports **Upload File**, **Paste Private Key** (with optional passphrase for encrypted keys), **Generate New Key** (`Ed25519` default / `ECDSA-P256`), **Copy Public Key**, **Rename**, and **Delete** (warns and lists affected hosts/sessions before deleting a referenced key).
-- Host-Key Approval modal: opens automatically when any session enters `AwaitingHostKey`, showing hop name, `host:port`, algorithm, and SHA-256 fingerprint, with **Trust & Pin** (`approve_host_key`) and **Reject** (`reject_host_key`).
-- Vault Unlock modal: opens on startup/tray action when vault is locked (or first-time setup to initialize vault with Master Password / OS Keyring), never offering plaintext fallback.
-- Settings view: app autostart toggle (`--tray`), vault lock/unlock controls, and encrypted backup export/import trigger.
+- Default export mode is **Config only (secrets omitted)**; enabling **Include secrets (encrypted full backup)** reveals a required write-only passphrase input + confirmation (cleared immediately on submit, never stored in component state).
+- Import UI auto-detects or allows optional passphrase for encrypted bundles, with a **Replace existing** checkbox (default false = merge/skip duplicates), and refreshes `store` on success.
 
 ## Scope
-- In: `src-tauri/ui/src/**`, `src-tauri/ui/dist/**`, plus small bug fixes in `src-tauri/src/**` only if full integration verification uncovers a mismatch
+- In: `src-tauri/ui/src/**`, `src-tauri/ui/dist/**`, plus small bug fixes in `src-tauri/src/**` only if cross-stack verification uncovers a mismatch
 - Out: `crates/conduit-core/**`, `crates/conduit-vault/**`, `crates/conduit-ssh/**`, `crates/conduit-runtime/**`, `docs/MASTER-PLAN.md`
 
 ## Sub-tasks
-1. [done] Implement `src-tauri/ui/src/lib/components/KeyVaultView.svelte` with key table (name, algorithm, SHA-256 fingerprint, created date, `Used by N hosts/sessions`), Copy Public Key, Rename, Delete confirmation listing affected hosts/sessions, and write-only modals for Upload File, Paste Private Key (with optional passphrase), and Generate New Key (`Ed25519`/`ECDSA-P256`) — done when: `cd src-tauri/ui && npm run check` exits 0
-2. [done] Implement `src-tauri/ui/src/lib/components/HostKeyModal.svelte` and `VaultUnlockModal.svelte` (covering first-time vault creation, Master Password unlock, OS keyring unlock, and strict TOFU fingerprint approval/rejection) — done when: `cd src-tauri/ui && npm run check` exits 0
-3. [done] Implement `src-tauri/ui/src/lib/components/SettingsView.svelte` (OS login autostart toggle, vault status/lock button, encrypted backup export/import) and wire `KeyVaultView`, `HostKeyModal`, `VaultUnlockModal`, and `SettingsView` into `App.svelte` — done when: `cd src-tauri/ui && npm run check && npm run build` exits 0
-4. [done] Run full cross-stack verification (`cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && (cd src-tauri/ui && npm run check && npm run build)`) and verify zero raw secret fields exist in frontend TypeScript types or IPC responses — done when: full verification command exits 0
+1. [done] Update `src-tauri/ui/src/lib/components/SettingsView.svelte` with Config Export (redacted JSON default vs. passphrase-encrypted full backup with write-only passphrase + confirm) and Config Import (path, optional write-only passphrase, replace-existing toggle, result summary) wired to `api.exportConfig` and `api.importConfig` — done when: `cd src-tauri/ui && npm run check && npm run build` exits 0
+2. [done] Run full cross-stack verification (`cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && (cd src-tauri/ui && npm run check && npm run build)`), verify zero raw secret fields in frontend types/bundle, and run a headless Chromium smoke check of the 7-tab editor + Settings config export/import against a stubbed IPC — done when: full verification command exits 0
 
 ## Verify
 ```sh
@@ -31,21 +27,17 @@ cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings 
 ```
 
 ## Escalate when
-- A Rust/TypeScript IPC contract mismatch requires changing `crates/conduit-core` or `crates/conduit-runtime` → stop, set Status: needs-human — reason: exact contract mismatch
+- Full verification uncovers a regression in `crates/**` outside this phase's scope → stop, set Status: needs-human — reason: exact failing test and crate
 
 ## Log
 - (append-only, one line per event)
-- sub-task 1: added KeyVaultView, write-only AddKeyModal, store key-delete and vault helpers, unique modal title ids, and preview mock commands
-- sub-task 2: added HostKeyModal (explicit Trust & Pin or Reject) and VaultUnlockModal (create, password, OS keyring)
-- sub-task 3: added SettingsView and wired Key Vault, Settings, host-key and unlock modals into App
-- sub-task 4: full verification passed on rerun; first run hit a port-collision flake in conduit-runtime concurrent_sessions_stay_isolated (out of scope, not changed); secret audit and browser run with a fake backend passed
+- sub-task 1: added Config export and import section to SettingsView.svelte; passphrases stay in DOM inputs, are emptied on submit, and never enter component state; rebuilt dist
+- sub-task 2: ran full verification, secret scan, and headless smoke journey; no regressions and no src-tauri/src or crates changes needed
 
 ## Evidence
 - (append-only: command → observed result)
-- cd src-tauri/ui && npm run check → 146 files, 0 errors, 0 warnings
-- cd src-tauri/ui && npm run check → 148 files, 0 errors, 0 warnings
-- cd src-tauri/ui && npm run check && npm run build → 149 files, 0 errors, 0 warnings; bundle 136.69 kB JS + 10.38 kB CSS
-- full Verify command → exit 0; 17 test suites, 286 passed, 0 failed; clippy clean; svelte-check 149 files 0 errors 0 warnings; bundle 136.69 kB JS + 10.38 kB CSS
-- first full Verify run → exit 101: concurrent_sessions_stay_isolated failed at crates/conduit-runtime/tests/e2e_runtime.rs:212 with "failed to bind HTTP/HTTPS listener on 127.0.0.1:45015: Address already in use"; test alone 5/5 passed, full rerun passed
-- grep of src-tauri/ui/src/lib/types.ts → secret-named fields are only SecretRef ids, has_secret, and a passphrase file path; grep of UI source → no web storage or console logging; production bundle → no mock data
-- headless Chromium on production bundle with fake IPC → 29/29 checks passed, 0 page exceptions (vault create/unlock/lock, key import/delete reconfirm, host-key approve, autostart, backup, secrets cleared)
+- `cd src-tauri/ui && npm run check && npm run build` → exit 0; svelte-check 158 files, 0 errors, 0 warnings; vite built 154 modules (index-D2N8AH_b.js)
+- `cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && (cd src-tauri/ui && npm run check && npm run build)` → exit 0; 18 test suites, 333 passed, 0 failed, 0 ignored; clippy clean; svelte-check 0 errors, 0 warnings; vite build clean
+- secret scan of src/lib/types.ts for private_key, privateKey, secret_value, password_value, plaintext, key_material, pem fields → 0 hits; same scan of dist JS → 1 hit, the AddKeyModal textarea placeholder "-----BEGIN OPENSSH PRIVATE KEY-----" (not data); mock data not in production bundle
+- headless Chromium flow.mjs against Vite dev server with mock IPC (7 editor tabs; Settings config export/import, passphrase mismatch, inputs emptied on submit, replace toggle, locked vault) → 69/69 steps passed
+- inspect.mjs on initial load → 0 JS errors, 0 failed requests; console was not monitored during the 69-step journey; real Tauri backend not exercised through the UI (covered by cargo IPC tests)

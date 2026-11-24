@@ -2,7 +2,7 @@
   import { api, errorMessage } from "../api";
   import { moved } from "../chain";
   import { store } from "../stores.svelte";
-  import type { AuthMethod, HopEntry, HostProfile, SecretRef } from "../types";
+  import type { AuthMethod, HopEntry, HostProfile, KeyId, SecretRef } from "../types";
   import type { FieldErrors } from "../validate";
 
   interface Props {
@@ -45,6 +45,16 @@
   const availableKeys = $derived(store.keys.filter((key) => !usedKeys.has(key.id)));
   const vaultReady = $derived(store.vault.initialized && store.vault.unlocked);
   const err = (field: string) => errors[`${errorPrefix}${field}`];
+  const missingForwardKeys = $derived(
+    (hop?.agent_forward_keys ?? []).filter((id) => !store.keys.some((key) => key.id === id)),
+  );
+
+  function setForwardKey(id: KeyId, forwarded: boolean) {
+    onHopChange?.((current) => {
+      const others = current.agent_forward_keys.filter((key) => key !== id);
+      return { ...current, agent_forward_keys: forwarded ? [...others, id] : others };
+    });
+  }
 
   function setAuth(edit: (auth: AuthMethod[]) => AuthMethod[]) {
     onHostChange((current) => ({ ...current, auth: edit(current.auth) }));
@@ -269,8 +279,46 @@
     {#if hop.agent_forward}
       <p class="warning" role="alert">
         <strong>Security warning:</strong> root on this remote host can use your forwarded keys while
-        connected. This choice is saved, but this version does not forward the agent yet.
+        connected. Only the keys checked below are forwarded.
       </p>
+      <fieldset class="key-picker">
+        <legend>Forwarded Keys</legend>
+        {#if store.keys.length === 0 && missingForwardKeys.length === 0}
+          <p class="muted">No keys in the vault. Add one in Key Vault to forward it.</p>
+        {/if}
+        {#each store.keys as key (key.id)}
+          <label class="check">
+            <input
+              type="checkbox"
+              checked={hop.agent_forward_keys.includes(key.id)}
+              onchange={(e) => setForwardKey(key.id, e.currentTarget.checked)}
+            />
+            {key.name} <small class="muted">{key.algorithm}</small>
+          </label>
+        {/each}
+        {#each missingForwardKeys as id (id)}
+          <label class="check">
+            <input type="checkbox" checked onchange={(e) => setForwardKey(id, e.currentTarget.checked)} />
+            Missing key <small class="muted">uncheck to remove</small>
+          </label>
+        {/each}
+      </fieldset>
+      {#if hop.agent_forward_keys.length === 0}
+        <p class="muted">No keys are checked, so no agent is forwarded to this hop.</p>
+      {/if}
+      <label class="field">
+        Remote Command <small class="muted">optional, runs on this hop while forwarding</small>
+        <input
+          value={hop.agent_forward_command ?? ""}
+          spellcheck="false"
+          autocomplete="off"
+          oninput={(e) => {
+            const text = e.currentTarget.value;
+            const agent_forward_command = text.trim() === "" ? null : text;
+            onHopChange?.((current) => ({ ...current, agent_forward_command }));
+          }}
+        />
+      </label>
     {/if}
 
     <h3>Host key</h3>

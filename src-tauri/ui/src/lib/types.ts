@@ -138,6 +138,10 @@ export interface HopEntry {
   name: string;
   host: HostProfile;
   agent_forward: boolean;
+  /** Vault keys exposed to this hop while `agent_forward` is on. Nothing else is exposed. */
+  agent_forward_keys: KeyId[];
+  /** Optional command run on this hop's agent-forwarding session channel. */
+  agent_forward_command: string | null;
 }
 
 export interface ForwardConfig {
@@ -290,6 +294,84 @@ export interface ChainTestResult {
   session_id: Uuid;
   all_connected: boolean;
   hops: HopTestResult[];
+}
+
+// Session-editor helpers.
+
+export type PortConflictKind = "session" | "os_socket";
+
+export interface PortConflict {
+  port: number;
+  kind: PortConflictKind;
+  detail: string;
+}
+
+export interface PortConflictReport {
+  conflicts: PortConflict[];
+}
+
+export type FilterMode = "allow" | "block";
+
+export interface RuleError {
+  index: number;
+  rule: string;
+  message: string;
+}
+
+export interface FilterTestResult {
+  /** Every rule parsed and the target is non-empty. */
+  valid: boolean;
+  /** `null` when the input is not valid. */
+  allowed: boolean | null;
+  reason: string;
+  rule_errors: RuleError[];
+}
+
+/** Public facts about a MITM CA. Never carries key material or a passphrase. */
+export interface MitmCaInfo {
+  subject: string;
+  /** RFC 3339. */
+  not_after: string;
+  expired: boolean;
+  /** Whole days until expiry. Negative once expired. */
+  days_remaining: number;
+}
+
+/** At most one source may be set. */
+export interface MitmPassphraseSource {
+  passphrase?: string | null;
+  passphraseRef?: SecretRef | null;
+  passphraseFile?: string | null;
+}
+
+// Config export and import. Summaries hold counts only.
+
+export interface ExportSummary {
+  path: string;
+  encrypted: boolean;
+  session_count: number;
+  host_count: number;
+  key_count: number;
+  /** Vault records sealed into the bundle. Always 0 for a plain export. */
+  secret_count: number;
+  /** References whose vault record no longer exists. */
+  missing_secrets: number;
+}
+
+export interface ImportSummary {
+  encrypted: boolean;
+  sessions_added: number;
+  sessions_updated: number;
+  sessions_skipped: number;
+  hosts_added: number;
+  hosts_updated: number;
+  hosts_skipped: number;
+  keys_added: number;
+  secrets_added: number;
+  known_hosts_added: number;
+  known_hosts_updated: number;
+  /** Credential references dropped because they could not be trusted or resolved. */
+  credentials_removed: number;
 }
 
 // Desktop shell.

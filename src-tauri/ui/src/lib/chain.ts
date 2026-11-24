@@ -10,7 +10,14 @@ export function blankHost(): HostProfile {
 
 /** `hop_id` keys the host-key pin, so each hop gets its own and keeps it when moved. */
 export function newHop(): HopEntry {
-  return { hop_id: crypto.randomUUID(), name: "", host: blankHost(), agent_forward: false };
+  return {
+    hop_id: crypto.randomUUID(),
+    name: "",
+    host: blankHost(),
+    agent_forward: false,
+    agent_forward_keys: [],
+    agent_forward_command: null,
+  };
 }
 
 export function moved<T>(items: readonly T[], from: number, to: number): T[] {
@@ -50,5 +57,7 @@ export function authRefs(auth: readonly AuthMethod[]): string[] {
   );
 }
 
-export const profileRefs = (profile: SessionProfile): string[] =>
-  profile.hops.flatMap((hop) => authRefs(hop.host.auth));
+export const profileRefs = (profile: SessionProfile): string[] => [
+  ...profile.hops.flatMap((hop) => authRefs(hop.host.auth)),
+  ...(profile.mitm?.passphrase ? [profile.mitm.passphrase] : []),
+];

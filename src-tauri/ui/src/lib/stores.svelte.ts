@@ -87,6 +87,9 @@ const usesKey = (auth: AuthMethod[], id: KeyId) =>
 const withoutKey = (auth: AuthMethod[], id: KeyId) =>
   auth.filter((method) => !(typeof method === "object" && "Key" in method && method.Key.key === id));
 
+const hopUsesKey = (hop: HopEntry, id: KeyId) =>
+  usesKey(hop.host.auth, id) || hop.agent_forward_keys.includes(id);
+
 class AppStore {
   // Backend data. Replaced whole, so `$state.raw` avoids deep proxies and IPC clone problems.
   sessions = $state.raw<SessionView[]>([]);
@@ -270,7 +273,7 @@ class AppStore {
   /** Names of unsaved edits that would lose this key if it is deleted. */
   draftsUsingKey(id: KeyId): string[] {
     const names = Object.values(this.drafts)
-      .filter((profile) => profile.hops.some((hop) => usesKey(hop.host.auth, id)))
+      .filter((profile) => profile.hops.some((hop) => hopUsesKey(hop, id)))
       .map((profile) => profile.name);
     if (this.hostDraft && usesKey(this.hostDraft.auth, id)) names.push(this.hostDraft.name);
     return names;
@@ -290,8 +293,12 @@ class AppStore {
       if (!forced.deleted) return forced.usage;
     }
     this.#mapDraftHops((hop) =>
-      usesKey(hop.host.auth, id)
-        ? { ...hop, host: { ...hop.host, auth: withoutKey(hop.host.auth, id) } }
+      hopUsesKey(hop, id)
+        ? {
+            ...hop,
+            agent_forward_keys: hop.agent_forward_keys.filter((key) => key !== id),
+            host: { ...hop.host, auth: withoutKey(hop.host.auth, id) },
+          }
         : hop,
     );
     if (this.hostDraft && usesKey(this.hostDraft.auth, id)) {
@@ -419,6 +426,26 @@ class AppStore {
     } finally {
       this.saving = false;
     }
+  }
+
+  /**
+   * Stores a CA passphrase on the saved session. The backend replaces and deletes the previous
+   * record, so a draft edited during the call must move to the new reference. Throws on failure.
+   */
+  async setMitmPassphrase(id: Uuid, passphrase: string): Promise<void> {
+    const { secret_ref } = await api.setMitmPassphrase(id, passphrase);
+    const draft = this.drafts[id];
+    if (draft?.mitm) {
+      const mitm = { ...draft.mitm, passphrase: secret_ref, ca_passphrase_file: null };
+      this.drafts = { ...this.drafts, [id]: { ...draft, mitm } };
+    } else if (draft) {
+      // MITM was turned off meanwhile. Saving that draft leaves this record unused.
+      this.#orphanedSecrets.add(secret_ref);
+    }
+    await this.refresh();
+    const latest = this.drafts[id];
+    const saved = this.sessions.find((s) => s.profile.id === id)?.profile;
+    if (latest && saved && sameProfile(saved, latest)) this.#dropDraft(id);
   }
 
   pinFor(hop: HopEntry): HostKeyEntry | null {

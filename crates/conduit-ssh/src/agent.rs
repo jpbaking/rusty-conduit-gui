@@ -59,6 +59,8 @@ pub enum AgentError {
 pub struct SignAudit {
     pub hop_id: String,
     pub key_sha256: String,
+    /// The requested key's algorithm, or `unparseable` if the key could not be read.
+    pub algorithm: String,
     pub data_len: usize,
     pub allowed: bool,
 }
@@ -134,6 +136,7 @@ impl ScopedAgent {
             audit(&SignAudit {
                 hop_id: self.hop_id.to_string(),
                 key_sha256: key_sha256.clone(),
+                algorithm: key.algorithm().as_str().to_string(),
                 data_len: data.len(),
                 allowed: assigned.is_some(),
             });
@@ -145,6 +148,19 @@ impl ScopedAgent {
             .as_ref()
             .try_sign(data)
             .map_err(|_| AgentError::SignFailed)
+    }
+
+    /// Audits a sign request refused because its key or framing could not be parsed.
+    pub fn audit_unparseable_sign(&self, data_len: usize) {
+        if let Some(audit) = &self.audit {
+            audit(&SignAudit {
+                hop_id: self.hop_id.to_string(),
+                key_sha256: "unparseable".to_string(),
+                algorithm: "unparseable".to_string(),
+                data_len,
+                allowed: false,
+            });
+        }
     }
 
     /// Handles one request. Every mutation is refused.
@@ -250,6 +266,7 @@ mod tests {
     fn audit_records_allowed_and_refused_signatures_without_data() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&events);
+        let sink_view = Arc::clone(&events);
         let audit: SignAuditFn = Arc::new(move |e: &SignAudit| sink.lock().unwrap().push(e.clone()));
         let k = key(KeyGenAlgorithm::Ed25519);
         let other = key(KeyGenAlgorithm::Ed25519);
@@ -266,8 +283,15 @@ mod tests {
             events[0].key_sha256,
             k.public_key().fingerprint(HashAlg::Sha256).to_string()
         );
+        assert_eq!(events[0].algorithm, "ssh-ed25519");
         assert!(!events[1].allowed);
         assert_eq!(events[1].hop_id, "hop");
+        assert_eq!(events[1].algorithm, "ssh-ed25519");
+
+        drop(events);
+        agent.audit_unparseable_sign(7);
+        let events = sink_view.lock().unwrap();
+        assert_eq!(events[2].algorithm, "unparseable");
     }
 
     #[test]

@@ -4,7 +4,9 @@
 //! [`SessionManager`]. Secrets only ever flow inward: methods accept [`SecretInput`], which
 //! cannot be serialized, and return opaque metadata.
 
+pub mod export;
 pub mod keys;
+pub mod parity;
 pub mod sessions;
 #[cfg(test)]
 pub(crate) mod test_support;

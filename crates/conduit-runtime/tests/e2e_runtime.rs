@@ -11,25 +11,30 @@ mod common;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use common::{
-    echo_roundtrip, free_port, http_get, new_user_key, payload, socks5h_connect, spawn_echo,
-    spawn_node, spawn_origin, Node, PASSWORD, REMOTE_ONLY_HOST,
+    echo_roundtrip, http_get, new_user_key, payload, socks5h_connect, spawn_echo, spawn_node,
+    spawn_origin, Node, PASSWORD, REMOTE_ONLY_HOST,
 };
 use conduit_core::{
     AuthMethod, ForwardConfig, HopEntry, HostKeyLookup, HostKeyRecord, HostProfile, KeyId,
     KnownHostsStore, LoggingConfig, MitmCaMode, MitmConfig, SecretRef, SessionProfile, Timestamp, TunnelConfig,
 };
 use conduit_runtime::{ManagerConfig, RuntimeError, RuntimeEvent, SessionManager, SessionState};
+use conduit_ssh::agent_wire::{
+    SSH_AGENTC_REQUEST_IDENTITIES, SSH_AGENTC_SIGN_REQUEST, SSH_AGENT_FAILURE,
+    SSH_AGENT_IDENTITIES_ANSWER, SSH_AGENT_SIGN_RESPONSE,
+};
 use conduit_vault::{Argon2Params, Vault};
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose};
-use russh::keys::ssh_key::LineEnding;
+use russh::keys::signature::Verifier;
+use russh::keys::ssh_key::{LineEnding, Signature};
 use russh::keys::{HashAlg, PrivateKey, PublicKey};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use uuid::Uuid;
@@ -284,6 +289,28 @@ fn profile(name: &str, hops: Vec<HopEntry>) -> SessionProfile {
 
 fn loopback(port: u16) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+}
+
+/// Below the OS ephemeral ranges (Linux 32768+, macOS and Windows 49152+), so a `:0` bind by a
+/// parallel test can never be handed a port reserved here.
+const TEST_PORT_BASE: u32 = 20_000;
+const TEST_PORT_SPAN: u32 = 10_000;
+
+/// Picks a loopback port for a listener the session binds later.
+///
+/// The counter keeps ports unique within this process, its per-process start separates
+/// concurrent test binaries, and the bind probe skips ports another program already holds.
+async fn free_port() -> u16 {
+    static NEXT: OnceLock<AtomicU32> = OnceLock::new();
+    let next = NEXT.get_or_init(|| AtomicU32::new(std::process::id() % TEST_PORT_SPAN));
+    for _ in 0..TEST_PORT_SPAN {
+        let offset = next.fetch_add(1, Ordering::Relaxed) % TEST_PORT_SPAN;
+        let port = (TEST_PORT_BASE + offset) as u16;
+        if TcpListener::bind(loopback(port)).await.is_ok() {
+            return port;
+        }
+    }
+    panic!("no free loopback port in the test range");
 }
 
 /// Three pinned servers authenticated as `key → password → key`, with secrets in the vault.
@@ -625,6 +652,166 @@ fn security_gates_locked_vault_holds_until_unlocked() {
         f.until_connected(id).await;
         assert_eq!(password_attempts(&node), 1);
         assert_tunnel_works(socks_port).await;
+        f.finish().await;
+    });
+}
+
+/// Sends one framed agent request and returns the unframed reply.
+async fn agent_ask<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S, message: &[u8]) -> Vec<u8> {
+    stream
+        .write_all(&(message.len() as u32).to_be_bytes())
+        .await
+        .unwrap();
+    stream.write_all(message).await.unwrap();
+    stream.flush().await.unwrap();
+    let mut header = [0u8; 4];
+    stream.read_exact(&mut header).await.unwrap();
+    let mut reply = vec![0u8; u32::from_be_bytes(header) as usize];
+    stream.read_exact(&mut reply).await.unwrap();
+    reply
+}
+
+fn put_wire_string(out: &mut Vec<u8>, value: &[u8]) {
+    out.extend_from_slice(&(value.len() as u32).to_be_bytes());
+    out.extend_from_slice(value);
+}
+
+fn take_wire_string<'a>(input: &mut &'a [u8]) -> &'a [u8] {
+    let (len, rest) = input.split_first_chunk::<4>().unwrap();
+    let (value, rest) = rest.split_at(u32::from_be_bytes(*len) as usize);
+    *input = rest;
+    value
+}
+
+fn agent_sign_request(key: &PublicKey, data: &[u8]) -> Vec<u8> {
+    let mut message = vec![SSH_AGENTC_SIGN_REQUEST];
+    put_wire_string(&mut message, &key.to_bytes().unwrap());
+    put_wire_string(&mut message, data);
+    message.extend_from_slice(&0u32.to_be_bytes());
+    message
+}
+
+fn agent_identity_blobs(reply: &[u8]) -> Vec<Vec<u8>> {
+    assert_eq!(reply[0], SSH_AGENT_IDENTITIES_ANSWER);
+    let count = u32::from_be_bytes(reply[1..5].try_into().unwrap());
+    let mut rest = &reply[5..];
+    (0..count)
+        .map(|_| {
+            let blob = take_wire_string(&mut rest).to_vec();
+            take_wire_string(&mut rest);
+            blob
+        })
+        .collect()
+}
+
+/// Lists identities and signs through a new agent channel, checking the signature.
+async fn assert_agent_signs(node: &Node, assigned: &PrivateKey, challenge: &[u8]) {
+    let mut stream = node.open_agent_channel().await.unwrap().into_stream();
+    let listed = agent_ask(&mut stream, &[SSH_AGENTC_REQUEST_IDENTITIES]).await;
+    assert_eq!(
+        agent_identity_blobs(&listed),
+        vec![assigned.public_key().to_bytes().unwrap()],
+        "the hop must see only its assigned key"
+    );
+    let reply = agent_ask(&mut stream, &agent_sign_request(assigned.public_key(), challenge)).await;
+    assert_eq!(reply[0], SSH_AGENT_SIGN_RESPONSE);
+    let mut rest = &reply[1..];
+    let signature = Signature::try_from(take_wire_string(&mut rest)).unwrap();
+    let verifying = assigned.public_key().key_data();
+    verifying.verify(challenge, &signature).unwrap();
+    assert!(verifying.verify(b"tampered", &signature).is_err());
+}
+
+#[test]
+fn scoped_agent_forwarding_exposes_only_assigned_keys_and_audits_logs() {
+    e2e(async {
+        let f = Fixture::new();
+        let login = new_user_key();
+        let assigned = new_user_key();
+        let unassigned = new_user_key();
+        let node = spawn_node(Some(login.public_key().clone())).await;
+        f.pin(0, &node, &node.host_key);
+
+        // The vault also holds a key this hop was not given.
+        let _ = f.key(&unassigned);
+        let AuthMethod::Key { key: assigned_id } = f.key(&assigned) else {
+            unreachable!("Fixture::key returns a key method");
+        };
+        let mut entry = hop(0, &node, vec![f.key(&login)]);
+        entry.agent_forward = true;
+        entry.agent_forward_keys = vec![assigned_id];
+        let mut session = profile("agent", vec![entry]);
+        session.forward.socks_port = free_port().await;
+        let id = f.add(session);
+
+        // A locked vault parks the session before anything reaches the server.
+        f.vault.write().unwrap().lock();
+        f.manager.start(id).await.unwrap();
+        f.until(id, "Locked", |s| *s == SessionState::Locked).await;
+        assert_eq!(node.state.key_attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(node.state.agent_requests.load(Ordering::SeqCst), 0);
+
+        f.vault
+            .write()
+            .unwrap()
+            .unlock_with_password(VAULT_PASSWORD)
+            .unwrap();
+        f.manager.on_vault_unlocked().await;
+        f.until_connected(id).await;
+        assert_eq!(node.state.agent_requests.load(Ordering::SeqCst), 1);
+
+        assert_agent_signs(&node, &assigned, b"first challenge").await;
+        let mut stream = node.open_agent_channel().await.unwrap().into_stream();
+        for key in [unassigned.public_key(), login.public_key()] {
+            let reply = agent_ask(&mut stream, &agent_sign_request(key, b"refused")).await;
+            assert_eq!(reply, [SSH_AGENT_FAILURE]);
+        }
+        drop(stream);
+
+        // A reconnect builds a fresh relay that still serves only the assigned key.
+        node.drop_session().await;
+        let deadline = tokio::time::Instant::now() + STATE_TIMEOUT;
+        while node.state.agent_requests.load(Ordering::SeqCst) < 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no agent request after reconnect:\n{}",
+                f.log_text(id)
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        f.until_connected(id).await;
+        assert_agent_signs(&node, &assigned, b"after reconnect").await;
+
+        f.manager.stop(id).await.unwrap();
+        let log = f.log_text(id);
+        let audit: Vec<&str> = log.lines().filter(|l| l.contains("[agent-audit]")).collect();
+        assert_eq!(audit.len(), 4, "{log}");
+        let fingerprint = |key: &PrivateKey| key.public_key().fingerprint(HashAlg::Sha256).to_string();
+        for (index, (key, result)) in [
+            (&assigned, "result=allowed"),
+            (&unassigned, "result=refused"),
+            (&login, "result=refused"),
+            (&assigned, "result=allowed"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let line = audit[index];
+            assert!(line.contains("hop=hop-0"), "{line}");
+            assert!(line.contains(&fingerprint(key)), "{line}");
+            assert!(line.contains("algorithm=ssh-ed25519"), "{line}");
+            assert!(line.contains(result), "{line}");
+        }
+
+        // No line of any private key, and no signed data, reaches the log.
+        assert!(!log.contains("PRIVATE KEY"), "{log}");
+        for key in [&assigned, &unassigned, &login] {
+            let text = key.to_openssh(LineEnding::LF).unwrap();
+            for line in text.lines().filter(|l| !l.starts_with("-----")) {
+                assert!(!log.contains(line), "private key material leaked to logs");
+            }
+        }
+        assert!(!log.contains("first challenge"), "{log}");
         f.finish().await;
     });
 }

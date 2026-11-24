@@ -11,14 +11,22 @@ import type {
   ClipboardFallbackPayload,
   CloseChoice,
   DeleteResult,
+  ExportSummary,
+  FilterMode,
+  FilterTestResult,
   GenerateAlgorithm,
   HostKeyEntry,
   HostProfile,
   ImportBackupResult,
+  ImportSummary,
   KeyId,
   KeySource,
   KeyView,
   LogLine,
+  MitmCaInfo,
+  MitmCaMode,
+  MitmPassphraseSource,
+  PortConflictReport,
   RuntimeEvent,
   SecretMeta,
   SecretRef,
@@ -134,6 +142,25 @@ export const api = {
   resetHostKey: (hopId: string, host: string, port: number) =>
     call<boolean>("reset_host_key", { hopId, host, port }),
   testChain: (id: Uuid) => call<ChainTestResult>("test_chain", { id }),
+
+  // Session-editor helpers.
+  checkPortConflicts: (sessionId: Uuid | null, bind: string, httpPort: number, socksPort: number) =>
+    call<PortConflictReport>("check_port_conflicts", { sessionId, bind, httpPort, socksPort }),
+  testFilterRules: (mode: FilterMode, rules: string[], target: string) =>
+    call<FilterTestResult>("test_filter_rules", { mode, rules, target }),
+  inspectMitmCa: (caMode: MitmCaMode, source: MitmPassphraseSource = {}) =>
+    call<MitmCaInfo>("inspect_mitm_ca", {
+      caMode,
+      passphrase: source.passphrase ?? null,
+      passphraseRef: source.passphraseRef ?? null,
+      passphraseFile: source.passphraseFile ?? null,
+    }),
+
+  // Config export and import.
+  exportConfig: (path: string, includeSecrets = false, passphrase: string | null = null) =>
+    call<ExportSummary>("export_config", { path, includeSecrets, passphrase }),
+  importConfig: (path: string, passphrase: string | null = null, replaceExisting = false) =>
+    call<ImportSummary>("import_config", { path, passphrase, replaceExisting }),
 
   // Desktop shell.
   getAutostart: () => call<AutostartStatus>("get_autostart"),

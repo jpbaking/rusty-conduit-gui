@@ -3,18 +3,23 @@
 //! Secrets arrive as [`SecretInput`] and are never returned. Every command is `async` so disk,
 //! key-derivation, and network work stays off the UI thread.
 
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use conduit_core::{HostProfile, KeyId, KeySource, SecretRef, SessionProfile, VaultKeyMeta};
+use conduit_core::{
+    HostProfile, KeyId, KeySource, MitmCaMode, SecretRef, SessionProfile, VaultKeyMeta,
+};
 use conduit_runtime::LogLine;
 use serde::Serialize;
 use tauri::{AppHandle, Manager, Runtime, State};
 use uuid::Uuid;
 
+use crate::controller::export::{ExportSummary, ImportSummary};
 use crate::controller::keys::{
     BackupSummary, DeleteResult, GenerateAlgorithm, ImportBackupResult, KeyView,
 };
+use crate::controller::parity::{self, FilterMode, FilterTestResult, MitmCaInfo, PortConflictReport};
 use crate::controller::sessions::{ChainTestResult, SessionView, StateSummary};
 use crate::controller::{run_blocking, AppController, AppError, SecretInput, SecretMeta, VaultStatus};
 use crate::platform;
@@ -247,6 +252,64 @@ pub async fn test_chain(c: Ctl<'_>, id: Uuid) -> CmdResult<ChainTestResult> {
     c.test_session_chain(id).await
 }
 
+// Session-editor helpers.
+
+#[tauri::command]
+pub async fn check_port_conflicts(
+    c: Ctl<'_>,
+    session_id: Option<Uuid>,
+    bind: IpAddr,
+    http_port: u16,
+    socks_port: u16,
+) -> CmdResult<PortConflictReport> {
+    blocking(&c, move |c| Ok(c.check_port_conflicts(session_id, bind, http_port, socks_port))).await
+}
+
+#[tauri::command]
+pub async fn test_filter_rules(
+    mode: FilterMode,
+    rules: Vec<String>,
+    target: String,
+) -> CmdResult<FilterTestResult> {
+    Ok(parity::test_filter_rules(mode, &rules, &target))
+}
+
+#[tauri::command]
+pub async fn inspect_mitm_ca(
+    c: Ctl<'_>,
+    ca_mode: MitmCaMode,
+    passphrase: Option<SecretInput>,
+    passphrase_ref: Option<SecretRef>,
+    passphrase_file: Option<PathBuf>,
+) -> CmdResult<MitmCaInfo> {
+    blocking(&c, move |c| {
+        c.inspect_mitm_ca(&ca_mode, passphrase, passphrase_ref, passphrase_file)
+    })
+    .await
+}
+
+// Config export and import.
+
+#[tauri::command]
+pub async fn export_config(
+    c: Ctl<'_>,
+    path: PathBuf,
+    include_secrets: Option<bool>,
+    passphrase: Option<SecretInput>,
+) -> CmdResult<ExportSummary> {
+    blocking(&c, move |c| c.export_config(&path, include_secrets.unwrap_or(false), passphrase)).await
+}
+
+#[tauri::command]
+pub async fn import_config(
+    c: Ctl<'_>,
+    path: PathBuf,
+    passphrase: Option<SecretInput>,
+    replace_existing: Option<bool>,
+) -> CmdResult<ImportSummary> {
+    blocking(&c, move |c| c.import_config(&path, passphrase, replace_existing.unwrap_or(false))).await
+}
+
 // Desktop shell.
 
 /// Login autostart, behind a trait so tests never write a real autostart entry.
@@ -370,6 +433,11 @@ macro_rules! ipc_handler {
             $crate::commands::list_host_key_pins,
             $crate::commands::reset_host_key,
             $crate::commands::test_chain,
+            $crate::commands::check_port_conflicts,
+            $crate::commands::test_filter_rules,
+            $crate::commands::inspect_mitm_ca,
+            $crate::commands::export_config,
+            $crate::commands::import_config,
             $crate::commands::get_autostart,
             $crate::commands::set_autostart,
             $crate::commands::shell_ready,
@@ -410,7 +478,8 @@ mod tests {
         "list_hosts", "upsert_host", "delete_host", "promote_hop_to_host", "start_session",
         "stop_session", "restart_session", "start_all", "stop_all", "get_session_logs",
         "clear_session_logs", "approve_host_key", "reject_host_key", "list_host_key_pins",
-        "reset_host_key", "test_chain",
+        "reset_host_key", "test_chain", "check_port_conflicts", "test_filter_rules",
+        "inspect_mitm_ca", "export_config", "import_config",
         "get_autostart", "set_autostart", "shell_ready", "resolve_close",
     ];
 
@@ -500,6 +569,33 @@ mod tests {
             );
         }
         all
+    }
+
+    /// A PKCS#12 CA protected by the [`MITM`] canary, written to `path`.
+    fn write_mitm_ca(path: &std::path::Path) {
+        use p12_keystore::{Certificate, EncryptionAlgorithm, KeyStore, KeyStoreEntry, PrivateKey, PrivateKeyChain};
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::default();
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params.distinguished_name.push(rcgen::DnType::CommonName, "IPC Test CA");
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let now = time::OffsetDateTime::now_utc();
+        params.not_before = now - time::Duration::days(1);
+        params.not_after = now + time::Duration::days(30);
+        let cert = params.self_signed(&key).unwrap();
+        let chain = PrivateKeyChain::new(
+            b"key-id".to_vec(),
+            PrivateKey::from_der(&key.serialize_der()).unwrap(),
+            [Certificate::from_der(cert.der()).unwrap()],
+        );
+        let mut store = KeyStore::new();
+        store.add_entry("ca", KeyStoreEntry::PrivateKeyChain(chain));
+        let bytes = store
+            .writer(MITM)
+            .encryption_algorithm(EncryptionAlgorithm::PbeWithHmacSha256AndAes256)
+            .write()
+            .unwrap();
+        std::fs::write(path, bytes).unwrap();
     }
 
     fn assert_clean(label: &str, text: &str, forbidden: &[String]) {
@@ -637,6 +733,67 @@ mod tests {
         ipc.err("import_backup", json!({ "path": path, "passphrase": PASSWORD }));
         assert_eq!(ipc.ok("import_backup", json!({ "path": path, "passphrase": BACKUP_PASS }))["skipped"], 3);
 
+        // Session-editor helpers.
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let held_port = held.local_addr().unwrap().port();
+        let ports = ipc.ok(
+            "check_port_conflicts",
+            json!({ "sessionId": id, "bind": "127.0.0.1", "httpPort": held_port, "socksPort": 0 }),
+        );
+        assert_eq!(ports["conflicts"][0]["kind"], "os_socket");
+        drop(held);
+        let filter = ipc.ok(
+            "test_filter_rules",
+            json!({ "mode": "block", "rules": ["*.example.com"], "target": "api.example.com" }),
+        );
+        assert_eq!((filter["valid"].clone(), filter["allowed"].clone()), (json!(true), json!(false)));
+        let bad_rule = ipc.ok(
+            "test_filter_rules",
+            json!({ "mode": "allow", "rules": ["10.0.0.0/99"], "target": "x" }),
+        );
+        assert_eq!(bad_rule["rule_errors"][0]["index"], 0);
+        ipc.err("test_filter_rules", json!({ "mode": "other", "rules": [], "target": "x" }));
+
+        let ca_path = dir.path().join("inspect.p12");
+        write_mitm_ca(&ca_path);
+        let ca_mode = json!({ "Pkcs12": { "path": ca_path } });
+        let inline = ipc.ok("inspect_mitm_ca", json!({ "caMode": ca_mode, "passphrase": MITM }));
+        assert!(inline["subject"].as_str().unwrap().contains("IPC Test CA"));
+        assert_eq!(inline["expired"], false);
+        let stored = ipc.ok("inspect_mitm_ca", json!({ "caMode": ca_mode, "passphraseRef": mitm["secret_ref"] }));
+        assert_eq!(stored["subject"], inline["subject"]);
+        assert_eq!(
+            ipc.err("inspect_mitm_ca", json!({ "caMode": ca_mode, "passphrase": PASSWORD }))["code"],
+            "invalid"
+        );
+
+        // Config export and import, in both forms.
+        let plain_export = dir.path().join("config-plain.json");
+        let plain_path = plain_export.to_str().unwrap();
+        let plain = ipc.ok("export_config", json!({ "path": plain_path }));
+        assert_eq!((plain["encrypted"].clone(), plain["secret_count"].clone()), (json!(false), json!(0)));
+        let replaced = ipc.ok("import_config", json!({ "path": plain_path, "replaceExisting": true }));
+        assert_eq!(replaced["sessions_updated"], 1);
+        assert_eq!(replaced["credentials_removed"], 0);
+
+        let bundle_export = dir.path().join("config-bundle.json");
+        let bundle_path = bundle_export.to_str().unwrap();
+        ipc.err("export_config", json!({ "path": bundle_path, "includeSecrets": true }));
+        let sealed = ipc.ok(
+            "export_config",
+            json!({ "path": bundle_path, "includeSecrets": true, "passphrase": BACKUP_PASS }),
+        );
+        assert_eq!(sealed["encrypted"], true);
+        assert_eq!(sealed["missing_secrets"], 0);
+        assert_eq!(sealed["secret_count"], 5, "three keys, one password, one passphrase");
+        assert_eq!(
+            ipc.err("import_config", json!({ "path": bundle_path, "passphrase": PASSWORD }))["code"],
+            "unlock_failed"
+        );
+        let restored = ipc.ok("import_config", json!({ "path": bundle_path, "passphrase": BACKUP_PASS }));
+        assert_eq!(restored["sessions_skipped"], 1);
+        assert_eq!((restored["keys_added"].clone(), restored["secrets_added"].clone()), (json!(0), json!(0)));
+
         // Deletes, including the referenced-key confirmation contract.
         let refused = ipc.ok("delete_key", json!({ "id": key_id }));
         assert_eq!(refused["deleted"], false);
@@ -648,7 +805,7 @@ mod tests {
         ipc.ok("delete_host", json!({ "id": host["id"] }));
 
         // Read the files before the session is deleted, while they hold the most references.
-        let on_disk: Vec<(String, Vec<u8>)> = ["config.json", "vault.bin", "backup.bundle"]
+        let on_disk: Vec<(String, Vec<u8>)> = ["config.json", "vault.bin", "backup.bundle", "config-plain.json", "config-bundle.json"]
             .iter()
             .map(|name| (name.to_string(), std::fs::read(dir.path().join(name)).unwrap()))
             .collect();
