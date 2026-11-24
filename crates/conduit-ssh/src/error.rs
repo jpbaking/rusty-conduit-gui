@@ -19,6 +19,7 @@ pub enum SshError {
         port: u16,
         algorithm: String,
         sha256: String,
+        public_key_openssh: Option<String>,
     },
 
     /// The hop presented a key that differs from its pin. Hard stop.
@@ -117,6 +118,7 @@ mod tests {
                 port: 22,
                 algorithm: "ssh-ed25519".into(),
                 sha256: "SHA256:x".into(),
+                public_key_openssh: None,
             },
             SshError::HostKeyChanged {
                 hop_index: 0,

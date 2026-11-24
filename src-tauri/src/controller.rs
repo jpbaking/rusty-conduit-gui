@@ -642,6 +642,7 @@ mod tests {
                 fingerprint_sha256: "SHA256:abc".into(),
                 first_seen: Timestamp(1),
                 approved: true,
+                public_key_openssh: None,
             },
         );
         c.persist_known_hosts().unwrap();

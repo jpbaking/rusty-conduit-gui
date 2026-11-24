@@ -438,6 +438,7 @@ mod tests {
             HostKeyRecord {
                 algorithm: node.host_key.algorithm().as_str().to_string(),
                 fingerprint_sha256: node.fingerprint(),
+                public_key_openssh: None,
                 first_seen: Timestamp(1),
                 approved: true,
             },

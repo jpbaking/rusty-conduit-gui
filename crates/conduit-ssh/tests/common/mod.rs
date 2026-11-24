@@ -342,6 +342,7 @@ pub fn verifier_with(nodes: &[&Node], keys: &[&PublicKey]) -> HostKeyVerifier {
             HostKeyRecord {
                 algorithm: key.algorithm().as_str().to_string(),
                 fingerprint_sha256: key.fingerprint(HashAlg::Sha256).to_string(),
+                public_key_openssh: None,
                 first_seen: Timestamp(1),
                 approved: true,
             },

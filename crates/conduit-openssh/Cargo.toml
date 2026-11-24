@@ -1,0 +1,28 @@
+[package]
+name = "conduit-openssh"
+version = "0.1.0"
+edition = "2021"
+description = "Isolated, opt-in OpenSSH compatibility engine for Rusty Conduit SSH GUI."
+license = "BSD-3-Clause"
+
+[[bin]]
+name = "conduit-worker"
+path = "src/bin/conduit-worker.rs"
+
+[dependencies]
+conduit-core = { path = "../conduit-core" }
+conduit-ssh = { path = "../conduit-ssh" }
+rusty-conduit-ssh = { workspace = true }
+tokio = { workspace = true, features = ["process", "net", "io-util", "sync", "time", "rt", "macros"] }
+serde = { workspace = true }
+thiserror = { workspace = true }
+ring = { workspace = true }
+zeroize = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+conduit-vault = { path = "../conduit-vault" }
+russh = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }

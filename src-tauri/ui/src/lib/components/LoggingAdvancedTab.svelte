@@ -1,9 +1,13 @@
 <script lang="ts">
   import { untrack } from "svelte";
+  import { api, errorMessage } from "../api";
   import { store } from "../stores.svelte";
-  import type { LoggingConfig, OpenSshOptions, SessionProfile } from "../types";
+  import type { LoggingConfig, OpenSshBinaryInfo, OpenSshOptions, SessionProfile } from "../types";
   import { denylistedFlag, LOG_FORMATS, LOG_LEVELS, redactArgs } from "../validate";
   import PortField from "./PortField.svelte";
+
+  /** Long enough that a path being typed is not run one partial value at a time. */
+  const AUTO_CHECK_DELAY_MS = 500;
 
   const parseArgs = (text: string) =>
     text
@@ -35,6 +39,51 @@
   $effect(() => {
     const saved = openssh.extra_args;
     if (!sameArgs(saved, parseArgs(untrack(() => argsText)))) argsText = saved.join("\n");
+  });
+
+  // Primitive values, so edits to other draft fields do not trigger a new check.
+  const sshBin = $derived(openssh.ssh_bin.trim());
+  const usesOpenssh = $derived(draft.engine === "OpenSsh");
+
+  let checkingBin = $state(false);
+  let binInfo = $state.raw<OpenSshBinaryInfo | null>(null);
+  let binError = $state<string | null>(null);
+  let binRun = 0;
+
+  const binStatus = $derived.by(() => {
+    if (!binInfo) return null;
+    if (binInfo.supported) return { tone: "ok", label: "Supported" };
+    if (binInfo.major !== null) return { tone: "busy", label: "Version too old" };
+    if (binInfo.resolved_path !== null) return { tone: "alert", label: "Not usable" };
+    return { tone: "alert", label: "Not found" };
+  });
+
+  async function checkBinary() {
+    const run = ++binRun;
+    checkingBin = true;
+    binInfo = null;
+    binError = null;
+    try {
+      const info = await api.checkOpensshBinary(sshBin || undefined);
+      if (run === binRun) binInfo = info;
+    } catch (error) {
+      if (run === binRun) binError = errorMessage(error);
+    } finally {
+      if (run === binRun) checkingBin = false;
+    }
+  }
+
+  // A result only describes the exact program it was read from.
+  $effect(() => {
+    void sshBin;
+    const autoCheck = usesOpenssh;
+    binRun += 1;
+    checkingBin = false;
+    binInfo = null;
+    binError = null;
+    if (!autoCheck) return;
+    const timer = setTimeout(checkBinary, AUTO_CHECK_DELAY_MS);
+    return () => clearTimeout(timer);
   });
 
   function setLogging(patch: Partial<LoggingConfig>) {
@@ -92,15 +141,19 @@
   <h2 id={`${uid}-openssh`}>OpenSSH only <small class="muted">used when the engine is OpenSSH</small></h2>
   <div class="field-row">
     <div class="field grow">
-      <label class="field">
-        ssh program
+      <label for={`${uid}-ssh-bin`}>ssh program</label>
+      <div class="inline-form">
         <input
+          id={`${uid}-ssh-bin`}
           value={openssh.ssh_bin}
           spellcheck="false"
           aria-invalid={!!errors["openssh.ssh_bin"]}
           oninput={(e) => setOpenssh({ ssh_bin: e.currentTarget.value })}
         />
-      </label>
+        <button type="button" disabled={checkingBin} onclick={checkBinary}>
+          {checkingBin ? "Checking…" : "Check binary"}
+        </button>
+      </div>
       {#if errors["openssh.ssh_bin"]}<span class="field-error">{errors["openssh.ssh_bin"]}</span>{/if}
     </div>
     <div class="field grow">
@@ -123,6 +176,24 @@
       error={errors["openssh.ssh_socks_port"]}
       onValue={(ssh_socks_port) => setOpenssh({ ssh_socks_port })}
     />
+  </div>
+
+  <div role="status">
+    {#if binInfo && binStatus}
+      <p><span class={`pill ${binStatus.tone}`}>{binStatus.label}</span></p>
+      <dl class="fact-list">
+        <dt>Version</dt>
+        <dd>{binInfo.version_raw ?? "Unknown"}</dd>
+        <dt>Path</dt>
+        <dd>{binInfo.resolved_path ?? "Not found"}</dd>
+      </dl>
+      {#if binStatus.tone === "busy"}
+        <p class="warning">{binInfo.message}</p>
+      {:else if binStatus.tone === "alert"}
+        <p class="field-error">{binInfo.message}</p>
+      {/if}
+    {/if}
+    {#if binError}<p class="field-error">Could not check the program: {binError}</p>{/if}
   </div>
 
   <label class="field">

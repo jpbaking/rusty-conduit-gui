@@ -12,7 +12,12 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
 use conduit_core::{
-    to_config, validate, AuthMethod, HopEntry, KnownHostsStore, SessionProfile, SshEngine,
+    to_config, validate, AuthMethod, HopEntry, HostKeyLookup, KnownHostsStore, SessionProfile,
+    SshEngine,
+};
+use conduit_openssh::{
+    check_openssh_binary, render_known_hosts, LogFn, OpenSshError, OpenSshSupervisor,
+    SupervisorHop, SupervisorOptions,
 };
 use conduit_ssh::{
     agent_policy, connect_chain, reverse_policy, AgentForwardRelay, AgentInbound, AgentRelayError,
@@ -25,11 +30,11 @@ use rusty_conduit_ssh::build_engines;
 use rusty_conduit_ssh::config::Config;
 use rusty_conduit_ssh::logging::{AccessLogConfig, AccessLogger, Logger};
 use rusty_conduit_ssh::mitm::MitmState;
-use rusty_conduit_ssh::net::{FilteredDialer, UpstreamDialer};
+use rusty_conduit_ssh::net::{FilteredDialer, Socks5UpstreamDialer, TunnelState, UpstreamDialer};
 use rusty_conduit_ssh::reverse::ReverseProxy;
 use rusty_conduit_ssh::server::{ProtocolHandlers, Server, ShutdownReport};
 use rusty_conduit_ssh::EngineHandlers;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, Instant};
 use tokio_util::sync::CancellationToken;
@@ -45,6 +50,8 @@ const REVERSE_CHANNEL_CAPACITY: usize = 64;
 const AGENT_CHANNEL_CAPACITY: usize = 16;
 /// Backstop for noticing a dead chain if no disconnect event arrives.
 const LIVENESS_POLL: Duration = Duration::from_secs(1);
+/// A session has two forward ports, so a third pick is always different.
+const SOCKS_PORT_ATTEMPTS: usize = 3;
 
 pub(crate) type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub(crate) type SharedVault = Arc<RwLock<Vault>>;
@@ -358,6 +365,7 @@ pub(crate) fn classify(error: SshError) -> LinkError {
             port,
             algorithm,
             sha256,
+            public_key_openssh,
         } => LinkError::HostKey(HostKeyPrompt {
             hop_index,
             hop_id,
@@ -365,6 +373,7 @@ pub(crate) fn classify(error: SshError) -> LinkError {
             port,
             algorithm,
             sha256,
+            public_key_openssh,
         }),
         error @ (SshError::AuthFailed { .. } | SshError::HostKeyChanged { .. }) => {
             LinkError::Attention(error.to_string())
@@ -586,15 +595,23 @@ fn classify_agent(error: AgentRelayError) -> LinkError {
     }
 }
 
-/// The production engine: `russh` chain plus the embedded proxy.
+/// The production engine. Routes each session to the SSH engine its profile selects.
 #[derive(Debug, Default)]
-pub(crate) struct RusshEngine;
+pub(crate) struct DefaultEngine;
 
-impl Engine for RusshEngine {
+impl Engine for DefaultEngine {
     fn prepare(&self, ctx: SessionContext) -> BoxFut<'static, Result<Box<dyn Link>, LinkError>> {
         Box::pin(async move {
-            let link = RusshLink::prepare(ctx).await?;
-            Ok(Box::new(link) as Box<dyn Link>)
+            match ctx.profile.engine {
+                SshEngine::OpenSsh => {
+                    let link = OpenSshLink::prepare(ctx).await?;
+                    Ok(Box::new(link) as Box<dyn Link>)
+                }
+                _ => {
+                    let link = RusshLink::prepare(ctx).await?;
+                    Ok(Box::new(link) as Box<dyn Link>)
+                }
+            }
         })
     }
 }
@@ -605,47 +622,31 @@ struct RunningServer {
     reaper: Option<JoinHandle<()>>,
 }
 
-struct RusshLink {
-    profile: SessionProfile,
+/// The proxy side of a session, shared by both SSH engines.
+struct ProxyStack {
     cfg: Config,
-    options: ChainOptions,
-    verifier: HostKeyVerifier,
-    vault: SharedVault,
     logger: Logger,
     access: AccessLogger,
     reverse: Option<ReverseProxy>,
-    dialer: Arc<RusshDialer>,
     upstream: Arc<dyn UpstreamDialer>,
     mitm: Option<MitmState>,
     server: Option<RunningServer>,
-    relay: Option<ReverseRelay>,
-    agent_relays: Vec<AgentForwardRelay>,
-    logs: LogRingBuffer,
-    disconnects: Option<mpsc::UnboundedReceiver<DisconnectEvent>>,
     listeners: SharedListeners,
 }
 
-impl RusshLink {
-    async fn prepare(ctx: SessionContext) -> Result<Self, LinkError> {
-        let SessionContext {
-            profile,
-            vault,
-            known_hosts,
-            logs,
-            stats,
-            listeners,
-        } = ctx;
-
-        if profile.engine == SshEngine::OpenSsh {
-            return Err(LinkError::Fatal(
-                "the OpenSSH engine is not available in this build".into(),
-            ));
-        }
-        validate(&profile).map_err(|e| LinkError::Fatal(e.to_string()))?;
-
+impl ProxyStack {
+    /// Checks the vault, then starts access logging and the reverse proxy over `base`.
+    async fn start(
+        profile: &SessionProfile,
+        vault: &SharedVault,
+        logs: &LogRingBuffer,
+        stats: Arc<AtomicStats>,
+        listeners: SharedListeners,
+        base: Arc<dyn UpstreamDialer>,
+    ) -> Result<Self, LinkError> {
         let passphrase = {
             let vault = vault.read().unwrap_or_else(PoisonError::into_inner);
-            if needs_secrets(&profile) && !vault.is_unlocked() {
+            if needs_secrets(profile) && !vault.is_unlocked() {
                 return Err(LinkError::Locked);
             }
             match profile.mitm.as_ref().and_then(|m| m.passphrase.as_ref()) {
@@ -660,18 +661,9 @@ impl RusshLink {
             }
         };
 
-        let mut cfg = to_config(&profile, passphrase.as_ref().map(|p| p.as_str()))
+        let mut cfg = to_config(profile, passphrase.as_ref().map(|p| p.as_str()))
             .map_err(|e| LinkError::Fatal(e.to_string()))?;
         drop(passphrase);
-        let options =
-            ChainOptions::from_tunnel(&profile.tunnel).map_err(|e| LinkError::Fatal(e.to_string()));
-        let options = match options {
-            Ok(options) => options,
-            Err(error) => {
-                scrub_passphrase(&mut cfg);
-                return Err(error);
-            }
-        };
 
         let logger = Logger::with_writer(cfg.log_level, Box::new(logs.writer()));
         let access = match AccessLogger::start_with_stdout(
@@ -693,11 +685,7 @@ impl RusshLink {
             }
         };
 
-        let dialer = Arc::new(RusshDialer::new());
-        let counted: Arc<dyn UpstreamDialer> = Arc::new(StatsDialer::new(
-            Arc::clone(&dialer) as Arc<dyn UpstreamDialer>,
-            stats,
-        ));
+        let counted: Arc<dyn UpstreamDialer> = Arc::new(StatsDialer::new(base, stats));
         let upstream: Arc<dyn UpstreamDialer> = match cfg.forward_filter() {
             Some(filter) => Arc::new(FilteredDialer::new(counted, Arc::new(filter))),
             None => counted,
@@ -715,30 +703,14 @@ impl RusshLink {
             }
         };
 
-        for hop in profile.hops.iter().filter(|h| h.agent_forward && h.agent_forward_keys.is_empty()) {
-            logs.push(&format!(
-                "notice: agent forwarding is on for hop {} but no keys are assigned, so no agent channel will be opened",
-                hop.hop_id
-            ));
-        }
-
         Ok(Self {
-            profile,
             cfg,
-            options,
-            verifier: HostKeyVerifier::from_shared(known_hosts),
-            vault,
             logger,
             access,
             reverse,
-            dialer,
             upstream,
             mitm,
             server: None,
-            relay: None,
-            agent_relays: Vec::new(),
-            logs,
-            disconnects: None,
             listeners,
         })
     }
@@ -782,6 +754,95 @@ impl RusshLink {
         let run = tokio::spawn(server.run());
         self.server = Some(RunningServer { token, run, reaper });
         Ok(())
+    }
+
+    /// First shutdown step: stop accepting and drain the forward listeners.
+    async fn drain_server(&mut self) {
+        if let Some(server) = self.server.take() {
+            server.token.cancel();
+            if let Ok(report) = server.run.await {
+                if report.drained {
+                    self.logger.debug("all connections drained");
+                }
+            }
+            if let Some(reaper) = server.reaper {
+                let _ = reaper.await;
+            }
+        }
+    }
+
+    /// Last shutdown steps, after SSH is down: drain the reverse proxy and flush the logs.
+    async fn finish(mut self) {
+        if let Some(reverse) = self.reverse.take() {
+            if reverse.shutdown().await.drained {
+                self.logger.debug("all reverse proxy connections drained");
+            }
+        }
+        self.logger.info("shutting down");
+        if let Err(e) = self.access.shutdown().await {
+            self.logger.error(format!("failed to flush access logs: {e}"));
+        }
+        self.logger.flush();
+    }
+}
+
+struct RusshLink {
+    profile: SessionProfile,
+    options: ChainOptions,
+    verifier: HostKeyVerifier,
+    vault: SharedVault,
+    stack: ProxyStack,
+    dialer: Arc<RusshDialer>,
+    relay: Option<ReverseRelay>,
+    agent_relays: Vec<AgentForwardRelay>,
+    logs: LogRingBuffer,
+    disconnects: Option<mpsc::UnboundedReceiver<DisconnectEvent>>,
+}
+
+impl RusshLink {
+    async fn prepare(ctx: SessionContext) -> Result<Self, LinkError> {
+        let SessionContext {
+            profile,
+            vault,
+            known_hosts,
+            logs,
+            stats,
+            listeners,
+        } = ctx;
+
+        validate(&profile).map_err(|e| LinkError::Fatal(e.to_string()))?;
+        let options =
+            ChainOptions::from_tunnel(&profile.tunnel).map_err(|e| LinkError::Fatal(e.to_string()))?;
+        let dialer = Arc::new(RusshDialer::new());
+        let stack = ProxyStack::start(
+            &profile,
+            &vault,
+            &logs,
+            stats,
+            listeners,
+            Arc::clone(&dialer) as Arc<dyn UpstreamDialer>,
+        )
+        .await?;
+
+        for hop in profile.hops.iter().filter(|h| h.agent_forward && h.agent_forward_keys.is_empty()) {
+            logs.push(&format!(
+                "notice: agent forwarding is on for hop {} but no keys are assigned, so no agent channel will be opened",
+                hop.hop_id
+            ));
+        }
+
+        Ok(Self {
+            profile,
+            options,
+            verifier: HostKeyVerifier::from_shared(known_hosts),
+            vault,
+            stack,
+            dialer,
+            relay: None,
+            agent_relays: Vec::new(),
+            logs,
+            disconnects: None,
+        })
     }
 
     async fn drop_connection(&mut self) {
@@ -839,7 +900,7 @@ impl Link for RusshLink {
         Box::pin(async move {
             // The relay's receiver is consumed per connection, so build a fresh pair each time.
             let (policy, inbound): (ChannelPolicy, Option<ReverseInbound>) =
-                if self.reverse.is_some() {
+                if self.stack.reverse.is_some() {
                     let (policy, inbound) = reverse_policy(REVERSE_CHANNEL_CAPACITY);
                     (policy, Some(inbound))
                 } else {
@@ -868,7 +929,7 @@ impl Link for RusshLink {
                     return Err(error);
                 }
             };
-            if let (Some(reverse), Some(inbound)) = (&self.reverse, inbound) {
+            if let (Some(reverse), Some(inbound)) = (&self.stack.reverse, inbound) {
                 match ReverseRelay::start(&chain, reverse.forwards(), inbound).await {
                     Ok(relay) => self.relay = Some(relay),
                     Err(error) => {
@@ -881,7 +942,7 @@ impl Link for RusshLink {
             self.agent_relays = agent_relays;
             self.dialer.swap(chain);
             self.disconnects = Some(receiver);
-            self.ensure_server().await
+            self.stack.ensure_server().await
         })
     }
 
@@ -916,28 +977,337 @@ impl Link for RusshLink {
     fn shutdown(self: Box<Self>) -> BoxFut<'static, ()> {
         Box::pin(async move {
             let mut this = *self;
-            if let Some(server) = this.server.take() {
-                server.token.cancel();
-                if let Ok(report) = server.run.await {
-                    if report.drained {
-                        this.logger.debug("all connections drained");
-                    }
-                }
-                if let Some(reaper) = server.reaper {
-                    let _ = reaper.await;
-                }
-            }
+            this.stack.drain_server().await;
             this.drop_connection().await;
-            if let Some(reverse) = this.reverse.take() {
-                if reverse.shutdown().await.drained {
-                    this.logger.debug("all reverse proxy connections drained");
+            this.stack.finish().await;
+        })
+    }
+}
+
+/// Maps an `ssh` failure to what the supervisor must do.
+fn classify_openssh(error: OpenSshError) -> LinkError {
+    match error {
+        // Never retried: these could lock an account or bypass host-key trust. Every hop was
+        // pinned before `ssh` started, so an "unknown" key here is a trust failure too.
+        error @ (OpenSshError::AuthFailed(_)
+        | OpenSshError::HostKeyChanged(_)
+        | OpenSshError::HostKeyUnknown(_)) => LinkError::Attention(error.to_string()),
+        error @ OpenSshError::BinaryUnsupported(_) => LinkError::Fatal(error.to_string()),
+        OpenSshError::Io(io) if is_setup_failure(io.kind()) => {
+            LinkError::Fatal(format!("OpenSSH session setup failed: {io}"))
+        }
+        error => LinkError::Transient {
+            reason: error.to_string(),
+            network: false,
+        },
+    }
+}
+
+/// A local setup problem that retrying cannot fix, such as a bad config or a missing worker.
+fn is_setup_failure(kind: std::io::ErrorKind) -> bool {
+    use std::io::ErrorKind::{InvalidData, InvalidInput, NotFound, PermissionDenied};
+    matches!(kind, InvalidData | InvalidInput | NotFound | PermissionDenied)
+}
+
+/// When a hop cannot be written to `known_hosts`, returns a copy of `store` for the host-key
+/// probe. A pin without a usable public key is marked unapproved there, so a matching key
+/// prompts (and records the key) while a different key is still a hard "changed" stop.
+fn probe_store(store: &KnownHostsStore, profile: &SessionProfile) -> Option<KnownHostsStore> {
+    let mut scratch = store.clone();
+    let mut incomplete = false;
+    for hop in &profile.hops {
+        let (hop_id, host, port) = (hop.hop_id.as_str(), hop.host.host.as_str(), hop.host.port);
+        if !render_known_hosts(store, &[(hop_id, host, port)]).is_empty() {
+            continue;
+        }
+        incomplete = true;
+        if let Some(pin) = store.get(hop_id, host, port) {
+            let mut pin = pin.clone();
+            pin.approved = false;
+            scratch.insert(
+                HostKeyLookup {
+                    hop_id: hop_id.to_string(),
+                    host: host.to_string(),
+                    port,
+                },
+                pin,
+            );
+        }
+    }
+    incomplete.then_some(scratch)
+}
+
+/// Builds the supervisor's hop list from the vault. Each hop's keys go in its own scoped agent.
+fn supervisor_hops(
+    profile: &SessionProfile,
+    vault: &Vault,
+    logs: &LogRingBuffer,
+) -> Result<Vec<SupervisorHop>, LinkError> {
+    profile
+        .hops
+        .iter()
+        .map(|hop| {
+            let mut keys = Vec::new();
+            let mut password = None;
+            for method in &hop.host.auth {
+                match resolve_auth(vault, method)? {
+                    // The comment is visible to the agent client, so vault names stay out of it.
+                    Some(HopAuth::Key(private)) => keys.push((private, String::new())),
+                    Some(HopAuth::Password(secret)) => {
+                        password.get_or_insert(secret);
+                    }
+                    _ => {}
                 }
             }
-            this.logger.info("shutting down");
-            if let Err(e) = this.access.shutdown().await {
-                this.logger.error(format!("failed to flush access logs: {e}"));
+            let agent = (!keys.is_empty()).then(|| {
+                let sink = logs.clone();
+                let audit: SignAuditFn =
+                    Arc::new(move |event: &SignAudit| sink.push(&audit_line(event)));
+                Arc::new(ScopedAgent::seal(hop.hop_id.clone(), keys, Some(audit)))
+            });
+            Ok(SupervisorHop {
+                hop_id: hop.hop_id.clone(),
+                host: hop.host.host.clone(),
+                port: hop.host.port,
+                user: hop.host.user.clone(),
+                password,
+                agent,
+            })
+        })
+        .collect()
+}
+
+/// The opt-in engine: a supervised `ssh -N -D` process plus the embedded proxy.
+struct OpenSshLink {
+    profile: SessionProfile,
+    options: ChainOptions,
+    known_hosts: Arc<RwLock<KnownHostsStore>>,
+    vault: SharedVault,
+    stack: ProxyStack,
+    logs: LogRingBuffer,
+    /// Feeds the proxy's dialer, and outlives each `ssh` process.
+    tunnel: watch::Sender<TunnelState>,
+    supervisor: Option<OpenSshSupervisor>,
+    supervisor_state: Option<watch::Receiver<TunnelState>>,
+}
+
+impl OpenSshLink {
+    async fn prepare(ctx: SessionContext) -> Result<Self, LinkError> {
+        let SessionContext {
+            profile,
+            vault,
+            known_hosts,
+            logs,
+            stats,
+            listeners,
+        } = ctx;
+
+        validate(&profile).map_err(|e| LinkError::Fatal(e.to_string()))?;
+        let options =
+            ChainOptions::from_tunnel(&profile.tunnel).map_err(|e| LinkError::Fatal(e.to_string()))?;
+
+        let ssh_bin = profile.openssh.ssh_bin.clone();
+        let info = tokio::task::spawn_blocking(move || check_openssh_binary(&ssh_bin))
+            .await
+            .map_err(|e| LinkError::Fatal(format!("OpenSSH binary check failed: {e}")))?;
+        if !info.supported {
+            return Err(LinkError::Fatal(format!(
+                "OpenSSH binary cannot be used: {}",
+                info.message
+            )));
+        }
+
+        let (tunnel, state) = watch::channel(TunnelState::Connecting);
+        let base: Arc<dyn UpstreamDialer> = Arc::new(Socks5UpstreamDialer::new(state));
+        let stack = ProxyStack::start(&profile, &vault, &logs, stats, listeners, base).await?;
+
+        for hop in profile.hops.iter().filter(|h| h.agent_forward) {
+            logs.push(&format!(
+                "notice: agent forwarding on hop {} is not applied by the OpenSSH engine",
+                hop.hop_id
+            ));
+        }
+
+        Ok(Self {
+            profile,
+            options,
+            known_hosts,
+            vault,
+            stack,
+            logs,
+            tunnel,
+            supervisor: None,
+            supervisor_state: None,
+        })
+    }
+
+    /// Surfaces the first hop that needs a host-key decision, before `ssh` is launched.
+    ///
+    /// Each server's key is checked before any credential is sent to it, and only hops already
+    /// trusted are authenticated to reach the next one.
+    async fn probe_host_keys(&self, scratch: KnownHostsStore) -> Result<(), LinkError> {
+        let hops = {
+            let vault = self.vault.read().unwrap_or_else(PoisonError::into_inner);
+            resolve_hops(&self.profile, &vault, ChannelPolicy::default())?
+        };
+        let verifier = HostKeyVerifier::new(scratch);
+        let chain = connect_chain(&hops, &verifier, &self.options, None)
+            .await
+            .map_err(classify)
+            .map_err(|error| match error {
+                // Without the key text, approving could never produce a usable `known_hosts`.
+                LinkError::HostKey(prompt) if prompt.public_key_openssh.is_none() => {
+                    LinkError::Fatal(format!(
+                        "the host key of hop {} cannot be used with the OpenSSH engine",
+                        prompt.hop_id
+                    ))
+                }
+                other => other,
+            })?;
+        chain.disconnect().await;
+        Ok(())
+    }
+
+    /// The configured SOCKS port, or a free one for this attempt.
+    ///
+    /// The forward listeners bind after `ssh` starts, so a free port must not be one of theirs.
+    fn socks_port(&self) -> Result<u16, LinkError> {
+        let configured = self.profile.openssh.ssh_socks_port;
+        if configured != 0 {
+            return Ok(configured);
+        }
+        let failed = |detail: String| LinkError::Transient {
+            reason: format!("no free local port for the SSH tunnel: {detail}"),
+            network: false,
+        };
+        let forward = &self.profile.forward;
+        // Rejected listeners stay open until return, so the OS cannot offer them again.
+        let mut rejected = Vec::new();
+        for _ in 0..SOCKS_PORT_ATTEMPTS {
+            let listener = std::net::TcpListener::bind((self.profile.openssh.ssh_socks_bind, 0))
+                .map_err(|e| failed(e.to_string()))?;
+            let port = listener
+                .local_addr()
+                .map_err(|e| failed(e.to_string()))?
+                .port();
+            if port != forward.http_port && port != forward.socks_port {
+                return Ok(port);
             }
-            this.logger.flush();
+            rejected.push(listener);
+        }
+        Err(failed("every port offered is a forward port".into()))
+    }
+
+    async fn stop_supervisor(&mut self, reason: &str) {
+        self.tunnel
+            .send_replace(TunnelState::Disconnected(reason.to_string()));
+        self.supervisor_state = None;
+        if let Some(supervisor) = self.supervisor.take() {
+            // Terminates and reaps `ssh` before its runtime directory is removed.
+            supervisor.shutdown().await;
+        }
+    }
+}
+
+impl Link for OpenSshLink {
+    fn connect(&mut self) -> BoxFut<'_, Result<(), LinkError>> {
+        Box::pin(async move {
+            {
+                let vault = self.vault.read().unwrap_or_else(PoisonError::into_inner);
+                if needs_secrets(&self.profile) && !vault.is_unlocked() {
+                    return Err(LinkError::Locked);
+                }
+            }
+            let scratch = {
+                let store = self.known_hosts.read().unwrap_or_else(PoisonError::into_inner);
+                probe_store(&store, &self.profile)
+            };
+            if let Some(scratch) = scratch {
+                self.probe_host_keys(scratch).await?;
+            }
+
+            let hops = {
+                let vault = self.vault.read().unwrap_or_else(PoisonError::into_inner);
+                supervisor_hops(&self.profile, &vault, &self.logs)?
+            };
+            let known_hosts = self
+                .known_hosts
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            let reverse_forwards = self
+                .stack
+                .reverse
+                .as_ref()
+                .map(|reverse| reverse.forwards().iter().map(|f| f.spec()).collect())
+                .unwrap_or_default();
+            let sink = self.logs.clone();
+            let log: LogFn = Arc::new(move |line: &str| sink.push(line));
+            let tunnel = &self.profile.tunnel;
+            let options = SupervisorOptions {
+                ssh_bin: self.profile.openssh.ssh_bin.clone(),
+                worker_bin: None,
+                hops,
+                known_hosts,
+                bind: self.profile.openssh.ssh_socks_bind,
+                socks_port: self.socks_port()?,
+                reverse_forwards,
+                extra_args: self.profile.openssh.extra_args.clone(),
+                ip_version: tunnel.ip_version.clone(),
+                server_alive_interval: tunnel.server_alive_interval,
+                server_alive_count_max: tunnel.server_alive_count_max,
+                startup_timeout: tunnel.startup_timeout,
+                log: Some(log),
+            };
+
+            self.tunnel.send_replace(TunnelState::Connecting);
+            let supervisor = match OpenSshSupervisor::start(options).await {
+                Ok(supervisor) => supervisor,
+                Err(error) => {
+                    self.tunnel
+                        .send_replace(TunnelState::Disconnected(error.to_string()));
+                    return Err(classify_openssh(error));
+                }
+            };
+            self.tunnel
+                .send_replace(TunnelState::Ready(supervisor.socks_addr()));
+            self.supervisor_state = Some(supervisor.state());
+            self.supervisor = Some(supervisor);
+            self.stack.ensure_server().await
+        })
+    }
+
+    fn lost(&mut self) -> BoxFut<'_, String> {
+        Box::pin(async move {
+            let Some(state) = self.supervisor_state.as_mut() else {
+                return "connection closed".to_string();
+            };
+            let reason = loop {
+                let current = state.borrow_and_update().clone();
+                if let TunnelState::Disconnected(reason) = current {
+                    break reason;
+                }
+                if state.changed().await.is_err() {
+                    break "ssh supervisor stopped".to_string();
+                }
+            };
+            // New dials fail right away instead of reaching a dead SOCKS port.
+            self.tunnel
+                .send_replace(TunnelState::Disconnected(reason.clone()));
+            reason
+        })
+    }
+
+    fn disconnect(&mut self) -> BoxFut<'_, ()> {
+        Box::pin(self.stop_supervisor("reconnecting"))
+    }
+
+    fn shutdown(self: Box<Self>) -> BoxFut<'static, ()> {
+        Box::pin(async move {
+            let mut this = *self;
+            this.stack.drain_server().await;
+            this.stop_supervisor("stopped").await;
+            this.stack.finish().await;
         })
     }
 }
@@ -1021,6 +1391,7 @@ pub(crate) mod testing {
             port: 22,
             algorithm: "ssh-ed25519".into(),
             sha256: "SHA256:abc".into(),
+            public_key_openssh: Some("ssh-ed25519 AAAAtest".into()),
         }
     }
 
@@ -1284,6 +1655,77 @@ mod tests {
     }
 
     #[test]
+    fn classify_openssh_never_retries_trust_or_auth_failures() {
+        for error in [
+            OpenSshError::AuthFailed("denied".into()),
+            OpenSshError::HostKeyChanged("changed".into()),
+            OpenSshError::HostKeyUnknown("unknown".into()),
+        ] {
+            assert!(matches!(classify_openssh(error), LinkError::Attention(_)));
+        }
+        assert!(matches!(
+            classify_openssh(OpenSshError::BinaryUnsupported("old".into())),
+            LinkError::Fatal(_)
+        ));
+        assert!(matches!(
+            classify_openssh(OpenSshError::Io(std::io::ErrorKind::NotFound.into())),
+            LinkError::Fatal(_)
+        ));
+        assert!(matches!(
+            classify_openssh(OpenSshError::Io(std::io::ErrorKind::AddrInUse.into())),
+            LinkError::Transient { .. }
+        ));
+        assert!(matches!(
+            classify_openssh(OpenSshError::ProcessExited("exit 255".into())),
+            LinkError::Transient { .. }
+        ));
+    }
+
+    #[test]
+    fn probe_store_demotes_only_pins_without_a_usable_key() {
+        use conduit_core::{HostKeyRecord, HostProfile, Timestamp};
+        let hop = |id: &str| HopEntry {
+            hop_id: id.into(),
+            host: HostProfile {
+                host: "h".into(),
+                port: 22,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let record = |key: Option<&str>| HostKeyRecord {
+            algorithm: "ssh-ed25519".into(),
+            fingerprint_sha256: "SHA256:abc".into(),
+            first_seen: Timestamp(1),
+            approved: true,
+            public_key_openssh: key.map(str::to_string),
+        };
+        let lookup = |id: &str| HostKeyLookup {
+            hop_id: id.into(),
+            host: "h".into(),
+            port: 22,
+        };
+        let mut store = KnownHostsStore::default();
+        store.insert(lookup("full"), record(Some("ssh-ed25519 AAAA")));
+        let complete = SessionProfile {
+            hops: vec![hop("full")],
+            ..Default::default()
+        };
+        assert!(probe_store(&store, &complete).is_none());
+
+        store.insert(lookup("legacy"), record(None));
+        let mixed = SessionProfile {
+            hops: vec![hop("full"), hop("legacy"), hop("absent")],
+            ..Default::default()
+        };
+        let scratch = probe_store(&store, &mixed).unwrap();
+        assert!(scratch.get("full", "h", 22).unwrap().approved);
+        assert!(!scratch.get("legacy", "h", 22).unwrap().approved);
+        assert!(scratch.get("absent", "h", 22).is_none());
+        assert!(store.get("legacy", "h", 22).unwrap().approved, "the real store is unchanged");
+    }
+
+    #[test]
     fn classify_routes_each_failure() {
         assert!(matches!(
             classify(SshError::HostKeyUnknown {
@@ -1293,6 +1735,7 @@ mod tests {
                 port: 22,
                 algorithm: "ssh-ed25519".into(),
                 sha256: "SHA256:x".into(),
+                public_key_openssh: None,
             }),
             LinkError::HostKey(HostKeyPrompt { hop_index: 1, .. })
         ));

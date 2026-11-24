@@ -20,6 +20,8 @@ pub struct HostKeyPrompt {
     pub algorithm: String,
     /// `SHA256:<base64>`, matching `ssh-keygen -l`.
     pub sha256: String,
+    /// `<algorithm> <base64>`, stored with the pin when the user approves.
+    pub public_key_openssh: Option<String>,
 }
 
 /// Where a session is in its lifecycle.
@@ -179,6 +181,7 @@ mod tests {
             port: 22,
             algorithm: "ssh-ed25519".into(),
             sha256: "SHA256:x".into(),
+            public_key_openssh: None,
         }
     }
 

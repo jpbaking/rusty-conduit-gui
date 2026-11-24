@@ -6,7 +6,7 @@
 use std::sync::{Arc, RwLock};
 
 use conduit_core::KnownHostsStore;
-use russh::keys::{HashAlg, PublicKeyOrCertificate};
+use russh::keys::{HashAlg, PublicKey, PublicKeyOrCertificate};
 
 use crate::error::SshError;
 
@@ -16,6 +16,15 @@ pub struct ObservedHostKey {
     pub algorithm: String,
     /// `SHA256:<base64>`, matching `ssh-keygen -l`.
     pub sha256: String,
+    /// `<algorithm> <base64>` of the pinned key, with no comment.
+    pub public_key_openssh: Option<String>,
+}
+
+/// Formats a key as `<algorithm> <base64>`, dropping any comment.
+fn openssh_public_key(key: &PublicKey) -> Option<String> {
+    let line = key.to_openssh().ok()?;
+    let mut fields = line.split_whitespace();
+    Some(format!("{} {}", fields.next()?, fields.next()?))
 }
 
 impl ObservedHostKey {
@@ -25,10 +34,12 @@ impl ObservedHostKey {
             PublicKeyOrCertificate::PublicKey { key, .. } => Self {
                 algorithm: key.algorithm().as_str().to_string(),
                 sha256: key.fingerprint(HashAlg::Sha256).to_string(),
+                public_key_openssh: openssh_public_key(key),
             },
             PublicKeyOrCertificate::Certificate(cert) => Self {
                 algorithm: cert.algorithm().as_str().to_string(),
                 sha256: cert.public_key().fingerprint(HashAlg::Sha256).to_string(),
+                public_key_openssh: openssh_public_key(&PublicKey::from(cert.public_key().clone())),
             },
         }
     }
@@ -108,6 +119,7 @@ impl HostKeyVerifier {
                 port: hop.port,
                 algorithm: observed.algorithm.clone(),
                 sha256: observed.sha256.clone(),
+                public_key_openssh: observed.public_key_openssh.clone(),
             }),
             HostKeyDecision::Changed { expected_sha256 } => Err(SshError::HostKeyChanged {
                 hop_index: hop.hop_index,
@@ -131,6 +143,7 @@ mod tests {
         ObservedHostKey {
             algorithm: "ssh-ed25519".into(),
             sha256: fp.into(),
+            public_key_openssh: Some("ssh-ed25519 AAAAtest".into()),
         }
     }
 
@@ -145,6 +158,7 @@ mod tests {
             HostKeyRecord {
                 algorithm: "ssh-ed25519".into(),
                 fingerprint_sha256: fp.into(),
+                public_key_openssh: None,
                 first_seen: Timestamp(1),
                 approved,
             },
@@ -159,6 +173,12 @@ mod tests {
             host: "example.test".into(),
             port: 22,
         }
+    }
+
+    #[test]
+    fn openssh_public_key_is_algorithm_and_base64_without_comment() {
+        let key = PublicKey::from_openssh("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKFbhFyjXkgxJXrtpCcsutpfSo21kdcBHzLaTi+sKuWT a-comment").unwrap();
+        assert_eq!(openssh_public_key(&key).as_deref(), Some("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKFbhFyjXkgxJXrtpCcsutpfSo21kdcBHzLaTi+sKuWT"));
     }
 
     #[test]
@@ -182,6 +202,7 @@ mod tests {
                 port,
                 algorithm,
                 sha256,
+                public_key_openssh,
             }) => {
                 assert_eq!(
                     (hop_index, hop_id.as_str(), host.as_str(), port),
@@ -189,6 +210,7 @@ mod tests {
                 );
                 assert_eq!(algorithm, "ssh-ed25519");
                 assert_eq!(sha256, "SHA256:new");
+                assert_eq!(public_key_openssh.as_deref(), Some("ssh-ed25519 AAAAtest"));
             }
             other => panic!("expected HostKeyUnknown, got {other:?}"),
         }
@@ -251,6 +273,7 @@ mod tests {
             HostKeyRecord {
                 algorithm: key.algorithm.clone(),
                 fingerprint_sha256: key.sha256.clone(),
+                public_key_openssh: None,
                 first_seen: Timestamp(1),
                 approved: true,
             },

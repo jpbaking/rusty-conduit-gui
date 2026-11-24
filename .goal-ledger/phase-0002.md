@@ -1,52 +1,57 @@
-# phase-0002 — conduit-runtime: wire AgentForwardRelay, audit logs & E2E flake hardening
+# phase-0002 — conduit-openssh core: binary check, hardened -F config, known_hosts & isolated agent socket
 
 - Status: done
 - Owner: executor
 - Depends on: phase-0001
-- Goal: Wire per-hop `AgentForwardRelay` into `conduit-runtime`'s `RusshLink` (loading only `hop.agent_forward_keys` from `Vault`, logging every agent signature audit event into `LogRingBuffer`, tearing down cleanly on disconnect/reconnect), add a runtime E2E test for scoped agent forwarding, and harden `e2e_runtime.rs` against transient ephemeral port collisions.
-- Done when: `cargo test -p conduit-runtime && cargo clippy --workspace --all-targets -- -D warnings` exits 0 with passing E2E tests for scoped agent forwarding (including audit log capture) and 10 consecutive flake-free runs of `e2e_runtime`.
-- Pattern to follow: `crates/conduit-runtime/src/runner.rs:726` (`RusshLink::connect` reverse relay wiring)
+- Goal: Create `crates/conduit-openssh` (added to workspace `Cargo.toml`) implementing OpenSSH binary discovery & version check, short space-free `0700` runtime directory, app-owned `known_hosts` renderer, hardened per-session `-F` config generator, and isolated local `ssh-agent` server over Unix socket (and `cfg(windows)` named-pipe abstraction).
+- Done when: `cargo test -p conduit-openssh && cargo clippy --workspace --all-targets -- -D warnings` exits 0 with passing tests for `ssh -V` parsing (including real `/usr/bin/ssh`), `0700`/`0600` runtime dir & config generation, `HostKeyAlias` `known_hosts` rendering, and Unix-socket `ScopedAgent` wire roundtrips.
+- Pattern to follow: `crates/conduit-ssh/src/agent_wire.rs:68-86` (`serve` over `AsyncRead + AsyncWrite + Unpin`), `crates/conduit-core/src/model.rs:463-511` (`OpenSshOptions`, `SessionProfile`), `Cargo.toml:5-14` (workspace members).
 
 ## Context
-In Milestone 2 `phase-0006`, `concurrent_sessions_stay_isolated` hit a rare `Address already in use` flake because `free_port()` binds and drops a TCP socket before `SessionManager` later binds it. Also `runner.rs` currently leaves `hop.agent_forward` unwired.
-Key decisions already made:
-- Only start `AgentForwardRelay` on hops where `hop.agent_forward == true` AND `!hop.agent_forward_keys.is_empty()`. (If `agent_forward == true` with empty keys, log a clear notice and do not open an agent channel.)
-- `needs_secrets(profile)` in `runner.rs` must also return `true` if any hop has `agent_forward && !agent_forward_keys.is_empty()` so a locked vault parks the session in `Locked`.
-- Every signature audit event from `ScopedAgent` (allowed or refused, including hop_id, key fingerprint, and algorithm — NEVER private key material) is pushed to the session's `LogRingBuffer` with prefix `[agent-audit]`.
-- On reconnect, build a fresh `agent_policy` and `AgentForwardRelay` per opted-in hop (just like `reverse_policy`), and stop/drop previous relays in `drop_connection()` / `shutdown()`.
+Master Plan Section 3.6 requires every `SshEngine::OpenSsh` session to run completely isolated from `~/.ssh/config`, `/etc/ssh/ssh_config`, `~/.ssh/id_*`, `~/.ssh/known_hosts`, and ambient `SSH_AUTH_SOCK`.
+This phase builds the foundational modules of `crates/conduit-openssh`:
+- Binary discovery & version check (`binary.rs`): executes `<ssh_bin> -V` (which OpenSSH prints to stderr), parses `OpenSSH_<major>.<minor>` (including `OpenSSH_for_Windows_<major>.<minor>`), enforces `>= 8.4` on Windows (for `SSH_ASKPASS_REQUIRE=force`), and returns a serializable `OpenSshBinaryInfo`.
+- Short space-free runtime dir (`runtime_dir.rs`): creates `<base>/rc-<short_hex>` with `0700` permissions on Unix (`$XDG_RUNTIME_DIR` on Linux if space-free and short enough for Unix socket path limits `<= 64` chars, else `/tmp`; short temp dir on macOS/Windows), with RAII `Drop` cleanup.
+- App-owned `known_hosts` (`known_hosts.rs`): deterministic `HostKeyAlias` (`rc-<hex>`) per `(hop_id, host, port)` and renderer writing `<alias> <public_key_openssh>\n` (`0600` on Unix) for all approved `HostKeyRecord`s with `public_key_openssh`.
+- Hardened `-F` config (`config.rs`): generates per-hop and target `Host` stanzas with `HostKeyAlias`, `UserKnownHostsFile`, `GlobalKnownHostsFile none`, `StrictHostKeyChecking yes`, `IdentitiesOnly yes`, `IdentityAgent <socket|none>`, `ControlMaster no`, `ControlPath none`, `UpdateHostKeys no`, `NumberOfPasswordPrompts 1`, `ServerAliveInterval`, `ServerAliveCountMax`, `AddressFamily`, `ForwardAgent`, and multi-hop `ProxyCommand` invoking `conduit-worker hop-proxy ...` (never `ProxyJump`).
+- Isolated local agent server (`agent_server.rs`): serves `conduit_ssh::ScopedAgent` via `conduit_ssh::agent_wire::serve` on a Unix domain socket (`0600` inside runtime dir) on `cfg(unix)` and via `tokio::net::windows::named_pipe::ServerOptions` on `cfg(windows)`.
 
 ## Scope
-- In: `crates/conduit-runtime/src/**`, `crates/conduit-runtime/tests/**`, `crates/conduit-ssh/src/agent.rs` (only to add `pub algorithm: String` to `SignAudit` and populate it in `ScopedAgent`)
-- Out: `crates/conduit-core/**`, `crates/conduit-vault/**`, `crates/conduit-ssh/**` (except `crates/conduit-ssh/src/agent.rs`), `crates/conduit-tray/**`, `src-tauri/**`, `docs/MASTER-PLAN.md`
+- In: `Cargo.toml`, `Cargo.lock`, `crates/conduit-openssh/**`
+- Out: `docs/MASTER-PLAN.md`, `../rusty-conduit-ssh/**`, `crates/conduit-core/**`, `crates/conduit-ssh/**`, `crates/conduit-runtime/**`, `src-tauri/**`
 
 ## Sub-tasks
-1. [done] Update `crates/conduit-runtime/src/runner.rs`: include `agent_forward_keys` in `needs_secrets`, resolve vaulted keys for opted-in hops into `ScopedAgent` with a `LogRingBuffer` audit callback (`[agent-audit]`), attach `agent_policy` to each opted-in hop's `ChannelPolicy`, start `AgentForwardRelay`s after `connect_chain`, and cleanly stop/drop them on `drop_connection` and `shutdown` — done when: `cargo test -p conduit-runtime --lib` exits 0
-2. [done] Add E2E test `scoped_agent_forwarding_exposes_only_assigned_keys_and_audits_logs` in `crates/conduit-runtime/tests/e2e_runtime.rs` verifying: locked vault parks an agent-forwarding session, after unlock the remote server sees only the assigned key, signs cleanly, and `[agent-audit]` appears in `manager.logs(id)` without leaking private key material — done when: `cargo test -p conduit-runtime --test e2e_runtime scoped_agent_forwarding` exits 0
-3. [done] Harden `crates/conduit-runtime/tests/e2e_runtime.rs` against transient `free_port()` port collisions (e.g., use OS-assigned distinct loopback ports or retry-safe port allocation so parallel tests never collide on the same ephemeral port) and verify 10 consecutive runs pass with 0 failures — done when: `cargo test -p conduit-runtime && cargo clippy --workspace --all-targets -- -D warnings` exits 0
+1. [done] Add `"crates/conduit-openssh"` to `Cargo.toml` workspace members and create `crates/conduit-openssh/Cargo.toml` (with `[[bin]] name = "conduit-worker" path = "src/bin/conduit-worker.rs"` stub, depending on `conduit-core`, `conduit-ssh`, `rusty-conduit-ssh`, `tokio` with `process`/`net`/`io-util`/`sync`/`time`/`rt`/`macros`, `serde`, `thiserror`, `sha2` or `ring`, `hex` or simple hex helper, `zeroize`, `libc` on unix) and `crates/conduit-openssh/src/lib.rs` — done when: `cargo check -p conduit-openssh` exits 0.
+2. [done] Implement `crates/conduit-openssh/src/binary.rs`: `OpenSshBinaryInfo { requested, resolved_path, version_raw, major, minor, supported, message }` (`Serialize`, `Deserialize`, `Clone`, `Debug`, `PartialEq`, `Eq`), `parse_openssh_version(&str) -> Option<(u32, u32)>`, `check_openssh_binary(ssh_bin: &str) -> OpenSshBinaryInfo`, and `check_version_for_platform(major, minor, is_windows)` requiring `>= (8, 4)` on Windows with clear upgrade guidance; add unit tests covering Linux/macOS/Windows OpenSSH version strings (including `8.3` rejected on Windows, `8.4`/`8.6`/`10.2` accepted) and a test invoking `/usr/bin/ssh` on this host — done when: `cargo test -p conduit-openssh binary` passes.
+3. [done] Implement `crates/conduit-openssh/src/runtime_dir.rs` (short space-free `0700` directory with RAII cleanup, verified path contains no spaces and is `<= 80` bytes on Unix) and `crates/conduit-openssh/src/known_hosts.rs` (deterministic `host_key_alias(hop_id, host, port) -> String`, `render_known_hosts(&KnownHostsStore, &[(hop_id, host, port)]) -> String`, `write_known_hosts(...)` writing `0600` file, never touching `~/.ssh/known_hosts`) with unit tests — done when: `cargo test -p conduit-openssh runtime_dir && cargo test -p conduit-openssh known_hosts` passes.
+4. [done] Implement `crates/conduit-openssh/src/config.rs`: hardened per-session `-F` generator writing `0600` config files for single-hop and multi-hop chains (`HostKeyAlias`, `UserKnownHostsFile`, `GlobalKnownHostsFile none`, `StrictHostKeyChecking yes`, `IdentitiesOnly yes`, `IdentityAgent`, `ControlMaster no`, `ControlPath none`, `UpdateHostKeys no`, `NumberOfPasswordPrompts 1`, `ServerAliveInterval`, `ServerAliveCountMax`, `AddressFamily`, `ForwardAgent`, `ProxyCommand` for multi-hop using `conduit-worker hop-proxy`, never `ProxyJump`, proper Windows backslash escaping for named-pipe `IdentityAgent` paths) with unit tests verifying every directive and asserting zero `~/.ssh` or `ProxyJump` strings — done when: `cargo test -p conduit-openssh config` passes.
+5. [done] Implement `crates/conduit-openssh/src/agent_server.rs`: `IsolatedAgentServer::start(runtime_dir, name, Arc<ScopedAgent>)` serving `conduit_ssh::agent_wire::serve` over a `0600` Unix domain socket on `cfg(unix)` and `tokio::net::windows::named_pipe` on `cfg(windows)`, with graceful shutdown handle and `endpoint_path() -> String`; add async tests connecting to the Unix socket and verifying `REQUEST_IDENTITIES`, `SIGN_REQUEST`, and `ADD_IDENTITY` rejection (`SSH_AGENT_FAILURE`) — done when: `cargo test -p conduit-openssh agent_server` passes.
 
 ## Verify
 ```sh
-cargo test -p conduit-ssh -p conduit-runtime && cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p conduit-openssh && cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 ## Escalate when
-- `SshChain` in `conduit-ssh` is missing a needed accessor for per-hop `Handle<HopHandler>` → stop, set Status: needs-human — reason: exact missing accessor in `conduit-ssh`
+- Adding a new crate dependency would pull in `openssl-sys` or `aws-lc-sys` (violating pure-Rust crypto requirement) → stop, set `Status: needs-human — reason: <dependency name>`
+- `ssh -V` is missing or behaves unexpectedly on this host → stop, set `Status: needs-human — reason: <observed output>`
 
 ## Log
 - (append-only, one line per event)
-- sub-task 1: read the phase-0001 agent API before editing and found SignAudit has no algorithm field; stopped with no code changes and escalated
-- planner approved Option A: added crates/conduit-ssh/src/agent.rs to Scope: In for SignAudit.algorithm and expanded Verify to include conduit-ssh; resumed sub-m3-phase-0002 from sub-task 1
-- sub-task 1: added SignAudit.algorithm; wired per-hop agents into RusshLink with [agent-audit] logging, fresh relays per connect, and teardown in drop_connection
-- sub-task 2: added scoped_agent_forwarding_exposes_only_assigned_keys_and_audits_logs covering locked vault, key scoping, signing, refusal audit, reconnect, and no key leakage
-- sub-task 3: replaced free_port in e2e_runtime.rs with a per-process counter in 20000-29999, below the OS ephemeral range, plus a bind probe
-- note for planner: a connected session keeps signing after the vault locks, because lock_vault leaves connected sessions up (src-tauri/src/controller.rs:463)
+- sub-task 1: added crates/conduit-openssh to the workspace with manifest, lib.rs and conduit-worker stub
+- sub-task 2: implemented binary.rs with version parsing, Windows >= 8.4 gate, timeout-guarded -V check
+- sub-task 3: implemented runtime_dir.rs and known_hosts.rs
+- sub-task 4: implemented config.rs hardened -F generator with value validation; added IdentityFile lines (none by default) so ssh cannot fall back to ~/.ssh/id_*
+- sub-task 5: implemented agent_server.rs with Unix socket and cfg(windows) named pipe; Windows branch not compiled on this host (target not installed)
+- phase verified; note for phase-0003: pass each hop's public key path in ConfigHop.identity_files or agent key auth fails
+- loopback sshd check of IdentitiesOnly with an isolated agent
 
 ## Evidence
 - (append-only: command → observed result)
-- `grep -rn -i "algorithm\|algo" crates/conduit-ssh/src/agent.rs crates/conduit-ssh/src/agent_relay.rs crates/conduit-ssh/src/agent_wire.rs` → no algorithm in SignAudit (agent.rs:59-64); only RSA flag handling in agent_wire.rs and test key generation in agent.rs
-- `grep -rn "SignAudit {" crates src-tauri --include=*.rs` (non-test paths) → the struct is built only at agent.rs:134 and agent.rs:153, so option A stays within agent.rs
-- `cargo test -p conduit-runtime --lib` → 48 passed, 0 failed
-- `cargo test -p conduit-runtime --test e2e_runtime scoped_agent_forwarding` → 1 passed, 0 failed
-- `cargo test -p conduit-runtime --test e2e_runtime` x10 consecutive → 10 of 10 runs passed, 8 passed and 0 failed each, no `Address already in use`
-- `cargo test -p conduit-ssh -p conduit-runtime` → exit 0 (runtime 48 + 8 E2E; ssh 63 + 5 agent loopback + 12 multihop)
-- `cargo clippy --workspace --all-targets -- -D warnings` → exit 0
+- cargo check -p conduit-openssh → exit 0; Cargo.lock has 0 openssl-sys/aws-lc-sys packages
+- cargo test -p conduit-openssh binary → 7 passed, includes real /usr/bin/ssh (OpenSSH_10.2p1)
+- cargo test -p conduit-openssh runtime_dir → 5 passed; cargo test -p conduit-openssh known_hosts → 5 passed
+- cargo test -p conduit-openssh config → 10 passed, includes real ssh -G parse of generated config
+- cargo test -p conduit-openssh agent_server → 6 passed
+- cargo test -p conduit-openssh && cargo clippy --workspace --all-targets -- -D warnings → exit 0, 33 tests passed, clippy clean
+- throwaway sshd + ssh-agent: IdentityFile none → exit 255 Permission denied (publickey); IdentityFile <key>.pub → exit 0

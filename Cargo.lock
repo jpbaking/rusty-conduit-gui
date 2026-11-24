@@ -949,10 +949,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "conduit-openssh"
+version = "0.1.0"
+dependencies = [
+ "conduit-core",
+ "conduit-ssh",
+ "conduit-vault",
+ "libc",
+ "ring",
+ "russh",
+ "rusty-conduit-ssh",
+ "serde",
+ "thiserror 2.0.21",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "conduit-runtime"
 version = "0.1.0"
 dependencies = [
  "conduit-core",
+ "conduit-openssh",
  "conduit-ssh",
  "conduit-vault",
  "libc",
@@ -4750,6 +4768,7 @@ version = "0.1.0"
 dependencies = [
  "arboard",
  "conduit-core",
+ "conduit-openssh",
  "conduit-runtime",
  "conduit-ssh",
  "conduit-tray",

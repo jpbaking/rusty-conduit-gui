@@ -12,6 +12,7 @@ import type {
   KeyView,
   LogLine,
   MitmCaInfo,
+  OpenSshBinaryInfo,
   PortConflict,
   PortConflictReport,
   SessionProfile,
@@ -203,6 +204,31 @@ function mockFilterTest(args?: Record<string, unknown>): FilterTestResult {
   return { valid: true, allowed, reason: `preview: destination ${target} ${matched ? "matches" : "does not match"} the rules`, rule_errors };
 }
 
+/** Only a program named `ssh` exists in the preview. */
+function mockOpensshCheck(args?: Record<string, unknown>): OpenSshBinaryInfo {
+  const requested = String(args?.sshBin ?? "").trim() || "ssh";
+  if (requested !== "ssh" && !requested.endsWith("/ssh")) {
+    return {
+      requested,
+      resolved_path: null,
+      version_raw: null,
+      major: null,
+      minor: null,
+      supported: false,
+      message: `OpenSSH binary "${requested}" was not found.`,
+    };
+  }
+  return {
+    requested,
+    resolved_path: requested === "ssh" ? "/usr/bin/ssh" : requested,
+    version_raw: "OpenSSH_9.6p1, OpenSSL 3.0.13 30 Jan 2024",
+    major: 9,
+    minor: 6,
+    supported: true,
+    message: "OpenSSH 9.6 is supported.",
+  };
+}
+
 function dispatch(command: string, args?: Record<string, unknown>): unknown {
   switch (command) {
     case "shell_ready":
@@ -384,6 +410,8 @@ function dispatch(command: string, args?: Record<string, unknown>): unknown {
         expired: false,
         days_remaining: 90,
       } satisfies MitmCaInfo;
+    case "check_openssh_binary":
+      return mockOpensshCheck(args);
     case "export_config": {
       const encrypted = Boolean(args?.includeSecrets);
       return {

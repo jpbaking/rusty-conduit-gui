@@ -561,6 +561,10 @@ pub struct HostKeyRecord {
     #[serde(default)]
     pub first_seen: Timestamp,
     pub approved: bool,
+    /// `<algorithm> <base64>`, for rendering an OpenSSH `known_hosts` line. Absent on pins
+    /// recorded before this field existed.
+    #[serde(default)]
+    pub public_key_openssh: Option<String>,
 }
 
 /// One app-owned known_hosts entry: the `(hop_id, host, port)` key and its record.
@@ -610,6 +614,32 @@ fn default_host_port() -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_key_record_without_public_key_deserializes() {
+        let json = r#"{
+            "algorithm": "ssh-ed25519",
+            "fingerprint_sha256": "SHA256:abc",
+            "first_seen": 1,
+            "approved": true
+        }"#;
+        let record: HostKeyRecord = serde_json::from_str(json).unwrap();
+        assert!(record.approved);
+        assert_eq!(record.public_key_openssh, None);
+    }
+
+    #[test]
+    fn host_key_record_public_key_round_trips() {
+        let record = HostKeyRecord {
+            algorithm: "ssh-ed25519".into(),
+            fingerprint_sha256: "SHA256:abc".into(),
+            first_seen: Timestamp(1),
+            approved: true,
+            public_key_openssh: Some("ssh-ed25519 AAAAtest".into()),
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        assert_eq!(serde_json::from_str::<HostKeyRecord>(&json).unwrap(), record);
+    }
 
     #[test]
     fn hop_entry_without_agent_forward_fields_deserializes() {

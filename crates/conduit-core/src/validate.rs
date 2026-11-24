@@ -80,22 +80,61 @@ fn reverse_enabled(profile: &SessionProfile) -> bool {
     profile.reverse.reverse_http_port != 0 || profile.reverse.reverse_socks_port != 0
 }
 
-/// SSH flags that let a compromised target or the remote escape the GUI's sandbox. These are
-/// never permitted in `extra_args`, regardless of the engine. Matching is dash- and
-/// `=value`-tolerant so `-F`, `--IdentityFile=/path`, and the bare long form all match.
-const ISOLATION_DENYLIST: &[&str] = &[
-    "F", "J", "i", "ProxyCommand", "ProxyJump", "IdentityAgent", "IdentityFile",
-    "UserKnownHostsFile", "GlobalKnownHostsFile", "StrictHostKeyChecking", "ControlPath",
-    "ControlMaster", "ForwardAgent", "Include",
+/// Short `ssh` flags that break tunnel isolation. Case-sensitive, as `ssh` treats them.
+const DENIED_SHORT_FLAGS: &[&str] = &["F", "J", "i", "O", "S", "A", "a", "W"];
+
+/// `ssh_config` options that break tunnel isolation. Matched case-insensitively, as `ssh` does.
+const DENIED_OPTIONS: &[&str] = &[
+    "ProxyCommand", "ProxyJump", "IdentityAgent", "IdentityFile", "UserKnownHostsFile",
+    "GlobalKnownHostsFile", "StrictHostKeyChecking", "ControlPath", "ControlMaster",
+    "ControlPersist", "ForwardAgent", "Include", "LocalCommand", "PermitLocalCommand",
+    "RemoteCommand", "KnownHostsCommand", "UpdateHostKeys", "Host", "Match",
 ];
 
-/// Return the denylisted flag a token refers to, if any (`-F`, `--IdentityFile=..`, bare
-/// `ForwardAgent`, etc.).
+/// Short flags that consume the rest of their token as a value, from `ssh`'s getopt string.
+const VALUE_FLAGS: &str = "bceilmopBDEFIJLOPQRSwW";
+
+/// The denied option named by `text`, read the way `ssh_config` reads a keyword: leading
+/// space or quotes are skipped, and it ends at whitespace, `=`, or a quote.
+fn denied_option(text: &str) -> Option<&'static str> {
+    let keyword = text
+        .trim_start_matches([' ', '\t', '\r', '\n', '"'])
+        .split([' ', '\t', '\r', '\n', '=', '"'])
+        .next()
+        .unwrap_or("");
+    DENIED_OPTIONS.iter().copied().find(|o| o.eq_ignore_ascii_case(keyword))
+}
+
+/// Return the denylisted flag or option a token refers to, if any.
+///
+/// Every token is checked as a possible option, so the value after a separate `-o` is caught
+/// without tracking position. Short flags are walked like getopt, so `-Fconfig`, `-i/path`,
+/// and clusters such as `-vA` or `-voProxyCommand=x` all match.
 fn denylisted_flag(token: &str) -> Option<&'static str> {
-    let rest = token.strip_prefix("--").unwrap_or(token);
-    let rest = rest.strip_prefix('-').unwrap_or(rest);
-    let flag = rest.split('=').next().unwrap_or("");
-    ISOLATION_DENYLIST.iter().copied().find(|f| *f == flag)
+    let undashed = token
+        .strip_prefix("--")
+        .or_else(|| token.strip_prefix('-'))
+        .unwrap_or(token);
+    if let Some(option) = denied_option(undashed) {
+        return Some(option);
+    }
+    let name = undashed.split('=').next().unwrap_or("");
+    if let Some(flag) = DENIED_SHORT_FLAGS.iter().copied().find(|f| *f == name) {
+        return Some(flag);
+    }
+    let cluster = token.strip_prefix('-')?;
+    for (index, c) in cluster.char_indices() {
+        if let Some(flag) = DENIED_SHORT_FLAGS.iter().copied().find(|f| f.starts_with(c)) {
+            return Some(flag);
+        }
+        if c == 'o' {
+            return denied_option(&cluster[index + 1..]);
+        }
+        if VALUE_FLAGS.contains(c) {
+            return None;
+        }
+    }
+    None
 }
 
 /// Validate a [`SessionProfile`], returning the first `FATAL` problem found.
@@ -314,6 +353,83 @@ mod tests {
         let mut p = forward_profile();
         p.openssh.extra_args = vec!["-o".into(), "Compression=yes".into()];
         assert!(validate(&p).is_ok());
+    }
+
+    fn denied(args: &[&str]) -> bool {
+        let mut p = forward_profile();
+        p.openssh.extra_args = args.iter().map(ToString::to_string).collect();
+        matches!(validate(&p), Err(ValidateError::IsolationDenylist { .. }))
+    }
+
+    #[test]
+    fn denylist_rejects_short_flags_standalone_and_attached() {
+        for arg in [
+            "-F", "-Fconfig", "-J", "-Jjump", "-i", "-i/path", "-O", "-Ocheck", "-S",
+            "-S/tmp/ctl", "-A", "-a", "-W", "-Whost:22",
+        ] {
+            assert!(denied(&[arg]), "{arg} must be rejected");
+        }
+    }
+
+    #[test]
+    fn denylist_rejects_flags_inside_a_cluster() {
+        for arg in ["-vA", "-qa", "-vFconfig", "-vvi/path", "-CS/tmp/ctl", "-voProxyCommand=x"] {
+            assert!(denied(&[arg]), "{arg} must be rejected");
+        }
+    }
+
+    #[test]
+    fn denylist_rejects_every_option_in_every_form() {
+        for option in DENIED_OPTIONS {
+            let lower = option.to_lowercase();
+            let upper = option.to_uppercase();
+            for name in [*option, lower.as_str(), upper.as_str()] {
+                for arg in [
+                    format!("-o{name}=x"),
+                    format!("-o{name} x"),
+                    format!("-o {name}=x"),
+                    format!("-o\"{name}\" x"),
+                    name.to_string(),
+                    format!("{name}=x"),
+                    format!("-{name}"),
+                    format!("--{name}=x"),
+                ] {
+                    assert!(denied(&[&arg]), "{arg} must be rejected");
+                }
+                assert!(denied(&["-o", &format!("{name}=x")]), "-o {name}=x must be rejected");
+                assert!(denied(&["-o", &format!("{name} x")]), "-o '{name} x' must be rejected");
+                assert!(denied(&["-o", &format!(" {name}\t=x")]), "spaced {name} must be rejected");
+            }
+        }
+    }
+
+    #[test]
+    fn denylist_error_names_the_canonical_option() {
+        let mut p = forward_profile();
+        p.openssh.extra_args = vec!["-o".into(), "proxycommand=nc %h %p".into()];
+        assert!(matches!(
+            validate(&p),
+            Err(ValidateError::IsolationDenylist { flag: "ProxyCommand", .. })
+        ));
+    }
+
+    #[test]
+    fn denylist_allows_safe_arguments() {
+        for args in [
+            &["-o", "Compression=yes"][..],
+            &["-oCompression=yes"],
+            &["-o", "ServerAliveInterval 30"],
+            &["-v"],
+            &["-vvv"],
+            &["-C"],
+            &["-4"],
+            &["-p", "2222"],
+            &["-p2222"],
+            &["-lFoo"],
+            &["-c", "aes256-gcm@openssh.com"],
+        ] {
+            assert!(!denied(args), "{args:?} must be allowed");
+        }
     }
 
     #[test]

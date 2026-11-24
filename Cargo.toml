@@ -8,6 +8,7 @@ members = [
     "crates/conduit-core",
     "crates/conduit-vault",
     "crates/conduit-ssh",
+    "crates/conduit-openssh",
     "crates/conduit-runtime",
     "crates/conduit-tray",
     "src-tauri",
@@ -39,6 +40,10 @@ base64 = "0.22"
 pkcs8 = { version = "0.11", features = ["pem", "encryption"] }
 p256 = { version = "0.14", features = ["ecdsa"] }
 elliptic-curve = { version = "0.14" }
+
+# conduit-openssh: alias hashing, random runtime names, and Unix file flags.
+ring = "0.17"
+libc = "0.2"
 
 # Keep debug builds small and fast to compile.
 [profile.dev]

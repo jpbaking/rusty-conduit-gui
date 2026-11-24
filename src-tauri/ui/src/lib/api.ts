@@ -26,6 +26,7 @@ import type {
   MitmCaInfo,
   MitmCaMode,
   MitmPassphraseSource,
+  OpenSshBinaryInfo,
   PortConflictReport,
   RuntimeEvent,
   SecretMeta,
@@ -155,6 +156,8 @@ export const api = {
       passphraseRef: source.passphraseRef ?? null,
       passphraseFile: source.passphraseFile ?? null,
     }),
+  checkOpensshBinary: (sshBin?: string) =>
+    call<OpenSshBinaryInfo>("check_openssh_binary", { sshBin: sshBin ?? null }),
 
   // Config export and import.
   exportConfig: (path: string, includeSecrets = false, passphrase: string | null = null) =>

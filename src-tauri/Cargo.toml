@@ -19,6 +19,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
 conduit-core = { path = "../crates/conduit-core" }
+conduit-openssh = { path = "../crates/conduit-openssh" }
 conduit-runtime = { path = "../crates/conduit-runtime" }
 conduit-ssh = { path = "../crates/conduit-ssh" }
 conduit-tray = { path = "../crates/conduit-tray" }

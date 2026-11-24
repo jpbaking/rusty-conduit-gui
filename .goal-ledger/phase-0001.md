@@ -1,55 +1,58 @@
-# phase-0001 — conduit-core + conduit-ssh: scoped agent forwarding wire protocol & loopback tests
+# phase-0001 — Hardening follow-ups & host-key public-key storage
 
 - Status: done
 - Owner: executor
 - Depends on: none
-- Goal: Extend `HopEntry` with per-hop `agent_forward_keys` / `agent_forward_command` (`#[serde(default)]`) and implement `AgentForwardRelay` in `conduit-ssh` serving the read-only OpenSSH `ssh-agent` wire protocol over `ScopedAgent` with signature audit callbacks and loopback tests.
-- Done when: `cargo test -p conduit-core -p conduit-ssh && cargo clippy --workspace --all-targets -- -D warnings` exits 0 with a loopback test proving an opted-in hop exposes ONLY its explicitly assigned key(s) over `auth-agent@openssh.com`, refuses mutating agent requests, and invokes the audit callback on every sign request.
-- Pattern to follow: `crates/conduit-ssh/src/agent.rs` and `crates/conduit-ssh/src/reverse.rs`
+- Goal: Close Phase 3 Gate D hardening items (attached/case-insensitive `extra_args` denylist in Rust+TS, plain-import path neutralization) and add backwards-compatible `public_key_openssh` to `HostKeyRecord` for Phase 4 `known_hosts` rendering.
+- Done when: `cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && (cd src-tauri/ui && npm run check)` exits 0 with new unit tests covering attached/case-variant `extra_args`, plain-import sanitization, and `HostKeyRecord.public_key_openssh` roundtrips.
+- Pattern to follow: `crates/conduit-core/src/validate.rs:86-100` (denylist), `src-tauri/ui/src/lib/validate.ts:98-121` (TS mirror), `src-tauri/src/controller/export.rs:234-257` (untrusted plain-import stripping), `crates/conduit-ssh/src/host_key.rs:14-35` (`ObservedHostKey`).
 
 ## Context
-`conduit-ssh` already has `ScopedAgent` (sealed read-only key set with `list_identities`, `sign`, and audit callback) and `HopHandler` (which accepts `server_channel_open_agent_forward` only when `ChannelPolicy::agent_channels` is `Some`).
-Key decisions already made:
-- Backwards-compatible `conduit-core` schema: add `#[serde(default)] pub agent_forward_keys: Vec<KeyId>` and `#[serde(default)] pub agent_forward_command: Option<String>` to `HopEntry` so existing `config.json` files deserialize cleanly.
-- OpenSSH `ssh-agent` wire protocol (`draft-miller-ssh-agent`): 4-byte big-endian length prefix + 1-byte message type + payload:
-  - `SSH_AGENTC_REQUEST_IDENTITIES` (11) → `SSH_AGENT_IDENTITIES_ANSWER` (12) containing ONLY the keys assigned to that hop's `ScopedAgent`.
-  - `SSH_AGENTC_SIGN_REQUEST` (13) → `SSH_AGENT_SIGN_RESPONSE` (14) on valid signature, or `SSH_AGENT_FAILURE` (5) if key is not in `ScopedAgent` or signing fails; ALWAYS invokes `ScopedAgent`'s audit callback.
-  - Every other message type (including `ADD_IDENTITY` 17, `REMOVE_IDENTITY` 18, `REMOVE_ALL` 19, `LOCK` 22, `UNLOCK` 23, `ADD_ID_CONSTRAINED` 25) → `SSH_AGENT_FAILURE` (5), never mutating state.
-  - Enforce a sane max packet length (e.g., 256 KiB) to prevent memory exhaustion from a hostile remote host.
-- Tunnel-only SSH (`ssh -N`) does not open a session channel, so `AgentForwardRelay::start(handle, hop_index, agent, agent_channels, remote_command)` opens a session channel on that hop's `Handle<HopHandler>`, calls `request_agent_forwarding(true)` (and runs `remote_command` if provided, or keeps the session channel alive cleanly), and spawns a relay task serving every accepted `Channel<Msg>` from `agent_channels` over `ScopedAgent`.
+Phase 3 Gate D identified two security hardening follow-ups that must land before OpenSSH execution goes live:
+1. `conduit-core`'s `extra_args` denylist only matched whole case-sensitive tokens (missing `-oProxyCommand=x`, `-Fconfig`, `-i/path`, `-O`, `-S`, `-A`, `-a`, case-insensitive option names, and `-o` followed by a forbidden option in the next token). Both Rust and TS must enforce the hardened denylist identically.
+2. Unauthenticated plain config imports currently preserve `openssh.ssh_bin` and `logging.http_access_log`/`socks_log` paths, which would let a tampered plain export point `ssh_bin` at an arbitrary binary or overwrite arbitrary files via log paths. Neutralize them on plain imports unless unchanged from an existing trusted session with the same ID.
+3. OpenSSH `UserKnownHostsFile` requires `<alias> <algorithm> <base64_key>` (not just `SHA256:` fingerprint). Adding `#[serde(default)] pub public_key_openssh: Option<String>` to `HostKeyRecord` (and threading it through `ObservedHostKey`, `SshError::HostKeyUnknown`, `HostKeyPrompt`, and `approve_host_key`) keeps existing `known_hosts.json` files compatible while giving Phase 4 the exact public key blob.
 
 ## Scope
-- In: `crates/conduit-core/src/model.rs`, `crates/conduit-ssh/src/**`, `crates/conduit-ssh/tests/**`, `crates/conduit-ssh/Cargo.toml`, `Cargo.lock`, `src-tauri/src/controller/test_support.rs` (only to add `..Default::default()` to the `HopEntry` test helper literal)
-- Out: `crates/conduit-vault/**`, `crates/conduit-runtime/**`, `crates/conduit-tray/**`, `src-tauri/**` (except `src-tauri/src/controller/test_support.rs`), `docs/MASTER-PLAN.md`
+- In: `crates/conduit-core/src/validate.rs`, `crates/conduit-core/src/model.rs`, `crates/conduit-core/src/storage.rs`, `crates/conduit-ssh/src/host_key.rs`, `crates/conduit-ssh/src/error.rs`, `crates/conduit-ssh/src/handler.rs`, `crates/conduit-ssh/src/chain/tests.rs`, `crates/conduit-ssh/tests/common/mod.rs`, `crates/conduit-ssh/tests/loopback_multihop.rs`, `crates/conduit-runtime/src/state.rs`, `crates/conduit-runtime/src/runner.rs`, `crates/conduit-runtime/src/manager.rs`, `crates/conduit-runtime/tests/e2e_runtime.rs`, `crates/conduit-tray/src/model.rs`, `src-tauri/src/controller.rs`, `src-tauri/src/controller/export.rs`, `src-tauri/src/controller/sessions.rs`, `src-tauri/src/controller/test_support.rs`, `src-tauri/ui/src/lib/validate.ts`, `src-tauri/ui/src/lib/types.ts`, `src-tauri/ui/src/lib/components/LoggingAdvancedTab.svelte`
+- Out: `docs/MASTER-PLAN.md`, `../rusty-conduit-ssh/**`, `crates/conduit-openssh/**`, `crates/conduit-vault/**`
 
 ## Sub-tasks
-1. [done] Add `#[serde(default)] pub agent_forward_keys: Vec<KeyId>` and `#[serde(default)] pub agent_forward_command: Option<String>` to `HopEntry` in `crates/conduit-core/src/model.rs` and add a serde backwards-compatibility unit test confirming old `HopEntry` JSON without those fields deserializes cleanly — done when: `cargo test -p conduit-core` exits 0
-2. [done] Implement `crates/conduit-ssh/src/agent_wire.rs` encoding/decoding `ssh-agent` wire messages (`REQUEST_IDENTITIES`, `SIGN_REQUEST`, `IDENTITIES_ANSWER`, `SIGN_RESPONSE`, `FAILURE`), enforcing max packet size, delegating exclusively to `ScopedAgent`, and refusing all mutating/unknown opcodes — done when: `cargo test -p conduit-ssh agent_wire` exits 0
-3. [done] Implement `AgentForwardRelay` and `agent_policy(capacity)` in `crates/conduit-ssh/src/agent_relay.rs` (wired into `lib.rs` and `SshChain::hop(index)` accessor) opening the session channel + `agent_forward_request` (+ optional `exec` remote command) on an opted-in hop and serving accepted agent channels via `agent_wire` — done when: `cargo test -p conduit-ssh agent_relay` exits 0
-4. [done] Extend `crates/conduit-ssh/tests/common/mod.rs` and add loopback integration tests in `crates/conduit-ssh/tests/loopback_agent_forward.rs` proving: (a) opted-in hop exposes ONLY its assigned key(s) (1 of 2 keys) and completes a real signature roundtrip verified against the public key, (b) mutating agent opcodes return `SSH_AGENT_FAILURE`, (c) audit callback records the signature event, and (d) non-opted-in hops reject `server_channel_open_agent_forward` — done when: `cargo test -p conduit-core -p conduit-ssh && cargo clippy --workspace --all-targets -- -D warnings` exits 0
+1. [done] Harden `crates/conduit-core/src/validate.rs` `extra_args` denylist: reject forbidden short flags both standalone and with attached values (`-F`, `-Fconfig`, `-J`, `-Jjump`, `-i`, `-i/path`, `-O`, `-Ocheck`, `-S`, `-S/tmp/ctl`, `-A`, `-a`, `-W`), reject `-o<Option>=...` / `-o<Option> ...` and `-o` followed by `<Option>=...` or `<Option> ...` as well as bare/dashed `<Option>` forms case-insensitively for `ProxyCommand`, `ProxyJump`, `IdentityAgent`, `IdentityFile`, `UserKnownHostsFile`, `GlobalKnownHostsFile`, `StrictHostKeyChecking`, `ControlPath`, `ControlMaster`, `ControlPersist`, `ForwardAgent`, `Include`, `LocalCommand`, `PermitLocalCommand`, `RemoteCommand`, `KnownHostsCommand`, `UpdateHostKeys`, `Host`, `Match`, while still allowing safe options like `["-o", "Compression=yes"]` or `["-oCompression=yes"]` or `["-v"]`; add thorough unit tests — done when: `cargo test -p conduit-core` passes with tests for all attached, case-variant, `-o` pair, and safe-arg cases.
+2. [done] Mirror the exact hardened `extra_args` denylist in `src-tauri/ui/src/lib/validate.ts` (updating `denylistedFlag` / adding a sequence-aware check for `-o` followed by a forbidden option, and updating `opensshErrors` + `LoggingAdvancedTab.svelte` chip highlighting) — done when: `(cd src-tauri/ui && npm run check)` passes with 0 errors.
+3. [done] Neutralize untrusted paths on plain config import in `src-tauri/src/controller/export.rs`: in `strip_untrusted_credentials` (or a sibling helper called from `import_plain`), for each incoming session reset `openssh.ssh_bin` to `"ssh"` unless an existing session with the same `id` already has the exact same `openssh.ssh_bin`, and reset `logging.http_access_log` and `logging.socks_log` to `None` unless the existing session with the same `id` already has the exact same path; keep encrypted bundle imports preserving these fields; add unit tests in `export.rs` verifying both plain-import neutralization and encrypted-import preservation — done when: `cargo test -p rusty-conduit-ssh-gui export` passes.
+4. [done] Add `#[serde(default)] pub public_key_openssh: Option<String>` to `HostKeyRecord` in `crates/conduit-core/src/model.rs`, populate `public_key_openssh: Option<String>` on `ObservedHostKey` (`crates/conduit-ssh/src/host_key.rs`, formatted via `key.to_openssh()` so it holds `<alg> <base64>`), carry it through `SshError::HostKeyUnknown`, `HostKeyPrompt` (`crates/conduit-runtime/src/state.rs`), `runner.rs`, and `SessionManager::approve_host_key` (`crates/conduit-runtime/src/manager.rs`), and update all struct literal sites in tests and `src-tauri/ui/src/lib/types.ts` — done when: `cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && (cd src-tauri/ui && npm run check)` passes with a deserialization backwards-compat test for `HostKeyRecord` without `public_key_openssh` and a test verifying `approve_host_key` stores `public_key_openssh`.
 
 ## Verify
 ```sh
-cargo test -p conduit-core -p conduit-ssh && cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && (cd src-tauri/ui && npm run check)
 ```
 
 ## Escalate when
-- `russh` 0.65.4 `Channel` lacks `agent_forward_request` or server-side `channel_open_agent_forward` cannot be triggered in the test harness → stop, set Status: needs-human — reason: exact `russh` 0.65.4 API gap
+- `russh::keys::PublicKey` does not expose `.to_openssh()` or equivalent OpenSSH public-key formatting method in `russh` 0.65 → stop, set `Status: needs-human — reason: <exact method signature gap>`
+- Any file outside `Scope: In` fails to compile due to the `HostKeyRecord` or `HostKeyPrompt` field addition → stop, set `Status: needs-human — reason: <list exact file paths>`
 
 ## Log
 - (append-only, one line per event)
-- sub-task 1: added agent_forward_keys and agent_forward_command to HopEntry plus a serde backwards-compatibility test in crates/conduit-core/src/model.rs
-- escalated before sub-task 2: required workspace clippy cannot pass without editing src-tauri, which is Scope: Out; sub-tasks 2-4 not started
-- planner approved adding src-tauri/src/controller/test_support.rs to Scope: In (for ..Default::default() on HopEntry literal) and confirmed russh 0.65.4 uses Channel::agent_forward(want_reply) and server channel_open_agent; resumed phase-0001 from sub-task 2
-- sub-task 2: added agent_wire.rs with framing, a 256 KiB limit, read-only dispatch to ScopedAgent, and audit of unparseable sign requests
-- sub-task 3: added agent_relay.rs (AgentForwardRelay, agent_policy) and SshChain::hop(index), using russh Channel::agent_forward as approved
-- sub-task 4: extended the test harness and added 5 loopback tests; added the approved `..Default::default()` to test_support.rs; moved the dead_code allowance onto `mod common` in both conduit-ssh test binaries
+- sub-task 1: hardened the Rust denylist (short flags, getopt clusters, case-insensitive options, quoted and spaced keywords) and added tests. Every token is checked as a possible option, so the value after a separate `-o` is caught without position tracking.
+- sub-task 2: mirrored the denylist in validate.ts with ASCII-only case folding. LoggingAdvancedTab.svelte needed no edit because its chips and opensshErrors already call denylistedFlag per token.
+- sub-task 3: added neutralize_untrusted_paths to plain import only, with plain and encrypted tests.
+- sub-task 4: applied the field to all Scope: In files, then stopped on the phase's escalation rule because two files outside Scope: In no longer compile.
+- planner unblocked: added `crates/conduit-tray/src/model.rs` and `src-tauri/src/controller.rs` to `Scope: In` so the two test literals can be updated with `public_key_openssh: None,`. Leaving `-I`/`PKCS11Provider`/`SecurityKeyProvider` allowed to preserve FIDO2/hardware-key use case per Master Plan Section 3.1.
+- sub-task 4: added `public_key_openssh: None,` to the two test literals the planner brought into scope (conduit-tray model.rs, src-tauri controller.rs).
+- phase verified and closed.
 
 ## Evidence
 - (append-only: command → observed result)
-- cargo test -p conduit-core → exit 0, 34 passed, 0 failed, including model::tests::hop_entry_without_agent_forward_fields_deserializes
-- cargo clippy --workspace --all-targets --keep-going -- -D warnings → exit 101, only error: E0063 missing fields agent_forward_command and agent_forward_keys at src-tauri/src/controller/test_support.rs:90:5
-- cargo test -p conduit-ssh agent_wire → exit 0, 8 passed
-- cargo test -p conduit-ssh agent_relay → exit 0, 3 passed
-- cargo test -p conduit-ssh --test loopback_agent_forward (10 repeats) → 0 failures, 5 tests each
-- cargo test -p conduit-core -p conduit-ssh && cargo clippy --workspace --all-targets -- -D warnings → exit 0; 34 core, 63 ssh unit, 5 agent loopback, 12 multihop loopback passed
+- `cargo test -p conduit-core --lib` (after sub-task 1) → 39 passed, 0 failed
+- `(cd src-tauri/ui && npm run check)` → 158 files, 0 errors, 0 warnings
+- `node --experimental-strip-types parity.mts` (scratch script, TS denylist) → 28 denied, 15 allowed, no mismatches
+- `cargo test -p rusty-conduit-ssh-gui export` (after sub-task 3, before sub-task 4) → 17 passed, 0 failed
+- `cargo test -p conduit-core -p conduit-ssh -p conduit-runtime` (after sub-task 4) → all passed (41, 48, 8, 64, 5, 12)
+- `cargo clippy -p conduit-core -p conduit-ssh -p conduit-runtime --all-targets -- -D warnings` → clean
+- `cargo check --workspace --all-targets --keep-going` → E0063 missing `public_key_openssh` at crates/conduit-tray/src/model.rs:509 and src-tauri/src/controller.rs:640
+- Phase `## Verify` → not run to completion: the workspace tests do not compile until the blocker is resolved
+- `cargo check` blocker resolved: both literals updated at crates/conduit-tray/src/model.rs:515 and src-tauri/src/controller.rs:644
+- `cargo test -p rusty-conduit-ssh-gui export` (after sub-task 4) → 17 passed, 0 failed
+- Phase `## Verify`: `cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && (cd src-tauri/ui && npm run check)` → exit 0; 345 tests passed, 0 failed; clippy clean; 158 files, 0 errors, 0 warnings
+- Correction to the line numbers above: `grep -n "public_key_openssh: None"` → crates/conduit-tray/src/model.rs:516 and src-tauri/src/controller.rs:645

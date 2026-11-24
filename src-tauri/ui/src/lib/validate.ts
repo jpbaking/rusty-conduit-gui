@@ -94,11 +94,11 @@ export function filterRuleError(raw: string): string | null {
   return domainError(domain, raw);
 }
 
-/** Same list as `ISOLATION_DENYLIST` in `conduit-core`. */
-const ISOLATION_DENYLIST: readonly string[] = [
-  "F",
-  "J",
-  "i",
+/** Same list as `DENIED_SHORT_FLAGS` in `conduit-core`. Case-sensitive. */
+const DENIED_SHORT_FLAGS: readonly string[] = ["F", "J", "i", "O", "S", "A", "a", "W"];
+
+/** Same list as `DENIED_OPTIONS` in `conduit-core`. Matched without regard to ASCII case. */
+const DENIED_OPTIONS: readonly string[] = [
   "ProxyCommand",
   "ProxyJump",
   "IdentityAgent",
@@ -108,16 +108,56 @@ const ISOLATION_DENYLIST: readonly string[] = [
   "StrictHostKeyChecking",
   "ControlPath",
   "ControlMaster",
+  "ControlPersist",
   "ForwardAgent",
   "Include",
+  "LocalCommand",
+  "PermitLocalCommand",
+  "RemoteCommand",
+  "KnownHostsCommand",
+  "UpdateHostKeys",
+  "Host",
+  "Match",
 ];
 
-/** Mirrors `denylisted_flag`: tolerates `-`, `--`, and an `=value` suffix. */
+/** Same as `VALUE_FLAGS` in `conduit-core`: short flags that take the rest of their token. */
+const VALUE_FLAGS = "bceilmopBDEFIJLOPQRSwW";
+
+// ASCII only, like Rust's `eq_ignore_ascii_case`. `toLowerCase` would fold the Kelvin sign to k.
+const asciiLower = (text: string): string => text.replace(/[A-Z]/g, (c) => c.toLowerCase());
+
+/** Mirrors `denied_option`: reads a keyword the way `ssh_config` does. */
+function deniedOption(text: string): string | null {
+  const keyword = text.replace(/^[ \t\r\n"]+/, "").split(/[ \t\r\n="]/)[0] ?? "";
+  const lowered = asciiLower(keyword);
+  return DENIED_OPTIONS.find((option) => asciiLower(option) === lowered) ?? null;
+}
+
+/**
+ * Mirrors `denylisted_flag`. Every token is checked as a possible option, so the value after a
+ * separate `-o` is caught without tracking position. Short flags are walked like getopt.
+ */
 export function denylistedFlag(token: string): string | null {
-  const noLong = token.startsWith("--") ? token.slice(2) : token;
-  const rest = noLong.startsWith("-") ? noLong.slice(1) : noLong;
-  const flag = rest.split("=")[0] ?? "";
-  return ISOLATION_DENYLIST.includes(flag) ? flag : null;
+  const undashed = token.startsWith("--")
+    ? token.slice(2)
+    : token.startsWith("-")
+      ? token.slice(1)
+      : token;
+  const option = deniedOption(undashed);
+  if (option) return option;
+  const name = undashed.split("=")[0] ?? "";
+  if (DENIED_SHORT_FLAGS.includes(name)) return name;
+  if (!token.startsWith("-")) return null;
+
+  const cluster = token.slice(1);
+  let index = 0;
+  for (const c of cluster) {
+    if (DENIED_SHORT_FLAGS.includes(c)) return c;
+    index += c.length;
+    if (c === "o") return deniedOption(cluster.slice(index));
+    if (VALUE_FLAGS.includes(c)) return null;
+  }
+  return null;
 }
 
 const REDACTED = "<redacted>";

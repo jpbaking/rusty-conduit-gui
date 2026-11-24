@@ -39,6 +39,8 @@ const BUNDLE_RECORD_ID: &[u8] = b"conduit-config-bundle";
 const BUNDLE_RECORD_TYPE: &[u8] = b"config-bundle-v1";
 const SALT_LEN: usize = 16;
 const MAX_IMPORT_BYTES: u64 = 64 * 1024 * 1024;
+/// What an untrusted `openssh.ssh_bin` is reset to.
+const DEFAULT_SSH_BIN: &str = "ssh";
 
 // An import file chooses its own Argon2 cost, so a hostile one must not be able to hang the app.
 const MAX_ARGON_MEMORY_KIB: u32 = 1024 * 1024;
@@ -254,6 +256,24 @@ fn strip_untrusted_credentials(incoming: &mut AppConfig, current: &AppConfig) ->
         }
     }
     removed
+}
+
+/// Resets paths a plain file could use to run a chosen program or overwrite a chosen file,
+/// unless the session with the same id already holds that exact value.
+fn neutralize_untrusted_paths(incoming: &mut AppConfig, current: &AppConfig) {
+    for session in &mut incoming.sessions {
+        let existing = current.sessions.iter().find(|s| s.id == session.id);
+        if existing.map(|e| e.openssh.ssh_bin.as_str()) != Some(session.openssh.ssh_bin.as_str()) {
+            session.openssh.ssh_bin = DEFAULT_SSH_BIN.into();
+        }
+        let logging = existing.map(|e| &e.logging);
+        if logging.and_then(|l| l.http_access_log.as_ref()) != session.logging.http_access_log.as_ref() {
+            session.logging.http_access_log = None;
+        }
+        if logging.and_then(|l| l.socks_log.as_ref()) != session.logging.socks_log.as_ref() {
+            session.logging.socks_log = None;
+        }
+    }
 }
 
 /// Merges hosts and sessions into `config`, returning the counts and the sessions it changed.
@@ -524,6 +544,7 @@ impl AppController {
         incoming.keys.clear();
         let (summary, changed) = self.mutate_config(move |config| {
             let removed = strip_untrusted_credentials(&mut incoming, config);
+            neutralize_untrusted_paths(&mut incoming, config);
             let (mut summary, changed) = merge(config, incoming, replace, true);
             summary.credentials_removed += removed;
             Ok((summary, changed))
@@ -767,6 +788,7 @@ mod tests {
         HostKeyRecord {
             algorithm: "ssh-ed25519".into(),
             fingerprint_sha256: fingerprint.into(),
+            public_key_openssh: None,
             first_seen: Timestamp(1),
             approved: true,
         }
@@ -1045,6 +1067,88 @@ mod tests {
         assert_eq!(hop.host.host, "attacker.example");
         assert!(hop.host.auth.is_empty());
         assert!(hop.agent_forward_keys.is_empty());
+    }
+
+    /// Gives the seeded session a custom program and both log paths.
+    fn set_paths(c: &AppController, id: Uuid) {
+        let mut session = c.config_snapshot().sessions.into_iter().find(|s| s.id == id).unwrap();
+        session.openssh.ssh_bin = "/opt/trusted/ssh".into();
+        session.logging.http_access_log = Some("/var/tmp/http.log".into());
+        session.logging.socks_log = Some("/var/tmp/socks.log".into());
+        c.upsert_session(session).unwrap();
+    }
+
+    #[tokio::test]
+    async fn export_plain_import_neutralizes_paths_on_a_fresh_install() {
+        let source_dir = TempDir::new();
+        let c = unlocked(&source_dir).await;
+        let seeded = seed(&c);
+        set_paths(&c, seeded.session);
+        let path = source_dir.path().join("plain.json");
+        c.export_config(&path, false, None).unwrap();
+
+        let target_dir = TempDir::new();
+        let t = unlocked(&target_dir).await;
+        t.import_config(&path, None, false).unwrap();
+        let config = t.config_snapshot();
+        let session = config.sessions.iter().find(|s| s.id == seeded.session).unwrap();
+        assert_eq!(session.openssh.ssh_bin, "ssh");
+        assert_eq!(session.logging.http_access_log, None);
+        assert_eq!(session.logging.socks_log, None);
+    }
+
+    #[tokio::test]
+    async fn export_plain_reimport_keeps_unchanged_paths() {
+        let dir = TempDir::new();
+        let c = unlocked(&dir).await;
+        let seeded = seed(&c);
+        set_paths(&c, seeded.session);
+        let before = c.config_snapshot();
+        let path = dir.path().join("plain.json");
+        c.export_config(&path, false, None).unwrap();
+
+        c.import_config(&path, None, true).unwrap();
+        assert_eq!(c.config_snapshot(), before);
+    }
+
+    #[tokio::test]
+    async fn export_edited_plain_file_cannot_change_paths() {
+        let dir = TempDir::new();
+        let c = unlocked(&dir).await;
+        let seeded = seed(&c);
+        set_paths(&c, seeded.session);
+        let path = dir.path().join("plain.json");
+        c.export_config(&path, false, None).unwrap();
+        edit_json(&path, |v| {
+            v["config"]["sessions"][0]["openssh"]["ssh_bin"] = json!("/tmp/evil");
+            v["config"]["sessions"][0]["logging"]["http_access_log"] = json!("/home/victim/.bashrc");
+            v["config"]["sessions"][0]["logging"]["socks_log"] = json!("/home/victim/.profile");
+        });
+
+        c.import_config(&path, None, true).unwrap();
+        let config = c.config_snapshot();
+        let session = config.sessions.iter().find(|s| s.id == seeded.session).unwrap();
+        assert_eq!(session.openssh.ssh_bin, "ssh");
+        assert_eq!(session.logging.http_access_log, None);
+        assert_eq!(session.logging.socks_log, None);
+    }
+
+    #[tokio::test]
+    async fn export_encrypted_import_preserves_paths() {
+        let source_dir = TempDir::new();
+        let c = unlocked(&source_dir).await;
+        let seeded = seed(&c);
+        set_paths(&c, seeded.session);
+        let path = bundle(&c, &source_dir);
+
+        let target_dir = TempDir::new();
+        let t = unlocked(&target_dir).await;
+        t.import_config(&path, pass(), false).unwrap();
+        let config = t.config_snapshot();
+        let session = config.sessions.iter().find(|s| s.id == seeded.session).unwrap();
+        assert_eq!(session.openssh.ssh_bin, "/opt/trusted/ssh");
+        assert_eq!(session.logging.http_access_log, Some("/var/tmp/http.log".into()));
+        assert_eq!(session.logging.socks_log, Some("/var/tmp/socks.log".into()));
     }
 
     #[tokio::test]

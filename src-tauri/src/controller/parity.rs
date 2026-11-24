@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use conduit_core::{MitmCaMode, SecretRef, ValidateError};
+use conduit_openssh::OpenSshBinaryInfo;
 use conduit_vault::VaultError;
 use rusty_conduit_ssh::config::Config;
 use rusty_conduit_ssh::filter::{FilterRule, HostFilter};
@@ -25,6 +26,8 @@ use super::{AppController, AppError, SecretInput};
 const CONFLICT_SESSION: &str = "session";
 /// `kind` of a conflict with a socket already bound on this machine.
 const CONFLICT_OS_SOCKET: &str = "os_socket";
+/// The program used when a session does not name one.
+const DEFAULT_SSH_BIN: &str = "ssh";
 
 /// One reason a port cannot be used.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -77,6 +80,16 @@ pub struct MitmCaInfo {
     pub expired: bool,
     /// Whole days until expiry; negative once expired.
     pub days_remaining: i64,
+}
+
+/// Checks the configured `ssh` program. A missing or blank value means the default, `ssh`.
+pub fn check_openssh_binary(ssh_bin: Option<String>) -> OpenSshBinaryInfo {
+    let requested = ssh_bin
+        .as_deref()
+        .map(str::trim)
+        .filter(|bin| !bin.is_empty())
+        .unwrap_or(DEFAULT_SSH_BIN);
+    conduit_openssh::check_openssh_binary(requested)
 }
 
 /// Two binds collide on the same IP, or when either listens on all interfaces.

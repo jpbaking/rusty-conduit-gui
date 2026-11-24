@@ -17,7 +17,7 @@ use uuid::Uuid;
 use crate::events::{EventBus, RuntimeEvent, DEFAULT_EVENT_CAPACITY};
 use crate::logs::{LogRingBuffer, DEFAULT_LOG_CAPACITY};
 use crate::runner::{
-    run_session, Control, Engine, RusshEngine, SessionContext, SharedListeners, SharedVault,
+    run_session, Control, DefaultEngine, Engine, SessionContext, SharedListeners, SharedVault,
 };
 use crate::state::{SessionSnapshot, SessionState, SessionStatsSnapshot, StateCell};
 
@@ -118,7 +118,7 @@ impl SessionManager {
         known_hosts: Arc<RwLock<KnownHostsStore>>,
         config: ManagerConfig,
     ) -> Self {
-        Self::with_engine(vault, known_hosts, config, Arc::new(RusshEngine))
+        Self::with_engine(vault, known_hosts, config, Arc::new(DefaultEngine))
     }
 
     pub(crate) fn with_engine(
@@ -335,6 +335,7 @@ impl SessionManager {
                     fingerprint_sha256: prompt.sha256.clone(),
                     first_seen,
                     approved: true,
+                    public_key_openssh: prompt.public_key_openssh.clone(),
                 },
             );
         }
@@ -638,6 +639,7 @@ mod tests {
             .unwrap();
         assert!(pin.approved);
         assert_eq!(pin.fingerprint_sha256, "SHA256:abc");
+        assert_eq!(pin.public_key_openssh.as_deref(), Some("ssh-ed25519 AAAAtest"));
         f.until_state(id, SessionState::Connected).await;
         assert_eq!(script.connects(), 2);
 
@@ -661,6 +663,7 @@ mod tests {
             HostKeyRecord {
                 algorithm: "ssh-ed25519".into(),
                 fingerprint_sha256: "SHA256:pinned".into(),
+                public_key_openssh: None,
                 first_seen: Timestamp(1),
                 approved: true,
             },

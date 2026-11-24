@@ -1,57 +1,56 @@
-# phase-0003 — src-tauri: port conflicts, filter tester, MITM CA inspector & config export/import IPC
+# phase-0003 — conduit-openssh: IPC askpass, conduit-worker, orphan guard & supervisor
 
 - Status: done
 - Owner: executor
-- Depends on: phase-0001, phase-0002
-- Goal: Implement the Phase 3 backend IPC commands in `src-tauri`: live port-conflict detection (`check_port_conflicts`), interactive filter rule tester (`test_filter_rules`), MITM CA certificate inspection (`inspect_mitm_ca`), and config export/import (`export_config` stripped-by-default or passphrase-encrypted full bundle, `import_config`) with full unit and secret-leak tests.
-- Done when: `cargo test -p rusty-conduit-ssh-gui && cargo clippy --workspace --all-targets -- -D warnings` exits 0 with all new commands covered by `every_ipc_command_works_and_no_response_or_file_leaks_a_secret`.
-- Pattern to follow: `src-tauri/src/commands.rs` and `src-tauri/src/controller/keys.rs`
+- Depends on: phase-0002
+- Goal: Implement authenticated local IPC askpass, child environment sanitization, cross-platform orphan guards, the `conduit-worker` binary (`askpass` & `hop-proxy`), and `OpenSshSupervisor` with real `/usr/bin/ssh` loopback integration tests.
+- Done when: `cargo test -p conduit-openssh && cargo clippy --workspace --all-targets -- -D warnings` exits 0 with passing real `/usr/bin/ssh` loopback tests for key auth via isolated agent, password auth via `conduit-worker askpass`, 2-hop `hop-proxy`, auth failure lockout detection, and host-key mismatch hard stop.
+- Pattern to follow: `crates/conduit-ssh/tests/common/mod.rs` (in-process `russh` loopback SSH server for tests), `crates/conduit-runtime/src/hardening.rs` (`cfg(target_os = "linux")` `libc::prctl`), `../rusty-conduit-ssh/src/net.rs:34-42` (`TunnelState`).
 
 ## Context
-Master Plan Phase 3 requires 100% `rusty-conduit-ssh` option parity in the Manage Window plus safe config export/import.
-Key decisions already made:
-- **`check_port_conflicts(session_id: Option<Uuid>, bind: IpAddr, http_port: u16, socks_port: u16)`:**
-  - Checks each non-zero port against all *other* saved sessions' forward ports (same bind IP or either side is unspecified `0.0.0.0`/`::`) AND checks whether a live OS `TcpListener::bind((bind, port))` fails with `AddrInUse` (skipping the OS bind check if `session_id` is currently running and owns that listener!). Returns `PortConflictReport { conflicts: Vec<PortConflict> }` with `port`, `kind` (`"session"` | `"os_socket"`), and `detail`.
-- **`test_filter_rules(mode: "allow" | "block", rules: Vec<String>, target: String)`:**
-  - Parses each rule with `rusty_conduit_ssh::filter::FilterRule::from_str`, builds `HostFilter`, tests `target` (IP or domain), and returns `FilterTestResult { valid: bool, allowed: Option<bool>, reason: String, rule_errors: Vec<RuleError> }`.
-- **`inspect_mitm_ca(ca_mode: MitmCaMode, passphrase: Option<SecretInput>, passphrase_ref: Option<SecretRef>, passphrase_file: Option<PathBuf>)`:**
-  - Resolves passphrase (from inline `SecretInput`, or from unlocked `Vault` via `passphrase_ref`, or `passphrase_file`), validates & parses the CA via `rusty_conduit_ssh::mitm` / `x509-parser` (matching the engine's exact CA loader!), and returns `MitmCaInfo { subject: String, not_after: String, expired: bool, days_remaining: i64 }`. Never returns private key material or passphrase!
-- **`export_config(path: PathBuf, include_secrets: bool, passphrase: Option<SecretInput>)` & `import_config(path: PathBuf, passphrase: Option<SecretInput>, replace_existing: bool)`:**
-  - When `include_secrets == false` (default): writes a redacted JSON config export (`AppConfig` with `keys` metadata preserved or stripped as safe metadata, NO secret values, NO `vault.bin` bytes).
-  - When `include_secrets == true`: requires a non-empty `passphrase` and unlocked `Vault`; writes an `XChaCha20-Poly1305` + `Argon2id` encrypted full bundle containing `AppConfig` + `KnownHostsStore` + all referenced vault secrets (reusing `conduit_vault::crypto` primitives, zero plaintext secrets on disk!).
-  - `import_config` detects plain JSON vs. encrypted bundle, validates every imported session/host, skips or updates duplicates cleanly, and requires unlocked vault + passphrase when importing an encrypted bundle.
-- Update `keys.rs` usage tracking to also count `hop.agent_forward_keys` so deleting a key warns when it is assigned for agent forwarding!
+OpenSSH's `ProxyJump` (`-J`) breaks multi-hop password auth and paths with spaces. Instead:
+- Each session's `OpenSshSupervisor` starts an authenticated local IPC askpass server (Unix socket on Unix or loopback TCP `127.0.0.1:0` with a 256-bit random hex token per hop; passwords are never passed in argv, env, or disk files).
+- Each hop's `ssh` process receives a sanitized environment (`env_clear()` + minimal safe allowlist, explicitly stripping `SSH_AUTH_SOCK`, `DISPLAY`, `WEBKIT_*`, `__NV_*`, etc.) with `SSH_ASKPASS=<path to conduit-worker>`, `SSH_ASKPASS_REQUIRE=force`, `DISPLAY=conduit:0`, and its per-hop IPC endpoint + token + hop index.
+- `conduit-worker askpass` connects to the askpass IPC, authenticates with the token and hop index, receives the one-shot secret, writes it to stdout, zeroizes it, and exits. Each hop's password is served at most once per connect attempt so bad passwords cannot loop.
+- `conduit-worker hop-proxy --config <path> --ssh-bin <path> --hop <n> -- <host> <port>` spawns the inner `ssh -F <hop_config> -W <host>:<port>` with orphan guard and sanitized env.
+- Orphan guards: `PR_SET_PDEATHSIG(SIGTERM)` on `cfg(target_os = "linux")`, Windows Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) on `cfg(windows)`, and a parent-PID watcher thread on `cfg(target_os = "macos")`.
+- `OpenSshSupervisor` spawns `ssh -F <target_config> -N -D <bind>:<port> [-R ...] <extra_args> <target_alias>`, probes the local `-D` SOCKS5 port for readiness, publishes `watch::Receiver<TunnelState>`, streams stderr diagnostics, classifies auth failures (`Permission denied`) and host-key failures (`Host key verification failed` / `REMOTE HOST IDENTIFICATION HAS CHANGED`), and kills/reaps the child + drops the runtime dir on shutdown.
+- Important from phase-0002: because the hardened `-F` config sets `IdentitiesOnly yes`, for every hop that uses vault key auth via `IsolatedAgentServer`, `OpenSshSupervisor` must write each key's public key (`.pub`) into `RuntimeDir` (`0600`) and pass those paths in `ConfigHop.identity_files` (`crates/conduit-openssh/src/config.rs:28`); otherwise `ssh` will not offer the agent's keys. Also expose `reverse_forwards: Vec<String>` (passed as `-R <spec>`) and a stderr/diagnostic log callback on `OpenSshSupervisor` so `phase-0004` can wire `ReverseProxy` and `LogRingBuffer` directly.
 
 ## Scope
-- In: `src-tauri/src/**`, `src-tauri/Cargo.toml`, `Cargo.lock`
-- Out: `crates/**`, `src-tauri/ui/**`, `docs/MASTER-PLAN.md`
+- In: `crates/conduit-openssh/**`
+- Out: `docs/MASTER-PLAN.md`, `../rusty-conduit-ssh/**`, `crates/conduit-core/**`, `crates/conduit-ssh/**`, `crates/conduit-runtime/**`, `src-tauri/**`
 
 ## Sub-tasks
-1. [done] Update `src-tauri/src/controller/keys.rs` so key usage counting and forced deletion also track and strip `hop.agent_forward_keys` references — done when: `cargo test -p rusty-conduit-ssh-gui keys` exits 0
-2. [done] Implement `src-tauri/src/controller/parity.rs` with `check_port_conflicts`, `test_filter_rules`, and `inspect_mitm_ca` (reusing `rusty_conduit_ssh::filter` and `rusty_conduit_ssh::mitm` CA parsing) plus unit tests — done when: `cargo test -p rusty-conduit-ssh-gui parity` exits 0
-3. [done] Implement `src-tauri/src/controller/export.rs` with `export_config` (redacted JSON default + passphrase-encrypted full bundle using `conduit_vault::crypto`) and `import_config` (plain + encrypted auto-detect, validation, zero plaintext secret leakage) plus unit tests — done when: `cargo test -p rusty-conduit-ssh-gui export` exits 0
-4. [done] Expose `check_port_conflicts`, `test_filter_rules`, `inspect_mitm_ca`, `export_config`, and `import_config` in `src-tauri/src/commands.rs`, register them in `ipc_handler!` and `ALL_COMMANDS`, and extend `every_ipc_command_works_and_no_response_or_file_leaks_a_secret` to exercise all 44 commands and verify exported files contain zero plaintext secrets — done when: `cargo test -p rusty-conduit-ssh-gui && cargo clippy --workspace --all-targets -- -D warnings` exits 0
+1. [done] Implement `crates/conduit-openssh/src/env.rs` (sanitized child environment builder using `env_clear()` + minimal allowlist, stripping `SSH_AUTH_SOCK`/`WEBKIT_*`/`__NV_*`, setting `SSH_ASKPASS`/`SSH_ASKPASS_REQUIRE=force`/`DISPLAY=conduit:0`/askpass IPC vars) and `crates/conduit-openssh/src/orphan.rs` (`PR_SET_PDEATHSIG(SIGTERM)` in `pre_exec` on `cfg(target_os = "linux")`, Windows Job Object handle on `cfg(windows)`, parent-PID watcher on `cfg(target_os = "macos")`) with unit tests — done when: `cargo test -p conduit-openssh env && cargo test -p conduit-openssh orphan` passes.
+2. [done] Implement `crates/conduit-openssh/src/askpass.rs`: authenticated local IPC askpass server (Unix domain socket inside runtime dir on Unix, loopback TCP on Windows) keyed by per-hop random 32-byte hex token + hop index, serving each hop's zeroized password at most once per attempt (subsequent requests for the same hop return denied so `ssh` fails cleanly instead of looping), plus client function `run_askpass_client()` reading endpoint/token/hop from env and printing secret to stdout; add unit tests for valid auth, wrong token rejection, and one-shot exhaustion — done when: `cargo test -p conduit-openssh askpass` passes.
+3. [done] Implement `crates/conduit-openssh/src/bin/conduit-worker.rs`: subcommands `askpass` (calls `run_askpass_client()` with core-dump hardening) and `hop-proxy --config <path> --ssh-bin <path> --hop <n> -- <host> <port>` (applies orphan guard, builds sanitized env for hop `n`, execs/spawns `<ssh_bin> -F <config> -W <host>:<port> <hop_alias>` inheriting stdio) — done when: `cargo build -p conduit-openssh --bin conduit-worker` succeeds with 0 warnings.
+4. [done] Implement `crates/conduit-openssh/src/supervisor.rs`: `OpenSshSupervisor` + `OpenSshError` (`AuthFailed`, `HostKeyChanged`, `HostKeyUnknown`, `BinaryUnsupported`, `StartupTimeout`, `ProcessExited`, `Io`) that sets up `RuntimeDir`, renders `known_hosts`, starts per-hop `IsolatedAgentServer`s and `AskpassServer`, writes hardened `-F` configs (wiring `conduit-worker` path via `resolve_worker_bin()`), spawns `ssh -F ... -N -D <bind>:<port> [-R ...] <extra_args> <target_alias>` with orphan guard and sanitized env, parses stderr lines into structured failure classification + log callback, waits for `-D` SOCKS5 listener readiness (updating `watch::Sender<TunnelState>`), and cleanly terminates + reaps on shutdown/drop — done when: `cargo test -p conduit-openssh supervisor` passes.
+5. [done] Add real `/usr/bin/ssh` loopback integration tests in `crates/conduit-openssh/tests/openssh_loopback.rs` using an in-process `russh` test SSH server (with `direct-tcpip` forwarding): (a) single-hop Ed25519 key auth via isolated agent socket + SOCKS5 TCP roundtrip, (b) single-hop password auth via `conduit-worker askpass`, (c) 2-hop chain via `conduit-worker hop-proxy` (mixed key + password), (d) wrong password classified as `OpenSshError::AuthFailed` (not transient), (e) wrong pinned host key classified as `OpenSshError::HostKeyChanged`, and (f) verifying runtime directory is removed on drop — done when: `cargo test -p conduit-openssh --test openssh_loopback` passes.
 
 ## Verify
 ```sh
-cargo test -p rusty-conduit-ssh-gui && cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p conduit-openssh && cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 ## Escalate when
-- `rusty_conduit_ssh::mitm` does not expose a public helper to load/inspect a CA without building a full `MitmState` → stop, set Status: needs-human — reason: exact visibility in `../rusty-conduit-ssh/src/mitm/`
+- Real `/usr/bin/ssh` rejects a generated `-F` directive or `SSH_ASKPASS_REQUIRE=force` behaves unexpectedly on this Linux host → stop, set `Status: needs-human — reason: <exact ssh -v stderr>`
+- `conduit-worker` binary path cannot be located reliably during `cargo test` (check `CARGO_BIN_EXE_conduit-worker` env var first, falling back to sibling of `std::env::current_exe()`) → stop, set `Status: needs-human — reason: <path lookup issue>`
 
 ## Log
 - (append-only, one line per event)
-- sub-task 1: key usage now counts hop.agent_forward_keys (once per session) and forced delete strips them and re-syncs the session
-- sub-task 2: added parity.rs (port conflicts, filter tester using engine FilterRule/HostFilter, CA inspector using engine CaMaterial parsers so expired CAs are reported)
-- sub-task 3: added export.rs (redacted JSON, Argon2id + XChaCha20-Poly1305 bundle, auto-detecting atomic import; plain imports keep a credential ref only for the same host/port/user)
-- sub-task 4: exposed 5 commands, registered them in ipc_handler! and ALL_COMMANDS (44 total), extended the IPC leak test to both export files
-- phase verified and closed
+- sub-task 1: added env.rs (allowlisted child env, per-hop token narrowing) and orphan.rs (PDEATHSIG, Job Object, macOS watcher)
+- sub-task 2: added askpass.rs (token-authenticated, one-shot IPC server and client)
+- sub-task 3: implemented conduit-worker askpass and hop-proxy; a lone argument is treated as the ssh prompt because SSH_ASKPASS cannot carry a subcommand
+- sub-task 4: added supervisor.rs (OpenSshSupervisor, OpenSshError, stderr classification, SOCKS readiness, guarded spawn thread, cleanup)
+- sub-task 5: added tests/openssh_loopback.rs with real /usr/bin/ssh for key, password, 2-hop, wrong password, wrong host key, and cleanup
+- Verify passed; no ssh or conduit-worker processes or rc-* directories left after 10 loopback runs; cfg(windows) and cfg(target_os=macos) code not compiled on this host
 
 ## Evidence
 - (append-only: command → observed result)
-- `cargo test -p rusty-conduit-ssh-gui keys` → 16 passed; 0 failed
-- `cargo test -p rusty-conduit-ssh-gui parity` → 12 passed; 0 failed
-- `cargo test -p rusty-conduit-ssh-gui export` → 13 passed; 0 failed
-- `grep -c '$crate::commands::' src-tauri/src/commands.rs` → 44
-- `cargo test -p rusty-conduit-ssh-gui && cargo clippy --workspace --all-targets -- -D warnings` → exit 0; 99 passed, 0 failed, including every_ipc_command_works_and_no_response_or_file_leaks_a_secret; clippy clean
+- cargo test -p conduit-openssh env → 4 passed; cargo test -p conduit-openssh orphan → 3 passed
+- cargo test -p conduit-openssh askpass → 8 passed (7 askpass plus 1 env name match)
+- cargo build -p conduit-openssh --bin conduit-worker → Finished, 0 warnings
+- cargo test -p conduit-openssh supervisor → 5 passed
+- cargo test -p conduit-openssh --test openssh_loopback → 6 passed; repeated 10 times → pass=10/10
+- cargo test -p conduit-openssh && cargo clippy --workspace --all-targets -- -D warnings → exit 0 (52 unit + 6 loopback tests passed, clippy clean)

@@ -106,6 +106,8 @@ export interface HostKeyRecord {
   fingerprint_sha256: string;
   first_seen: Timestamp;
   approved: boolean;
+  /** `<algorithm> <base64>`. Absent on pins recorded before this field existed. */
+  public_key_openssh?: string | null;
 }
 
 export interface HostKeyEntry {
@@ -225,6 +227,8 @@ export interface HostKeyPrompt {
   algorithm: string;
   /** `SHA256:<base64>`, matching `ssh-keygen -l`. */
   sha256: string;
+  /** `<algorithm> <base64>`, stored with the pin on approval. */
+  public_key_openssh: string | null;
 }
 
 export type SessionState =
@@ -335,6 +339,20 @@ export interface MitmCaInfo {
   expired: boolean;
   /** Whole days until expiry. Negative once expired. */
   days_remaining: number;
+}
+
+/** The result of checking a configured `ssh` program. */
+export interface OpenSshBinaryInfo {
+  requested: string;
+  /** `null` when the program was not found. */
+  resolved_path: string | null;
+  /** The program's `-V` output. */
+  version_raw: string | null;
+  major: number | null;
+  minor: number | null;
+  supported: boolean;
+  /** Guidance to show the user. */
+  message: string;
 }
 
 /** At most one source may be set. */

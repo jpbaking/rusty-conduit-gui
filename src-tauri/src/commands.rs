@@ -10,6 +10,7 @@ use std::sync::Arc;
 use conduit_core::{
     HostProfile, KeyId, KeySource, MitmCaMode, SecretRef, SessionProfile, VaultKeyMeta,
 };
+use conduit_openssh::OpenSshBinaryInfo;
 use conduit_runtime::LogLine;
 use serde::Serialize;
 use tauri::{AppHandle, Manager, Runtime, State};
@@ -288,6 +289,12 @@ pub async fn inspect_mitm_ca(
     .await
 }
 
+/// Runs `<ssh_bin> -V`, which can take seconds, on the blocking pool.
+#[tauri::command]
+pub async fn check_openssh_binary(ssh_bin: Option<String>) -> CmdResult<OpenSshBinaryInfo> {
+    run_blocking(move || Ok(parity::check_openssh_binary(ssh_bin))).await
+}
+
 // Config export and import.
 
 #[tauri::command]
@@ -436,6 +443,7 @@ macro_rules! ipc_handler {
             $crate::commands::check_port_conflicts,
             $crate::commands::test_filter_rules,
             $crate::commands::inspect_mitm_ca,
+            $crate::commands::check_openssh_binary,
             $crate::commands::export_config,
             $crate::commands::import_config,
             $crate::commands::get_autostart,
@@ -479,7 +487,7 @@ mod tests {
         "stop_session", "restart_session", "start_all", "stop_all", "get_session_logs",
         "clear_session_logs", "approve_host_key", "reject_host_key", "list_host_key_pins",
         "reset_host_key", "test_chain", "check_port_conflicts", "test_filter_rules",
-        "inspect_mitm_ca", "export_config", "import_config",
+        "inspect_mitm_ca", "check_openssh_binary", "export_config", "import_config",
         "get_autostart", "set_autostart", "shell_ready", "resolve_close",
     ];
 
@@ -766,6 +774,15 @@ mod tests {
             ipc.err("inspect_mitm_ca", json!({ "caMode": ca_mode, "passphrase": PASSWORD }))["code"],
             "invalid"
         );
+
+        // The default program may or may not be installed, so only its name is asserted.
+        assert_eq!(ipc.ok("check_openssh_binary", json!({}))["requested"], "ssh");
+        assert_eq!(ipc.ok("check_openssh_binary", json!({ "sshBin": "  " }))["requested"], "ssh");
+        let missing_bin = dir.path().join("no-such-ssh");
+        let missing = ipc.ok("check_openssh_binary", json!({ "sshBin": missing_bin }));
+        assert_eq!(missing["supported"], false);
+        assert_eq!(missing["resolved_path"], Value::Null);
+        assert_eq!(missing["version_raw"], Value::Null);
 
         // Config export and import, in both forms.
         let plain_export = dir.path().join("config-plain.json");

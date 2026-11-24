@@ -1,12 +1,12 @@
-# GOAL — Phase 3: Full Option Parity, Scoped Agent Forwarding & Config Export/Import
+# GOAL — Phase 4: Opt-In OpenSSH Compatibility Engine & Hardening
 
 ## Goal
-- Goal ID: 20261124-phase3-parity-scoped-agent
-- Outcome: Implement Master Plan Phase 3: live per-hop Scoped Agent Forwarding (RFC/OpenSSH `ssh-agent` wire protocol over `ScopedAgent` with signature audit logging), full 7-Tab Session Editor (`rusty-conduit-ssh` 100% option parity with port-conflict detection, interactive filter tester, and MITM CA inspection), and Config Export/Import (secrets stripped by default; optional passphrase-encrypted full backup).
-- Done when: `cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && (cd src-tauri/ui && npm run check && npm run build)` exits 0 with passing loopback scoped-agent tests, parity IPC tests, zero secret leaks, and clean Svelte 5 typecheck and production bundle.
+- Goal ID: 20261124-phase4-openssh-engine
+- Outcome: Implement Master Plan Phase 4 (Opt-In OpenSSH Compatibility Engine & Hardening): close Phase 3 Gate D hardening items, add `crates/conduit-openssh` + `conduit-worker` (binary discovery, hardened `-F` config, app-owned `known_hosts`, isolated agent socket/named-pipe, authenticated IPC askpass, `hop-proxy` multi-hop wrapper, orphan-guarded supervision), wire `SshEngine::OpenSsh` into `conduit-runtime` with real `/usr/bin/ssh` E2E tests, and expose `check_openssh_binary` in `src-tauri` + `LoggingAdvancedTab.svelte`.
+- Done when: `cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && (cd src-tauri/ui && npm run check && npm run build)` exits 0 with passing real `/usr/bin/ssh` loopback E2E tests, hardened denylist & plain-import sanitization tests, zero secret leaks across all 45 IPC commands, and clean Svelte 5 typecheck and production bundle.
 - Goal status: completed
 - Goal status meaning: drafting | approved | executing | blocked-on-human | in-review | awaiting-acceptance | completed | abandoned
-- Last completed phase: phase-0006
+- Last completed phase: phase-0005
 
 ## Execution
 - Execution mode: delegated
@@ -18,49 +18,47 @@
 - Repository: yes
 - Strategy: isolated-branch
 - Starting branch: main
-- Work branch: goal/20261124-phase3-parity-scoped-agent
-- Baseline commit: c95efbf86784c4b8c6473129e076232e76091a44
+- Work branch: goal/20261124-phase4-openssh-engine
+- Baseline commit: a1b1b83666e904ce64a5b38e38886732452324aa
 - Starting upstream at start: none
 - Work upstream at start: none
 
 ## Phases
-- [done] phase-0001 — conduit-core + conduit-ssh: scoped agent forwarding wire protocol & loopback tests
-- [done] phase-0002 — conduit-runtime: wire AgentForwardRelay, audit logs & E2E flake hardening
-- [done] phase-0003 — src-tauri: port conflicts, filter tester, MITM CA inspector & config export/import IPC
-- [done] phase-0004 — src-tauri/ui: 7-tab SessionEditor shell & Tabs 1-3 (Chain+Agent, Forward, Reverse)
-- [done] phase-0005 — src-tauri/ui: Tabs 4-7 (Filters, HTTPS MITM, Keepalive, Logging & Advanced)
-- [done] phase-0006 — src-tauri/ui: Config Export/Import UI in Settings & full cross-stack verification
+- [done] phase-0001 — Hardening follow-ups & host-key public-key storage
+- [done] phase-0002 — conduit-openssh core: binary check, hardened -F config, known_hosts & isolated agent socket
+- [done] phase-0003 — conduit-openssh: IPC askpass, conduit-worker, orphan guard & supervisor
+- [done] phase-0004 — conduit-runtime: wire SshEngine::OpenSsh into runner.rs & real /usr/bin/ssh E2E tests
+- [done] phase-0005 — src-tauri + ui: check_openssh_binary IPC, secret-leak test & LoggingAdvancedTab
 
 ## Handoff
 - Current position: completed
 - Next role: planner
 - Next action: none
-- Last verified evidence: Gate D full verification exited 0 (333 Rust tests passed, clippy clean, svelte-check 0/0, vite build 176.85 kB JS / 12.43 kB CSS, PURE_RUST_CRYPTO_OK)
+- Last verified evidence: Gate D full verification exited 0 (413 Rust tests passed, clippy clean, svelte-check 0/0, vite build 179.16 kB JS / 12.43 kB CSS, PURE_RUST_CRYPTO_OK, 0 warnings)
 - Blockers: none
 
 ## Review
 - Reviewed by: Gemini 4 Neon (Medium) — planner Gate D review
-- Verification result: PASS — `cargo test --workspace` (333 passed, 0 failed), `cargo clippy --workspace --all-targets -- -D warnings` (0 warnings), `(cd src-tauri/ui && npm run check && npm run build)` (0 errors, 0 warnings), `PURE_RUST_CRYPTO_OK` (no aws-lc-sys/openssl-sys), headless Chromium mock-IPC smoke journey 69/69 passed
-- Diff reviewed: `c95efbf86784c4b8c6473129e076232e76091a44..75b3074` across all 6 phases; zero scope drift, zero edits to `docs/MASTER-PLAN.md` or `../rusty-conduit-ssh`
-- Findings: No blocking defects. Four non-blocking follow-up items tracked for Phase 4 (OpenSSH engine & hardening): (1) `conduit-core` `extra_args` denylist matches whole case-sensitive flags only (misses attached/case-variant options like `-oProxyCommand=x`); (2) plain config import preserves `logging.http_access_log`/`socks_log`/`openssh.ssh_bin` paths (inert until OpenSSH engine ships); (3) `ScopedAgent` RSA signing currently supports SHA-512 only (Ed25519/ECDSA unaffected); (4) `lock_vault` leaves already-connected sessions up so active agent relays keep signing until disconnect.
+- Verification result: PASS — `cargo test --workspace` (413 passed, 0 failed; includes 52+6 `conduit-openssh` and 50+8+8 `conduit-runtime` real `/usr/bin/ssh` tests + 45-command `src-tauri` secret-leak IPC test), `cargo clippy --workspace --all-targets -- -D warnings` (0 warnings), `(cd src-tauri/ui && npm run check && npm run build)` (0 errors, 0 warnings, 179.16 kB JS / 12.43 kB CSS), `PURE_RUST_CRYPTO_OK`, `validate_goal_ledger.py --root .` (valid, 5 phases, 0 warnings)
+- Diff reviewed: `a1b1b83666e904ce64a5b38e38886732452324aa..6e19d45` (51 files, +5464/-372 across all 5 phases); zero scope drift, zero edits to `docs/MASTER-PLAN.md` or `../rusty-conduit-ssh`
+- Findings: No blocking defects. Platform notes for Phase 5 CI: (1) `cfg(windows)` named-pipe/Job-Object/runtime-dir paths and `cfg(target_os = "macos")` parent-PID watcher were not compiled or executed on this Linux-only host (Phase 5 cross-OS CI will verify them); (2) `-E` remains allowed in `extra_args` (optional follow-up if log-file flag should be restricted); (3) OpenSSH engine logs a notice when `agent_forward` is enabled because `ssh -N` opens no session channel (per Master Plan Section 3.1).
 
 ## Log
-- created Milestone 3 ledger with 6 phases for Master Plan Phase 3 (scoped agent forwarding, 7-tab option parity, config export/import) on branch goal/20261124-phase3-parity-scoped-agent from baseline c95efbf86784c4b8c6473129e076232e76091a44
-- delegated phase-0001 to sub-m3-phase-0001 (claude --model opus --effort medium)
-- phase-0001 blocked after sub-task 1: workspace clippy needs a one-line fix in out-of-scope src-tauri/src/controller/test_support.rs:90
-- planner unblocked phase-0001: added src-tauri/src/controller/test_support.rs to Scope: In and resumed sub-m3-phase-0001 from sub-task 2
-- phase-0001 done: scoped agent wire protocol, relay, and loopback tests verified
-- planner verified phase-0001 (34 core + 63 ssh + 5 agent loopback + 12 multihop tests, clippy clean) and delegated phase-0002 to sub-m3-phase-0002 (claude --model opus --effort medium)
-- phase-0002 blocked at sub-task 1 before any code change: SignAudit has no algorithm field and crates/conduit-ssh/** is Scope: Out
-- planner unblocked phase-0002 (Option A): added crates/conduit-ssh/src/agent.rs to Scope: In for SignAudit.algorithm and resumed sub-m3-phase-0002 from sub-task 1
-- phase-0002 done: per-hop scoped agent relays, agent-audit logs, E2E coverage, and port hardening verified
-- planner verified phase-0002 (48 runtime + 8 E2E + 63 ssh + 5 agent + 12 multihop tests, clippy clean) and delegated phase-0003 to sub-m3-phase-0003 (claude --model opus --effort medium)
-- phase-0003 done: port conflicts, filter tester, MITM CA inspector, config export/import, and agent-forward key tracking verified across 44 IPC commands
-- planner verified phase-0003 (99 src-tauri tests, 44 IPC commands + secret-leak test, clippy clean) and delegated phase-0004 to sub-m3-phase-0004 (claude --model opus --effort medium)
-- phase-0004 done: 7-tab SessionEditor, per-hop Forwarded Keys picker, Forward and Reverse Proxy tabs, and typed clients for the 5 Phase 3 commands verified
-- planner verified phase-0004 (svelte-check 0/0, vite build clean, ledger valid) and delegated phase-0005 to sub-m3-phase-0005 (claude --model opus --effort medium)
-- phase-0005 done: Tabs 4-7 wired with full validation; open finding: conduit-core extra_args denylist misses attached and case-variant ssh options
-- planner verified phase-0005 (svelte-check 0/0, vite build clean, ledger valid) and delegated phase-0006 to sub-m3-phase-0006 (claude --model opus --effort medium)
-- phase-0006 done: Settings config export/import wired; full cross-stack verification and mock-IPC smoke journey passed
-- planner Gate D review passed (333 tests, clippy clean, svelte-check 0/0, vite build clean, PURE_RUST_CRYPTO_OK); set status to awaiting-acceptance
-- user accepted Milestone 3 with squash; marked completed and squashed onto goal/20261124-phase3-parity-scoped-agent
+- created Milestone 4 ledger with 5 phases for Master Plan Phase 4 (opt-in OpenSSH engine & hardening) on branch goal/20261124-phase4-openssh-engine from baseline a1b1b83666e904ce64a5b38e38886732452324aa
+- delegated phase-0001 to sub-m4-phase-0001 (claude --model opus --effort medium)
+- phase-0001 blocked: sub-tasks 1-3 done, sub-task 4 stopped on out-of-scope compile failures in conduit-tray/src/model.rs:509 and src-tauri/src/controller.rs:640
+- planner unblocked phase-0001: added crates/conduit-tray/src/model.rs and src-tauri/src/controller.rs to Scope: In and resumed sub-m4-phase-0001 from sub-task 4
+- phase-0001 done: Verify exit 0 with 345 tests passed, clippy clean, svelte-check 0 errors
+- planner verified phase-0001 (345 tests, clippy clean, svelte-check 0/0) and delegated phase-0002 to sub-m4-phase-0002 (claude --model opus --effort medium)
+- phase-0002 done: Verify exit 0 with 33 conduit-openssh tests, clippy clean; cfg(windows) code not compiled on this host
+- planner verified phase-0002 (33 tests, PURE_RUST_CRYPTO_OK, clippy clean), updated phase-0003 context with IdentitiesOnly .pub file requirement, and delegated phase-0003 to sub-m4-phase-0003 (claude --model opus --effort medium)
+- phase-0003 done: Verify exit 0 with 52 unit + 6 real /usr/bin/ssh loopback tests, clippy clean; cfg(windows) and macOS code not compiled on this host
+- planner verified phase-0003 (52 unit + 6 loopback tests, clippy clean), updated phase-0004 context & Verify for conduit-worker build and shutdown().await, and delegated phase-0004 to sub-m4-phase-0004 (claude --model opus --effort medium)
+- phase-0004 blocked: sub-task 1 done (50 unit tests, clippy clean); sub-task 2 at 7/8 E2E tests after two failed runs, last failure a SOCKS port collision
+- planner unblocked phase-0004: approved port-collision fix (non-ephemeral test ports + socks_port skipping profile forward ports) and confirmed agent_forward notice behavior; resumed sub-m4-phase-0004 from sub-task 2
+- phase-0004 done: Verify exit 0 with 50 unit + 8 e2e_runtime + 8 real /usr/bin/ssh tests, clippy clean; cfg(windows) and macOS paths not run on this host
+- planner verified phase-0004 (50 unit + 8 e2e_runtime + 8 openssh_e2e, clippy clean) and delegated phase-0005 to sub-m4-phase-0005 (claude --model opus --effort medium)
+- phase-0005 blocked: sub-tasks 1-3 done and Verify exit 0 (413 tests), but the rebuilt tracked src-tauri/ui/dist is outside Scope: In and is left uncommitted
+- planner added src-tauri/ui/dist/** to phase-0005 Scope: In, committed rebuilt dist, closed phase-0005, and entered Gate D review
+- planner Gate D review passed (413 tests, clippy clean, svelte-check 0/0, vite build clean, PURE_RUST_CRYPTO_OK); set status to awaiting-acceptance
+- user accepted Milestone 4 with squash; marked completed, squashed onto goal/20261124-phase4-openssh-engine, and fast-forwarded main

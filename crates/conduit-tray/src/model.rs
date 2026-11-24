@@ -513,6 +513,7 @@ mod tests {
             port: 22,
             algorithm: "ssh-ed25519".into(),
             sha256: "SHA256:x".into(),
+            public_key_openssh: None,
         };
         let model = TrayMenuModel::from_snapshots(
             &[snap("K", SessionState::AwaitingHostKey(prompt), &[])],

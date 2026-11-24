@@ -178,6 +178,7 @@ mod tests {
             HostKeyRecord {
                 algorithm: "ssh-ed25519".into(),
                 fingerprint_sha256: "SHA256:abc".into(),
+                public_key_openssh: None,
                 first_seen: Timestamp::now(),
                 approved: false,
             },

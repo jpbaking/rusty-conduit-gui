@@ -1,58 +1,57 @@
-# phase-0004 — src-tauri/ui: 7-tab SessionEditor shell & Tabs 1-3 (Chain+Agent, Forward, Reverse)
+# phase-0004 — conduit-runtime: wire SshEngine::OpenSsh into runner.rs & real /usr/bin/ssh E2E tests
 
 - Status: done
 - Owner: executor
 - Depends on: phase-0003
-- Goal: Refactor `SessionEditor.svelte` into the Master Plan Section 8.2 7-Tab Session Editor, update `types.ts` / `api.ts` / `mock.ts` for all 44 backend commands and new `HopEntry` fields, and implement Tabs 1–3 (**Connection & Jump Chain** with per-hop Forwarded Keys picker, **Forward Proxy** with single-port mux & live port-conflict detection, and **Reverse Proxy (`-R`)** with exposure warning & mux indicator).
-- Done when: `(cd src-tauri/ui && npm run check && npm run build)` exits 0 with Tabs 1–3 fully functional and clean placeholder panels for Tabs 4–7 (completed in `phase-0005`).
-- Pattern to follow: `docs/MASTER-PLAN.md` Section 8.2 and `src-tauri/ui/src/lib/components/SessionEditor.svelte`
+- Goal: Wire `SshEngine::OpenSsh` into `crates/conduit-runtime/src/runner.rs` with full state-machine, lockout protection, host-key TOFU, backoff, `LogRingBuffer`, and `StatsDialer` parity, plus real `/usr/bin/ssh` loopback E2E tests.
+- Done when: `cargo test -p conduit-runtime && cargo clippy --workspace --all-targets -- -D warnings` exits 0 with passing real `/usr/bin/ssh` loopback E2E tests in `crates/conduit-runtime/tests/openssh_e2e.rs`.
+- Pattern to follow: `crates/conduit-runtime/src/runner.rs:608-920` (`RusshLink` and `impl Link for RusshLink`), `crates/conduit-runtime/tests/e2e_runtime.rs` (runtime E2E test harness), `../rusty-conduit-ssh/src/net.rs:198-235` (`Socks5UpstreamDialer`).
 
 ## Context
-Master Plan Section 8.2 defines a 7-tab Session Editor:
-1. Connection & Jump Chain
-2. Forward Proxy
-3. Reverse Proxy (`-R`)
-4. Destination Filters
-5. HTTPS MITM
-6. Keepalive & Reconnect
-7. Logging & Advanced
-
-Key decisions already made:
-- Tab 1 (`JumpChainBuilder` + `HopEditor`): when `hop.agent_forward` is enabled, show a **Forwarded Keys** multi-select checklist of vaulted keys (`hop.agent_forward_keys`) and an optional **Remote Command** input (`hop.agent_forward_command`), while keeping the clear security warning that root on that remote host can use forwarded keys while connected. (Remove the old "does not forward yet" caveat now that Phase 3 wired it!)
-- Tab 2 (`ForwardProxyTab.svelte`): bind IP (with non-loopback warning when bind is not `127.0.0.1` / `::1`), HTTP port, SOCKS port, **Single-port multiplex** toggle (syncs HTTP & SOCKS to one shared port), `max_connections` (`0` = unlimited), and debounced live port-conflict check via `api.checkPortConflicts(...)`.
-- Tab 3 (`ReverseProxyTab.svelte`): remote bind IP (with non-loopback / `GatewayPorts` exposure warning), remote HTTP port, remote SOCKS port, single-port mux indicator when both ports are equal and non-zero.
-- Show per-tab validation error badges so the user can see immediately if another tab has an invalid field blocking Save.
+`crates/conduit-runtime/src/runner.rs` already defines `trait Engine` and `trait Link`, and `RusshLink::prepare` currently returns `LinkError::Fatal("the OpenSSH engine is not available in this build")` at line 639 when `profile.engine == SshEngine::OpenSsh`.
+In this phase:
+- `RusshEngine::prepare` (or a dispatching `DefaultEngine`) routes `SshEngine::OpenSsh` to `OpenSshLink::prepare`.
+- `OpenSshLink` uses `rusty_conduit_ssh::net::Socks5UpstreamDialer` fed by a `watch::Sender<TunnelState>`, wrapped in `StatsDialer` and `FilteredDialer`, driving `build_engines`, `MitmState`, `ReverseProxy`, `Server`, and `AccessLogger`/`LogRingBuffer` identically to `RusshLink`.
+- Before launching `OpenSshSupervisor`, `OpenSshLink::connect` checks that every hop has an approved pin with `public_key_openssh` in `known_hosts`; if any hop is unpinned (or missing `public_key_openssh`), it probes the chain's host keys via `conduit_ssh::connect_chain` (or a lightweight host-key probe) to surface `LinkError::HostKey(HostKeyPrompt)` so the exact same `AwaitingHostKey` → `approve_host_key` flow works seamlessly for OpenSSH sessions too!
+- Auth failures (`OpenSshError::AuthFailed`) and changed host keys (`OpenSshError::HostKeyChanged`) map to `LinkError::Attention` (zero retries, preventing account lockout). Unsupported binary / invalid config maps to `LinkError::Fatal`. Unexpected `ssh` exit / network drop maps to `LinkError::Transient`.
+- `OpenSshLink::disconnect` updates `TunnelState::Disconnected(...)` and stops the supervisor via `supervisor.shutdown().await` (preferring `shutdown().await` over bare drop so `ssh` is terminated and reaped before the runtime dir is removed) while keeping forward listeners bound; `OpenSshLink::shutdown` drains `Server` → stops supervisor → drains `ReverseProxy` → flushes `AccessLogger`.
+- Note from phase-0003: `OpenSshSupervisor` expects validated `extra_args` (already enforced by `conduit_core::validate(&profile)` in `prepare`). During `conduit-runtime` integration tests, ensure `conduit-worker` is built (`cargo build -p conduit-openssh --bin conduit-worker`) and located via `target/debug/conduit-worker` (sibling of `current_exe().parent().parent()`).
 
 ## Scope
-- In: `src-tauri/ui/src/**`, `src-tauri/ui/dist/**`
-- Out: `crates/**`, `src-tauri/src/**`, `docs/MASTER-PLAN.md`
+- In: `crates/conduit-runtime/Cargo.toml`, `crates/conduit-runtime/src/runner.rs`, `crates/conduit-runtime/src/manager.rs`, `crates/conduit-runtime/tests/openssh_e2e.rs`, `Cargo.lock`
+- Out: `docs/MASTER-PLAN.md`, `../rusty-conduit-ssh/**`, `crates/conduit-core/**`, `crates/conduit-ssh/**`, `crates/conduit-openssh/**`, `src-tauri/**`
 
 ## Sub-tasks
-1. [done] Update `src-tauri/ui/src/lib/types.ts`, `api.ts`, and `mock.ts` to add `agent_forward_keys` / `agent_forward_command` on `HopEntry` and typed clients + preview mocks for `check_port_conflicts`, `test_filter_rules`, `inspect_mitm_ca`, `export_config`, and `import_config` — done when: `cd src-tauri/ui && npm run check` exits 0
-2. [done] Upgrade `src-tauri/ui/src/lib/components/HopEditor.svelte` with the per-hop **Forwarded Keys** multi-select picker (`agent_forward_keys`) and optional **Remote Command** (`agent_forward_command`) when `agent_forward` is checked, updating the security warning text — done when: `cd src-tauri/ui && npm run check` exits 0
-3. [done] Implement `src-tauri/ui/src/lib/components/ForwardProxyTab.svelte` (bind IP + non-loopback warning, HTTP/SOCKS ports, single-port mux toggle, `max_connections`, live `checkPortConflicts` warnings) and `ReverseProxyTab.svelte` (remote bind IP + `GatewayPorts` warning, remote HTTP/SOCKS ports, mux indicator) — done when: `cd src-tauri/ui && npm run check` exits 0
-4. [done] Refactor `src-tauri/ui/src/lib/components/SessionEditor.svelte` into the accessible 7-tab editor (`role="tablist"` / `role="tab"` / `role="tabpanel"` with error badges per tab) wiring Tabs 1–3 and clean placeholders for Tabs 4–7, and rebuild `src-tauri/ui/dist/` — done when: `(cd src-tauri/ui && npm run check && npm run build)` exits 0
+1. [done] Add `conduit-openssh = { path = "../conduit-openssh" }` to `crates/conduit-runtime/Cargo.toml` and implement `OpenSshLink` in `crates/conduit-runtime/src/runner.rs` (dispatched when `profile.engine == SshEngine::OpenSsh`), with full parity for `validate`, vault unlock check (`LinkError::Locked`), `check_openssh_binary` validation, `AccessLogger` + `LogRingBuffer`, `ReverseProxy` (`-R` specs), `Socks5UpstreamDialer` wrapped in `StatsDialer` + `FilteredDialer`, `MitmState`, `Server` bound once across reconnects, `AwaitingHostKey` host-key check, lockout-safe error classification (`LinkError::Attention`), and graceful shutdown — done when: `cargo test -p conduit-runtime --lib` passes.
+2. [done] Add real `/usr/bin/ssh` loopback E2E tests in `crates/conduit-runtime/tests/openssh_e2e.rs` driving `SessionManager` with `SshEngine::OpenSsh`: (a) single-hop key auth + HTTP/SOCKS proxy roundtrip verifying `StatsSnapshot` counters increment and `LogRingBuffer` captures logs, (b) password auth via `conduit-worker askpass` + HTTP proxy roundtrip, (c) bad password transitions immediately to `SessionState::NeedsAttention` with zero retries, (d) host-key mismatch transitions to `SessionState::NeedsAttention`, and (e) clean `stop()` leaves no lingering `ssh` child process — done when: `cargo test -p conduit-runtime --test openssh_e2e` passes.
 
 ## Verify
 ```sh
-(cd src-tauri/ui && npm run check && npm run build)
+cargo build -p conduit-openssh --bin conduit-worker && cargo test -p conduit-runtime && cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 ## Escalate when
-- Any Phase 3 IPC command signature in `src-tauri/src/commands.rs` mismatches the expected TypeScript contract → stop, set Status: needs-human — reason: exact signature mismatch
+- `conduit-openssh` API is missing a required field or method (e.g. `-R` reverse forward specs or stderr log callback) needed by `OpenSshLink` → stop, set `Status: needs-human — reason: <exact API gap in conduit-openssh>`
+- `conduit-worker` binary is not automatically built before `cargo test -p conduit-runtime` (note: in Cargo, integration tests in `conduit-runtime` do not automatically build binaries from a dependency crate unless `cargo build -p conduit-openssh --bin conduit-worker` ran or a helper builds/locates it) → stop, set `Status: needs-human — reason: <describe worker binary discovery issue>`
 
 ## Log
 - (append-only, one line per event)
-- sub-task 1: added hop agent fields, typed clients and preview mocks for the 5 Phase 3 commands; new hops and key deletion now handle agent_forward_keys
-- sub-task 2: HopEditor gained the Forwarded Keys checklist and optional Remote Command, and the old not-forwarded caveat is gone
-- sub-task 3: added ForwardProxyTab (bind warning, ports, mux toggle, max_connections, debounced conflict check), ReverseProxyTab (GatewayPorts warning, mux indicator), and a shared PortField
-- sub-task 4: SessionEditor is now the accessible 7-tab editor with per-tab error badges, Tabs 1-3 wired, placeholders for Tabs 4-7, and dist rebuilt
+- sub-task 1: added OpenSshLink and DefaultEngine dispatch in runner.rs, moved shared proxy setup into ProxyStack used by both engines, switched manager.rs to DefaultEngine
+- sub-task 2: added crates/conduit-runtime/tests/openssh_e2e.rs with 8 real /usr/bin/ssh tests; test helper builds conduit-worker and passes its path through CARGO_BIN_EXE_conduit-worker
+- sub-task 2 stopped after two failed check runs; port-collision fix not attempted
+- planner unblocked: approved port-collision fix (allocate test ports below ephemeral range as in `e2e_runtime.rs:297-315` and make `OpenSshLink::socks_port()` skip the profile's `forward.http_port`/`forward.socks_port`). Confirmed `agent_forward` on OpenSSH should log a clear notice and continue (per Master Plan Section 3.1 `ssh -N` limitation). Run full `## Verify` including `e2e_runtime` and `openssh_e2e`.
+- sub-task 2: applied the approved fix: test forward ports now come from 30000-31999, below the ephemeral range, and OpenSshLink::socks_port skips the profile forward ports
+- phase verified and closed
 
 ## Evidence
 - (append-only: command → observed result)
-- cd src-tauri/ui && npm run check → 149 FILES 0 ERRORS 0 WARNINGS
-- cd src-tauri/ui && npm run check → 149 FILES 0 ERRORS 0 WARNINGS; grep 'does not forward' src-tauri/ui/src → 0 matches
-- cd src-tauri/ui && npm run check → 152 FILES 0 ERRORS 0 WARNINGS
-- (cd src-tauri/ui && npm run check && npm run build) → exit 0; 152 FILES 0 ERRORS 0 WARNINGS; 148 modules, built in 3.58s
-- ## Verify: (cd src-tauri/ui && npm run check && npm run build) → exit 0; 0 errors, 0 warnings; production bundle built
-- headless Chromium against the Vite preview with mock IPC → 23 PASS, 0 FAIL, 0 console errors (tabs, keyboard nav, port conflicts, mux, badges, warnings, key picker, save round trip); not run against the real Tauri backend
+- `cargo test -p conduit-runtime --lib` → test result: ok. 50 passed; 0 failed
+- `cargo test -p conduit-runtime --test openssh_e2e` (run 1) → FAILED 0 passed, 8 failed: conduit-worker was not found near target/debug/build/conduit-runtime/<hash>/out/openssh_e2e-<hash>
+- `cargo test -p conduit-runtime --test openssh_e2e` (run 2) → FAILED 7 passed, 1 failed: key_auth_carries_http_and_socks_with_stats_and_logs, failed to bind SOCKS4/4a/5 listener on 127.0.0.1:41797: Address already in use (os error 98)
+- `cargo clippy --workspace --all-targets -- -D warnings` → exit 0
+- `cargo test -p conduit-runtime --lib` → test result: ok. 50 passed; 0 failed
+- full ## Verify block → not run to completion, because sub-task 2 is blocked
+- `cargo test -p conduit-runtime --test openssh_e2e` (run 3, after approved fix) → test result: ok. 8 passed; 0 failed
+- `cargo build -p conduit-openssh --bin conduit-worker && cargo test -p conduit-runtime && cargo clippy --workspace --all-targets -- -D warnings` → exit 0; lib 50 passed, e2e_runtime 8 passed, openssh_e2e 8 passed, doc 0
+- `cargo test -p conduit-runtime --test openssh_e2e` repeated 5 times → 8 passed, 0 failed each run, no `Address already in use`
+- `ps -axww -o command= | grep -cE '^[/]usr/bin/ssh -F'` after all runs → 0 leftover ssh processes
