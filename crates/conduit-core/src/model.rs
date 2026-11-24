@@ -251,7 +251,11 @@ fn default_max_connections() -> usize {
 
 /// Forward (`ssh -D`) listener configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "wire::ForwardConfig")]
 pub struct ForwardConfig {
+    /// Whether the forward proxy runs. Off keeps the ports below for when it is turned back on;
+    /// the engine then sees both ports as `0`.
+    pub enabled: bool,
     #[serde(default = "default_bind")]
     pub bind: IpAddr,
     #[serde(default = "default_http_port")]
@@ -271,6 +275,7 @@ pub struct ForwardConfig {
 impl Default for ForwardConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             bind: default_bind(),
             http_port: default_http_port(),
             socks_port: default_socks_port(),
@@ -283,7 +288,11 @@ impl Default for ForwardConfig {
 
 /// Reverse (`ssh -R`) listener configuration. Ports default to `0` (disabled).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "wire::ReverseConfig")]
 pub struct ReverseConfig {
+    /// Whether the reverse proxy runs. Off keeps the ports below for when it is turned back on;
+    /// the engine then sees both ports as `0`.
+    pub enabled: bool,
     #[serde(default = "default_reverse_bind")]
     pub reverse_bind: IpAddr,
     #[serde(default)]
@@ -302,12 +311,103 @@ pub struct ReverseConfig {
 impl Default for ReverseConfig {
     fn default() -> Self {
         Self {
+            enabled: false,
             reverse_bind: default_reverse_bind(),
             reverse_http_port: 0,
             reverse_socks_port: 0,
             reverse_max_connections: None,
             reverse_allow: Vec::new(),
             reverse_block: Vec::new(),
+        }
+    }
+}
+
+impl ForwardConfig {
+    /// The ports the engine listens on: both `0` while the forward proxy is off.
+    pub fn effective_ports(&self) -> (u16, u16) {
+        if self.enabled { (self.http_port, self.socks_port) } else { (0, 0) }
+    }
+}
+
+impl ReverseConfig {
+    /// The ports opened on the target: both `0` while the reverse proxy is off.
+    pub fn effective_ports(&self) -> (u16, u16) {
+        if self.enabled {
+            (self.reverse_http_port, self.reverse_socks_port)
+        } else {
+            (0, 0)
+        }
+    }
+}
+
+/// On-disk shapes. Profiles saved before the on/off switch have no `enabled`, so it is inferred
+/// from the ports: a proxy with any non-zero port was running.
+mod wire {
+    use super::*;
+
+    #[derive(Deserialize)]
+    pub(super) struct ForwardConfig {
+        #[serde(default)]
+        enabled: Option<bool>,
+        #[serde(default = "default_bind")]
+        bind: IpAddr,
+        #[serde(default = "default_http_port")]
+        http_port: u16,
+        #[serde(default = "default_socks_port")]
+        socks_port: u16,
+        #[serde(default = "default_max_connections")]
+        max_connections: usize,
+        #[serde(default)]
+        allow: Vec<String>,
+        #[serde(default)]
+        block: Vec<String>,
+    }
+
+    impl From<ForwardConfig> for super::ForwardConfig {
+        fn from(w: ForwardConfig) -> Self {
+            Self {
+                enabled: w.enabled.unwrap_or(w.http_port != 0 || w.socks_port != 0),
+                bind: w.bind,
+                http_port: w.http_port,
+                socks_port: w.socks_port,
+                max_connections: w.max_connections,
+                allow: w.allow,
+                block: w.block,
+            }
+        }
+    }
+
+    #[derive(Deserialize)]
+    pub(super) struct ReverseConfig {
+        #[serde(default)]
+        enabled: Option<bool>,
+        #[serde(default = "default_reverse_bind")]
+        reverse_bind: IpAddr,
+        #[serde(default)]
+        reverse_http_port: u16,
+        #[serde(default)]
+        reverse_socks_port: u16,
+        #[serde(default)]
+        reverse_max_connections: Option<usize>,
+        #[serde(default)]
+        reverse_allow: Vec<String>,
+        #[serde(default)]
+        reverse_block: Vec<String>,
+    }
+
+    impl From<ReverseConfig> for super::ReverseConfig {
+        fn from(w: ReverseConfig) -> Self {
+            Self {
+                enabled: w
+                    .enabled
+                    .unwrap_or(w.reverse_http_port != 0 || w.reverse_socks_port != 0),
+                reverse_bind: w.reverse_bind,
+                reverse_http_port: w.reverse_http_port,
+                reverse_socks_port: w.reverse_socks_port,
+                reverse_max_connections: w.reverse_max_connections,
+                reverse_allow: w.reverse_allow,
+                reverse_block: w.reverse_block,
+            }
         }
     }
 }
@@ -330,6 +430,18 @@ fn default_server_alive_interval() -> Duration {
 
 fn default_server_alive_count_max() -> u32 {
     3
+}
+
+fn default_tcp_keepalive() -> Duration {
+    Duration::from_secs(60)
+}
+
+fn default_tcp_keepalive_interval() -> Duration {
+    Duration::from_secs(10)
+}
+
+fn default_tcp_keepalive_retries() -> u32 {
+    5
 }
 
 fn default_reconnect_initial() -> Duration {
@@ -412,6 +524,16 @@ pub struct TunnelConfig {
     pub server_alive_interval: Duration,
     #[serde(default = "default_server_alive_count_max")]
     pub server_alive_count_max: u32,
+    /// Idle time before TCP keepalive probes start on proxy client sockets and reverse proxy
+    /// upstream sockets (`0` = TCP keepalive off). One setting covers forward and reverse.
+    #[serde(default = "default_tcp_keepalive", with = "serde_duration")]
+    pub tcp_keepalive: Duration,
+    /// Time between unanswered TCP keepalive probes.
+    #[serde(default = "default_tcp_keepalive_interval", with = "serde_duration")]
+    pub tcp_keepalive_interval: Duration,
+    /// Unanswered TCP keepalive probes before the OS closes the connection.
+    #[serde(default = "default_tcp_keepalive_retries")]
+    pub tcp_keepalive_retries: u32,
     #[serde(default)]
     pub no_reconnect: bool,
     #[serde(default = "default_reconnect_initial", with = "serde_duration")]
@@ -428,6 +550,9 @@ impl Default for TunnelConfig {
             ip_version: default_ip_version(),
             server_alive_interval: default_server_alive_interval(),
             server_alive_count_max: default_server_alive_count_max(),
+            tcp_keepalive: default_tcp_keepalive(),
+            tcp_keepalive_interval: default_tcp_keepalive_interval(),
+            tcp_keepalive_retries: default_tcp_keepalive_retries(),
             no_reconnect: false,
             reconnect_initial_delay: default_reconnect_initial(),
             reconnect_max_delay: default_reconnect_max(),
@@ -626,6 +751,42 @@ fn default_host_port() -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_enabled_is_inferred_from_ports_when_absent() {
+        let forward: ForwardConfig =
+            serde_json::from_str(r#"{"http_port": 0, "socks_port": 0}"#).unwrap();
+        assert!(!forward.enabled);
+        let forward: ForwardConfig = serde_json::from_str(r#"{"http_port": 3128}"#).unwrap();
+        assert!(forward.enabled);
+        // Missing ports take their defaults, which are on.
+        assert!(serde_json::from_str::<ForwardConfig>("{}").unwrap().enabled);
+
+        let reverse: ReverseConfig = serde_json::from_str("{}").unwrap();
+        assert!(!reverse.enabled);
+        let reverse: ReverseConfig =
+            serde_json::from_str(r#"{"reverse_socks_port": 1081}"#).unwrap();
+        assert!(reverse.enabled);
+    }
+
+    #[test]
+    fn proxy_enabled_round_trips_and_keeps_ports_while_off() {
+        let forward = ForwardConfig { enabled: false, ..ForwardConfig::default() };
+        let json = serde_json::to_string(&forward).unwrap();
+        let back: ForwardConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, forward);
+        assert_eq!(back.http_port, 3128);
+        assert_eq!(back.effective_ports(), (0, 0));
+
+        let reverse = ReverseConfig {
+            enabled: true,
+            reverse_http_port: 8888,
+            ..ReverseConfig::default()
+        };
+        let json = serde_json::to_string(&reverse).unwrap();
+        assert_eq!(serde_json::from_str::<ReverseConfig>(&json).unwrap(), reverse);
+        assert_eq!(reverse.effective_ports(), (8888, 0));
+    }
 
     #[test]
     fn host_key_record_without_public_key_deserializes() {

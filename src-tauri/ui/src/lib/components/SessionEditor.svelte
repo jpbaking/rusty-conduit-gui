@@ -5,7 +5,6 @@
   import type { HopEntry, SessionProfile } from "../types";
   import type { FieldErrors } from "../validate";
   import FiltersTab from "./FiltersTab.svelte";
-  import ForwardProxyTab from "./ForwardProxyTab.svelte";
   import HopEditor from "./HopEditor.svelte";
   import HopProfileBar from "./HopProfileBar.svelte";
   import JumpChainBuilder from "./JumpChainBuilder.svelte";
@@ -13,34 +12,32 @@
   import ListenerStrip from "./ListenerStrip.svelte";
   import LoggingAdvancedTab from "./LoggingAdvancedTab.svelte";
   import MitmTab from "./MitmTab.svelte";
-  import ReverseProxyTab from "./ReverseProxyTab.svelte";
+  import ProxyTab from "./ProxyTab.svelte";
 
   // Short labels keep the tab row on one line; the full name is the tooltip.
   const TABS = [
     { label: "Connection", title: "Connection & jump chain" },
-    { label: "Forward", title: "Forward proxy" },
-    { label: "Reverse", title: "Reverse proxy (-R)" },
+    { label: "Proxy", title: "Forward & reverse (-R) proxy" },
     { label: "Filters", title: "Destination filters" },
     { label: "MITM", title: "HTTPS MITM" },
     { label: "Keepalive", title: "Keepalive & reconnect" },
     { label: "Advanced", title: "Logging & advanced" },
   ] as const;
   const CONNECTION_TAB = 0;
-  const FORWARD_TAB = 1;
-  const REVERSE_TAB = 2;
-  const FILTERS_TAB = 3;
-  const MITM_TAB = 4;
-  const KEEPALIVE_TAB = 5;
-  const LOGGING_TAB = 6;
+  const PROXY_TAB = 1;
+  const FILTERS_TAB = 2;
+  const MITM_TAB = 3;
+  const KEEPALIVE_TAB = 4;
+  const LOGGING_TAB = 5;
 
-  /** The tabs that show a field's error. "No listeners" can be fixed on either proxy tab. */
+  /** The tabs that show a field's error. */
   function tabsForField(field: string): number[] {
     if (field === "hops" || field.startsWith("hop:") || field === "tunnel.ip_version") {
       return [CONNECTION_TAB];
     }
-    if (field.startsWith("forward.")) return [FORWARD_TAB];
-    if (field.startsWith("reverse.")) return [REVERSE_TAB];
-    if (field === "listeners") return [FORWARD_TAB, REVERSE_TAB];
+    if (field.startsWith("forward.") || field.startsWith("reverse.") || field === "listeners") {
+      return [PROXY_TAB];
+    }
     if (field.startsWith("filters.")) return [FILTERS_TAB];
     if (field.startsWith("mitm.")) return [MITM_TAB];
     if (field.startsWith("tunnel.")) return [KEEPALIVE_TAB];
@@ -193,14 +190,8 @@
     </div>
   </div>
 
-  <div class="tab-panel" role="tabpanel" id={panelId(FORWARD_TAB)} aria-labelledby={tabId(FORWARD_TAB)} hidden={activeTab !== FORWARD_TAB}>
-    {#key store.selectedId}
-      <ForwardProxyTab />
-    {/key}
-  </div>
-
-  <div class="tab-panel" role="tabpanel" id={panelId(REVERSE_TAB)} aria-labelledby={tabId(REVERSE_TAB)} hidden={activeTab !== REVERSE_TAB}>
-    <ReverseProxyTab />
+  <div class="tab-panel" role="tabpanel" id={panelId(PROXY_TAB)} aria-labelledby={tabId(PROXY_TAB)} hidden={activeTab !== PROXY_TAB}>
+    <ProxyTab />
   </div>
 
   <!-- Keyed so per-session editor state, such as a typed rule, never carries across sessions. -->

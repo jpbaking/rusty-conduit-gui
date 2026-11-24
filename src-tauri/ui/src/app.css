@@ -229,6 +229,27 @@ button.link-button { min-height: 0; padding: 0; color: var(--accent); background
 .card-body { margin: 0; padding: 0; border: 0; }
 .card > h2 { margin: 0; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; }
 .card > h2 small { margin-left: 4px; text-transform: none; letter-spacing: 0; font-size: 11px; }
+.card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.card-head > h2 { margin: 0; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; }
+.card-head > h2 small { margin-left: 4px; text-transform: none; letter-spacing: 0; font-size: 11px; }
+.proxy-switch { position: relative; flex: 0 0 auto; gap: 6px; font-size: 12px; font-weight: 600; }
+/* Single-port multiplex ticked by the app: pulse it and keep it outlined while the note shows. */
+.mux-check { align-self: flex-start; padding: 2px 6px; margin-left: -6px; border: 1px solid transparent; border-radius: 6px; }
+.mux-check.auto-on { border-color: var(--accent); animation: mux-pulse 0.6s ease-out 3; }
+@keyframes mux-pulse { from { box-shadow: 0 0 0 0 var(--accent); } to { box-shadow: 0 0 0 6px transparent; } }
+@media (prefers-reduced-motion: reduce) { .mux-check.auto-on { animation: none; } }
+/* A disabled input swallows the pointer, so let it fall through to the label's tooltip. */
+.proxy-switch input:disabled { pointer-events: none; }
+.proxy-switch[data-tip]::after {
+  content: attr(data-tip); position: absolute; top: calc(100% + 6px); right: 0; z-index: 20;
+  width: max-content; max-width: 260px; padding: 5px 8px; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--surface-2); color: var(--text); font-size: 12px; font-weight: 400; line-height: 1.35;
+  box-shadow: 0 4px 12px rgb(0 0 0 / 0.25); pointer-events: none;
+  opacity: 0; visibility: hidden; transition: opacity 120ms ease, visibility 0s linear 120ms;
+}
+.proxy-switch[data-tip]:hover::after {
+  opacity: 1; visibility: visible; transition: opacity 120ms ease 150ms, visibility 0s linear 150ms;
+}
 .card > .check, .card-body > .check, .card > .segmented { align-self: flex-start; }
 .card .field-row { align-items: flex-start; }
 .card.inactive .card-body { opacity: 0.5; }

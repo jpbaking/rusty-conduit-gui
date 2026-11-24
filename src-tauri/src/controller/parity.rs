@@ -204,7 +204,9 @@ impl AppController {
                 if !binds_overlap(bind, other.forward.bind) {
                     continue;
                 }
-                let roles = [("HTTP", other.forward.http_port), ("SOCKS", other.forward.socks_port)];
+                // A session whose forward proxy is switched off holds no forward ports.
+                let (other_http, other_socks) = other.forward.effective_ports();
+                let roles = [("HTTP", other_http), ("SOCKS", other_socks)];
                 for (role, _) in roles.iter().filter(|(_, p)| *p == port) {
                     conflicts.push(PortConflict {
                         port,
@@ -406,6 +408,24 @@ mod tests {
         let id = add_session(&c, "self", "127.0.0.1", port, 0);
         assert!(c.check_port_conflicts(Some(id), LOOPBACK, port, 0).conflicts.is_empty());
         assert!(c.check_port_conflicts(None, LOOPBACK, 0, 0).conflicts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn parity_port_check_ignores_a_session_with_forward_switched_off() {
+        let dir = TempDir::new();
+        let c = controller(&dir);
+        let port = free_port();
+        let mut off = profile("off", 22);
+        off.forward.http_port = port;
+        off.forward.enabled = false;
+        off.reverse.enabled = true;
+        off.reverse.reverse_http_port = 8888;
+        c.mutate_config(|config| {
+            config.sessions.push(off.clone());
+            Ok(())
+        })
+        .unwrap();
+        assert!(c.check_port_conflicts(None, LOOPBACK, port, 0).conflicts.is_empty());
     }
 
     #[tokio::test]

@@ -8,7 +8,9 @@
 use std::str::FromStr;
 use std::time::Duration;
 
-use rusty_conduit_ssh::config::{MIN_MITM_CERT_TTL, SshIpVersion};
+use rusty_conduit_ssh::config::{
+    MAX_TCP_KEEPALIVE_DURATION, MAX_TCP_KEEPALIVE_RETRIES, MIN_MITM_CERT_TTL, SshIpVersion,
+};
 use rusty_conduit_ssh::filter::FilterRule;
 use rusty_conduit_ssh::logging::{LogFormat, LogLevel};
 use thiserror::Error;
@@ -19,7 +21,7 @@ use crate::{MitmCaMode, SessionProfile};
 #[derive(Debug, Error)]
 pub enum ValidateError {
     #[error(
-        "http_port, socks_port, reverse_http_port, and reverse_socks_port are all 0: at least one listener must be enabled"
+        "no listeners: turn on the forward or reverse proxy with at least one non-zero port"
     )]
     NoListeners,
     // Structural: `MitmCaMode` is an enum, so a PKCS#12 bundle and a PEM pair can never coexist.
@@ -47,6 +49,8 @@ pub enum ValidateError {
         initial: Duration,
         max: Duration,
     },
+    #[error("invalid TCP keepalive setting: {0}")]
+    InvalidKeepalive(String),
     #[error("both an allowlist and a blocklist are set for `{scope}` filters: choose one")]
     ConflictingFilter { scope: &'static str },
     #[error("invalid filter rule in `{scope}`: {rule} ({message})")]
@@ -70,14 +74,14 @@ pub enum ValidateError {
     },
 }
 
-/// Whether at least one forward (`ssh -D`) listener is enabled.
+/// Whether the forward (`ssh -D`) proxy is on with at least one listener.
 fn forward_enabled(profile: &SessionProfile) -> bool {
-    profile.forward.http_port != 0 || profile.forward.socks_port != 0
+    profile.forward.effective_ports() != (0, 0)
 }
 
-/// Whether at least one reverse (`ssh -R`) listener is enabled.
+/// Whether the reverse (`ssh -R`) proxy is on with at least one listener.
 fn reverse_enabled(profile: &SessionProfile) -> bool {
-    profile.reverse.reverse_http_port != 0 || profile.reverse.reverse_socks_port != 0
+    profile.reverse.effective_ports() != (0, 0)
 }
 
 /// Short `ssh` flags that break tunnel isolation. Case-sensitive, as `ssh` treats them.
@@ -137,6 +141,36 @@ fn denylisted_flag(token: &str) -> Option<&'static str> {
     None
 }
 
+/// Mirror of the TCP keepalive range checks in `Config::validate` (Linux kernel limits).
+fn tcp_keepalive(profile: &SessionProfile) -> Result<(), ValidateError> {
+    let t = &profile.tunnel;
+    if t.tcp_keepalive.is_zero() {
+        return Ok(());
+    }
+    let range = Duration::from_secs(1)..=MAX_TCP_KEEPALIVE_DURATION;
+    let max = MAX_TCP_KEEPALIVE_DURATION.as_secs();
+    let fmt = |d: Duration| humantime::format_duration(d).to_string();
+    if !range.contains(&t.tcp_keepalive) {
+        return Err(ValidateError::InvalidKeepalive(format!(
+            "--tcp-keepalive must be 0 (disabled) or between 1s and {max}s (got {})",
+            fmt(t.tcp_keepalive)
+        )));
+    }
+    if !range.contains(&t.tcp_keepalive_interval) {
+        return Err(ValidateError::InvalidKeepalive(format!(
+            "--tcp-keepalive-interval must be between 1s and {max}s (got {})",
+            fmt(t.tcp_keepalive_interval)
+        )));
+    }
+    if !(1..=MAX_TCP_KEEPALIVE_RETRIES).contains(&t.tcp_keepalive_retries) {
+        return Err(ValidateError::InvalidKeepalive(format!(
+            "--tcp-keepalive-retries must be between 1 and {MAX_TCP_KEEPALIVE_RETRIES} (got {})",
+            t.tcp_keepalive_retries
+        )));
+    }
+    Ok(())
+}
+
 /// Validate a [`SessionProfile`], returning the first `FATAL` problem found.
 ///
 /// The rules here are a faithful port of [`rusty_conduit_ssh::config::Config::validate`],
@@ -193,6 +227,9 @@ pub fn validate(profile: &SessionProfile) -> Result<(), ValidateError> {
             max: profile.tunnel.reconnect_max_delay,
         });
     }
+
+    // TCP keepalive ranges (interval / retries are only checked while keepalive is on).
+    tcp_keepalive(profile)?;
 
     // Forward and reverse filters are each mutually exclusive allow/block.
     if !profile.forward.allow.is_empty() && !profile.forward.block.is_empty() {
@@ -296,6 +333,17 @@ mod tests {
         p.forward.http_port = 0;
         p.forward.socks_port = 0;
         assert!(matches!(validate(&p), Err(ValidateError::NoListeners)));
+    }
+
+    #[test]
+    fn switched_off_proxies_do_not_count_as_listeners() {
+        let mut p = forward_profile();
+        p.forward.enabled = false;
+        p.reverse.reverse_http_port = 8888;
+        // Reverse ports set but switched off: nothing listens.
+        assert!(matches!(validate(&p), Err(ValidateError::NoListeners)));
+        p.reverse.enabled = true;
+        assert!(validate(&p).is_ok());
     }
 
     #[test]
@@ -474,6 +522,40 @@ mod tests {
             validate(&p),
             Err(ValidateError::ReconnectDelayOrder { .. })
         ));
+    }
+
+    #[test]
+    fn tcp_keepalive_ranges() {
+        let secs = Duration::from_secs;
+        assert!(validate(&forward_profile()).is_ok());
+        for (idle, interval, retries) in [
+            (secs(32_768), secs(10), 5),
+            (Duration::from_millis(500), secs(10), 5),
+            (secs(60), Duration::ZERO, 5),
+            (secs(60), secs(32_768), 5),
+            (secs(60), secs(10), 0),
+            (secs(60), secs(10), 128),
+        ] {
+            let mut p = forward_profile();
+            p.tunnel.tcp_keepalive = idle;
+            p.tunnel.tcp_keepalive_interval = interval;
+            p.tunnel.tcp_keepalive_retries = retries;
+            assert!(
+                matches!(validate(&p), Err(ValidateError::InvalidKeepalive(_))),
+                "{idle:?}/{interval:?}x{retries}"
+            );
+        }
+        // Off: interval and retries are not checked.
+        let mut p = forward_profile();
+        p.tunnel.tcp_keepalive = Duration::ZERO;
+        p.tunnel.tcp_keepalive_interval = Duration::ZERO;
+        p.tunnel.tcp_keepalive_retries = 0;
+        assert!(validate(&p).is_ok());
+        // Upper bounds are inclusive.
+        p.tunnel.tcp_keepalive = secs(32_767);
+        p.tunnel.tcp_keepalive_interval = secs(32_767);
+        p.tunnel.tcp_keepalive_retries = 127;
+        assert!(validate(&p).is_ok());
     }
 
     #[test]

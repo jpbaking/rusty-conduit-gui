@@ -4,14 +4,17 @@
   import type { ForwardConfig, PortConflict, SessionProfile } from "../types";
   import { PortMux, shareablePort } from "../portMux.svelte";
   import { isIpAddress, isLoopback, isPort } from "../validate";
+  import MuxCheckbox from "./MuxCheckbox.svelte";
   import PortField from "./PortField.svelte";
+  import ProxySwitch from "./ProxySwitch.svelte";
 
   const CHECK_DELAY_MS = 300;
 
   const uid = $props.id();
   const forward = $derived((store.draft as SessionProfile).forward);
+  const reverseOn = $derived((store.draft as SessionProfile).reverse.enabled);
   const errors = $derived(store.draftErrors);
-  const forwardOn = $derived(forward.http_port !== 0 || forward.socks_port !== 0);
+  const forwardOn = $derived(forward.enabled && (forward.http_port !== 0 || forward.socks_port !== 0));
   const exposed = $derived(forwardOn && isIpAddress(forward.bind) && !isLoopback(forward.bind));
   const mux = new PortMux(() => ({ http: forward.http_port, socks: forward.socks_port }));
   const canShare = $derived(shareablePort({ http: forward.http_port, socks: forward.socks_port }) !== null);
@@ -22,6 +25,12 @@
     store.updateDraft((profile) => ({ ...profile, forward: { ...profile.forward, ...patch } }));
   }
 
+  /** Turning on with no ports set fills in the usual ones, so the proxy has a listener. */
+  function setEnabled(enabled: boolean) {
+    const unset = forward.http_port === 0 && forward.socks_port === 0;
+    setForward(enabled && unset ? { enabled, http_port: 3128, socks_port: 1080 } : { enabled });
+  }
+
   function setMux(on: boolean) {
     const ports = mux.toggle(on);
     if (ports) setForward({ http_port: ports.http, socks_port: ports.socks });
@@ -29,10 +38,11 @@
 
   $effect(() => {
     const id = store.selectedId;
-    const { bind, http_port, socks_port } = forward;
+    const { enabled, bind, http_port, socks_port } = forward;
     conflicts = [];
     checkError = null;
     const checkable =
+      enabled &&
       isIpAddress(bind) &&
       isPort(http_port, true) &&
       isPort(socks_port, true) &&
@@ -56,8 +66,19 @@
   });
 </script>
 
-<section class="card" aria-labelledby={`${uid}-heading`}>
-  <h2 id={`${uid}-heading`}>Forward proxy <small class="muted">port 0 turns a listener off</small></h2>
+<section class="card" class:inactive={!forward.enabled} aria-labelledby={`${uid}-heading`}>
+  <div class="card-head">
+    <h2 id={`${uid}-heading`}>Forward proxy <small class="muted">port 0 turns a listener off</small></h2>
+    <ProxySwitch
+      name="Forward proxy"
+      on={forward.enabled}
+      lockedReason={reverseOn ? undefined : "To turn this off, turn on the reverse proxy first"}
+      onToggle={setEnabled}
+    />
+  </div>
+  <!-- Switched off, the values stay as they are for when the proxy is turned back on. -->
+  <fieldset class="card-body" disabled={!forward.enabled}>
+  <legend class="sr-only">Forward proxy settings</legend>
   <div class="field-row">
     <div class="field grow">
       <label class="field">
@@ -113,20 +134,13 @@
     </div>
   </div>
 
-  <label class="check">
-    <input
-      type="checkbox"
-      checked={mux.on}
-      disabled={!mux.on && !canShare}
-      onchange={(e) => setMux(e.currentTarget.checked)}
-    />
-    Single-port multiplex <small class="muted">HTTP and SOCKS share one port</small>
-  </label>
+  <MuxCheckbox {mux} {canShare} onToggle={setMux} />
+  {#if errors["forward.ports"]}<p class="field-error">{errors["forward.ports"]}</p>{/if}
+  </fieldset>
 
   {#if exposed}
     <p class="warning">This address is not loopback, so other devices on the network may reach this proxy.</p>
   {/if}
-  {#if errors.listeners}<p class="field-error">{errors.listeners}</p>{/if}
 
   <div role="status">
     {#if conflicts.length > 0}

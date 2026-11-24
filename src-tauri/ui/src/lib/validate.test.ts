@@ -38,6 +38,7 @@ function validProfile(): SessionProfile {
       },
     ],
     forward: {
+      enabled: true,
       bind: "127.0.0.1",
       http_port: 8080,
       socks_port: 1080,
@@ -46,6 +47,7 @@ function validProfile(): SessionProfile {
       block: [],
     },
     reverse: {
+      enabled: false,
       reverse_bind: "127.0.0.1",
       reverse_http_port: 0,
       reverse_socks_port: 0,
@@ -58,6 +60,9 @@ function validProfile(): SessionProfile {
       ip_version: "auto",
       server_alive_interval: 30,
       server_alive_count_max: 3,
+      tcp_keepalive: 60,
+      tcp_keepalive_interval: 10,
+      tcp_keepalive_retries: 5,
       no_reconnect: false,
       reconnect_initial_delay: 1,
       reconnect_max_delay: 60,
@@ -293,12 +298,30 @@ describe("sessionErrors", () => {
     assert.equal(sessionErrors(profile)["reverse.max_connections"], undefined);
   });
 
-  test("requires at least one listener port", () => {
+  test("requires a port on a proxy that is switched on", () => {
     const profile = validProfile();
     profile.forward.http_port = 0;
     profile.forward.socks_port = 0;
+    let errors = sessionErrors(profile);
+    assert.equal(errors["forward.ports"], "Set an HTTP or SOCKS port, or switch the forward proxy off.");
+    assert.equal(errors.listeners, undefined);
+
+    profile.reverse.enabled = true;
+    errors = sessionErrors(profile);
+    assert.equal(errors["reverse.ports"], "Set an HTTP or SOCKS port, or switch the reverse proxy off.");
+
+    // Switched off, zero ports are fine; the reverse proxy with a port carries the session.
+    profile.forward.enabled = false;
+    profile.reverse.reverse_http_port = 8888;
+    assert.deepEqual(sessionErrors(profile), {});
+  });
+
+  test("requires the forward or reverse proxy to be on", () => {
+    const profile = validProfile();
+    profile.forward.enabled = false;
     const errors = sessionErrors(profile);
-    assert.equal(errors.listeners, "Enable at least one forward or reverse port.");
+    assert.equal(errors.listeners, "Turn on the forward or reverse proxy.");
+    assert.equal(errors["forward.ports"], undefined);
   });
 
   test("rejects an allowlist and blocklist together", () => {
@@ -339,6 +362,31 @@ describe("sessionErrors", () => {
       sessionErrors(profile)["tunnel.reconnect_initial_delay"],
       "The initial delay cannot exceed the maximum delay.",
     );
+  });
+
+  test("checks TCP keepalive ranges like the engine", () => {
+    const profile = validProfile();
+    profile.tunnel.tcp_keepalive = 32_768;
+    profile.tunnel.tcp_keepalive_interval = 0;
+    profile.tunnel.tcp_keepalive_retries = 128;
+    const errors = sessionErrors(profile);
+    assert.equal(errors["tunnel.tcp_keepalive"], "Use 0 (off) or a whole number from 1 to 32767.");
+    assert.equal(errors["tunnel.tcp_keepalive_interval"], "Use a whole number from 1 to 32767.");
+    assert.equal(errors["tunnel.tcp_keepalive_retries"], "Use a whole number from 1 to 127.");
+
+    profile.tunnel.tcp_keepalive = 32_767;
+    profile.tunnel.tcp_keepalive_interval = 32_767;
+    profile.tunnel.tcp_keepalive_retries = 127;
+    assert.deepEqual(sessionErrors(profile), {});
+
+    // Off: interval and probes are not checked.
+    profile.tunnel.tcp_keepalive = 0;
+    profile.tunnel.tcp_keepalive_interval = Number.NaN;
+    profile.tunnel.tcp_keepalive_retries = 0;
+    assert.deepEqual(sessionErrors(profile), {});
+
+    profile.tunnel.tcp_keepalive = 1.5;
+    assert.equal(sessionErrors(profile)["tunnel.tcp_keepalive"], "Use 0 (off) or a whole number from 1 to 32767.");
   });
 
   test("applies the OpenSSH denylist for every engine", () => {

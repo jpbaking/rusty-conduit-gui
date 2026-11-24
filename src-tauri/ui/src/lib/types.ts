@@ -147,6 +147,8 @@ export interface HopEntry {
 }
 
 export interface ForwardConfig {
+  /** Whether the forward proxy runs. Off keeps the ports; the engine then listens on none. */
+  enabled: boolean;
   bind: string;
   http_port: number;
   socks_port: number;
@@ -156,6 +158,8 @@ export interface ForwardConfig {
 }
 
 export interface ReverseConfig {
+  /** Whether the reverse proxy runs. Off keeps the ports; nothing is opened on the target. */
+  enabled: boolean;
   reverse_bind: string;
   reverse_http_port: number;
   reverse_socks_port: number;
@@ -182,6 +186,12 @@ export interface TunnelConfig {
   /** Seconds. */
   server_alive_interval: number;
   server_alive_count_max: number;
+  /** Seconds of idle before TCP keepalive probes start on proxy sockets, 0 = off. */
+  tcp_keepalive: number;
+  /** Seconds between unanswered TCP keepalive probes. */
+  tcp_keepalive_interval: number;
+  /** Unanswered TCP keepalive probes before the OS closes the connection. */
+  tcp_keepalive_retries: number;
   no_reconnect: boolean;
   /** Seconds. */
   reconnect_initial_delay: number;

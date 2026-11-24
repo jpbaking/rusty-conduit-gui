@@ -103,17 +103,24 @@ pub fn to_config(
     let log_format = LogFormat::from_str(&profile.logging.format)
         .map_err(MappingError::InvalidLogFormat)?;
 
+    // A proxy that is switched off keeps its ports in the profile but listens on none.
+    let (http_port, socks_port) = profile.forward.effective_ports();
+    let (reverse_http_port, reverse_socks_port) = profile.reverse.effective_ports();
+
     Ok(Config {
         config_path: None,
         bind: profile.forward.bind,
-        http_port: profile.forward.http_port,
-        socks_port: profile.forward.socks_port,
+        http_port,
+        socks_port,
         max_connections: profile.forward.max_connections,
+        tcp_keepalive: profile.tunnel.tcp_keepalive,
+        tcp_keepalive_interval: profile.tunnel.tcp_keepalive_interval,
+        tcp_keepalive_retries: profile.tunnel.tcp_keepalive_retries,
         allow,
         block,
         reverse_bind: profile.reverse.reverse_bind,
-        reverse_http_port: profile.reverse.reverse_http_port,
-        reverse_socks_port: profile.reverse.reverse_socks_port,
+        reverse_http_port,
+        reverse_socks_port,
         reverse_max_connections: profile
             .reverse
             .reverse_max_connections
@@ -308,6 +315,47 @@ mod tests {
         assert!(cfg.no_reconnect);
         assert_eq!(cfg.log_level, LogLevel::Verbose);
         assert_eq!(cfg.log_format, LogFormat::Json);
+    }
+
+    #[test]
+    fn switched_off_proxy_maps_to_zero_ports() {
+        let mut p = profile();
+        p.reverse.enabled = true;
+        p.reverse.reverse_http_port = 8888;
+        p.reverse.reverse_socks_port = 8889;
+        let cfg = to_config(&p, None).unwrap();
+        assert_eq!((cfg.http_port, cfg.socks_port), (3128, 1080));
+        assert_eq!((cfg.reverse_http_port, cfg.reverse_socks_port), (8888, 8889));
+
+        p.forward.enabled = false;
+        p.reverse.enabled = false;
+        let cfg = to_config(&p, None).unwrap();
+        assert_eq!((cfg.http_port, cfg.socks_port), (0, 0));
+        assert_eq!((cfg.reverse_http_port, cfg.reverse_socks_port), (0, 0));
+        // The profile keeps its ports for when the proxy is switched back on.
+        assert_eq!(p.forward.http_port, 3128);
+        assert_eq!(p.reverse.reverse_http_port, 8888);
+    }
+
+    #[test]
+    fn maps_tcp_keepalive() {
+        let cfg = to_config(&profile(), None).unwrap();
+        assert_eq!(
+            cfg.tcp_keepalive_settings(),
+            Some(rusty_conduit_ssh::net::KeepaliveSettings::DEFAULT)
+        );
+        let mut p = profile();
+        p.tunnel.tcp_keepalive = Duration::from_secs(120);
+        p.tunnel.tcp_keepalive_interval = Duration::from_secs(20);
+        p.tunnel.tcp_keepalive_retries = 3;
+        let cfg = to_config(&p, None).unwrap();
+        assert_eq!(
+            (cfg.tcp_keepalive, cfg.tcp_keepalive_interval, cfg.tcp_keepalive_retries),
+            (Duration::from_secs(120), Duration::from_secs(20), 3)
+        );
+        assert!(cfg.validate().is_ok());
+        p.tunnel.tcp_keepalive = Duration::ZERO;
+        assert_eq!(to_config(&p, None).unwrap().tcp_keepalive_settings(), None);
     }
 
     #[test]

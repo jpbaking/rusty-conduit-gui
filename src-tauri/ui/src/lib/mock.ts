@@ -53,6 +53,7 @@ function profile(id: string, name: string, host: string, httpPort: number): Sess
     engine: "Russh",
     hops: [{ hop_id: `${id}-hop`, name, host: hostProfile, agent_forward: false, agent_forward_keys: [], agent_forward_command: null }],
     forward: {
+      enabled: true,
       bind: "127.0.0.1",
       http_port: httpPort,
       socks_port: httpPort + 1,
@@ -61,6 +62,7 @@ function profile(id: string, name: string, host: string, httpPort: number): Sess
       block: [],
     },
     reverse: {
+      enabled: false,
       reverse_bind: "127.0.0.1",
       reverse_http_port: 0,
       reverse_socks_port: 0,
@@ -73,6 +75,9 @@ function profile(id: string, name: string, host: string, httpPort: number): Sess
       ip_version: "4",
       server_alive_interval: 15,
       server_alive_count_max: 3,
+      tcp_keepalive: 60,
+      tcp_keepalive_interval: 10,
+      tcp_keepalive_retries: 5,
       no_reconnect: false,
       reconnect_initial_delay: 1,
       reconnect_max_delay: 30,
@@ -84,7 +89,7 @@ function profile(id: string, name: string, host: string, httpPort: number): Sess
 }
 
 function withReverse(p: SessionProfile, httpPort: number): SessionProfile {
-  return { ...p, reverse: { ...p.reverse, reverse_http_port: httpPort } };
+  return { ...p, reverse: { ...p.reverse, enabled: true, reverse_http_port: httpPort } };
 }
 
 function view(p: SessionProfile, state: SessionState, active = 0): SessionView {

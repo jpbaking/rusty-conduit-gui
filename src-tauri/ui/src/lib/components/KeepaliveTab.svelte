@@ -8,6 +8,16 @@
   const tunnel = $derived(draft.tunnel);
   const errors = $derived(store.draftErrors);
 
+  // Worst case for the OS to drop a dead peer: idle, then every unanswered probe.
+  const tcpDeadAfter = $derived(
+    tunnel.tcp_keepalive + tunnel.tcp_keepalive_interval * tunnel.tcp_keepalive_retries,
+  );
+  const tcpValid = $derived(
+    !errors["tunnel.tcp_keepalive"] &&
+      !errors["tunnel.tcp_keepalive_interval"] &&
+      !errors["tunnel.tcp_keepalive_retries"],
+  );
+
   function setTunnel(patch: Partial<TunnelConfig>) {
     store.updateDraft((p) => ({ ...p, tunnel: { ...p.tunnel, ...patch } }));
   }
@@ -15,7 +25,7 @@
 
 <div class="card-grid">
 <section class="card" aria-labelledby={`${uid}-keepalive`}>
-  <h2 id={`${uid}-keepalive`}>Keepalive</h2>
+  <h2 id={`${uid}-keepalive`}>SSH keepalive</h2>
   <div class="field-row">
     <NumberField
       label="Server alive interval (seconds)"
@@ -34,6 +44,46 @@
   </div>
 </section>
 
+<section class="card" aria-labelledby={`${uid}-tcp-keepalive`}>
+  <h2 id={`${uid}-tcp-keepalive`}>TCP keepalive</h2>
+  <div class="field-row">
+    <NumberField
+      label="Idle before probes (seconds)"
+      value={tunnel.tcp_keepalive}
+      hint="0 turns TCP keepalive off"
+      error={errors["tunnel.tcp_keepalive"]}
+      onValue={(tcp_keepalive) => setTunnel({ tcp_keepalive })}
+    />
+  </div>
+  <!-- Stay editable while TCP keepalive is off: the values come back when it is turned on. -->
+  <div class="field-row">
+    <NumberField
+      label="Probe interval (seconds)"
+      value={tunnel.tcp_keepalive_interval}
+      min={1}
+      error={errors["tunnel.tcp_keepalive_interval"]}
+      onValue={(tcp_keepalive_interval) => setTunnel({ tcp_keepalive_interval })}
+    />
+    <NumberField
+      label="Probes before closing"
+      value={tunnel.tcp_keepalive_retries}
+      min={1}
+      error={errors["tunnel.tcp_keepalive_retries"]}
+      onValue={(tcp_keepalive_retries) => setTunnel({ tcp_keepalive_retries })}
+    />
+  </div>
+  {#if tunnel.tcp_keepalive === 0}
+    <p class="warning">TCP keepalive is off: idle proxy connections can be dropped by NAT, firewall, or VPN timeouts.</p>
+  {:else}
+    <p class="note">
+      Keeps idle proxy client connections and reverse proxy upstream connections alive. A dead
+      peer is closed after about {tcpValid ? `${tcpDeadAfter} seconds` : "the idle time plus every probe"}.
+    </p>
+  {/if}
+</section>
+</div>
+
+<div class="card-grid">
 <section class="card" aria-labelledby={`${uid}-reconnect`}>
   <h2 id={`${uid}-reconnect`}>Reconnect</h2>
   <label class="check">
@@ -63,7 +113,6 @@
     <p class="warning">An initial delay of 0 retries with no pause while the server is unreachable.</p>
   {/if}
 </section>
-</div>
 
 <section class="card" aria-labelledby={`${uid}-startup`}>
   <h2 id={`${uid}-startup`}>Startup</h2>
@@ -93,3 +142,4 @@
     <p class="note">This session is disabled, so it does not start with the app or with Start All. Enable it from the session list's right-click menu.</p>
   {/if}
 </section>
+</div>

@@ -3,14 +3,22 @@
   import type { ReverseConfig, SessionProfile } from "../types";
   import { PortMux, shareablePort } from "../portMux.svelte";
   import { isIpAddress, isLoopback } from "../validate";
+  import MuxCheckbox from "./MuxCheckbox.svelte";
   import PortField from "./PortField.svelte";
+  import ProxySwitch from "./ProxySwitch.svelte";
+
+  /** Filled in when the reverse proxy is turned on with no ports: one multiplexed port. */
+  const DEFAULT_REVERSE_PORT = 8888;
 
   const uid = $props.id();
   const reverse = $derived((store.draft as SessionProfile).reverse);
   const forwardCap = $derived((store.draft as SessionProfile).forward.max_connections);
+  const forwardEnabled = $derived((store.draft as SessionProfile).forward.enabled);
   const capError = $derived(store.draftErrors["reverse.max_connections"]);
   const errors = $derived(store.draftErrors);
-  const reverseOn = $derived(reverse.reverse_http_port !== 0 || reverse.reverse_socks_port !== 0);
+  const reverseOn = $derived(
+    reverse.enabled && (reverse.reverse_http_port !== 0 || reverse.reverse_socks_port !== 0),
+  );
   const exposed = $derived(
     reverseOn && isIpAddress(reverse.reverse_bind) && !isLoopback(reverse.reverse_bind),
   );
@@ -22,14 +30,36 @@
     store.updateDraft((profile) => ({ ...profile, reverse: { ...profile.reverse, ...patch } }));
   }
 
+  /** Turning on with no ports set fills in a shared port, so the proxy has a listener. */
+  function setEnabled(enabled: boolean) {
+    const unset = reverse.reverse_http_port === 0 && reverse.reverse_socks_port === 0;
+    if (enabled && unset) mux.announce();
+    setReverse(
+      enabled && unset
+        ? { enabled, reverse_http_port: DEFAULT_REVERSE_PORT, reverse_socks_port: DEFAULT_REVERSE_PORT }
+        : { enabled },
+    );
+  }
+
   function setMux(on: boolean) {
     const next = mux.toggle(on);
     if (next) setReverse({ reverse_http_port: next.http, reverse_socks_port: next.socks });
   }
 </script>
 
-<section class="card" aria-labelledby={`${uid}-heading`}>
-  <h2 id={`${uid}-heading`}>Reverse proxy <small class="muted">opened on the target host, port 0 turns a listener off</small></h2>
+<section class="card" class:inactive={!reverse.enabled} aria-labelledby={`${uid}-heading`}>
+  <div class="card-head">
+    <h2 id={`${uid}-heading`}>Reverse proxy <small class="muted">opened on the target host, port 0 turns a listener off</small></h2>
+    <ProxySwitch
+      name="Reverse proxy"
+      on={reverse.enabled}
+      lockedReason={forwardEnabled ? undefined : "To turn this off, turn on the forward proxy first"}
+      onToggle={setEnabled}
+    />
+  </div>
+  <!-- Switched off, the values stay as they are for when the proxy is turned back on. -->
+  <fieldset class="card-body" disabled={!reverse.enabled}>
+  <legend class="sr-only">Reverse proxy settings</legend>
   <div class="field-row">
     <div class="field grow">
       <label class="field">
@@ -90,15 +120,9 @@
     </div>
   </div>
 
-  <label class="check">
-    <input
-      type="checkbox"
-      checked={mux.on}
-      disabled={!mux.on && !canShare}
-      onchange={(e) => setMux(e.currentTarget.checked)}
-    />
-    Single-port multiplex <small class="muted">HTTP and SOCKS share one port</small>
-  </label>
+  <MuxCheckbox {mux} {canShare} onToggle={setMux} />
+  {#if errors["reverse.ports"]}<p class="field-error">{errors["reverse.ports"]}</p>{/if}
+  </fieldset>
   {#if exposed}
     <p class="warning">
       This address may expose the proxy to other hosts. sshd only uses it with
@@ -113,5 +137,4 @@
       on the target, and consider a reverse blocklist in Filters.
     </p>
   {/if}
-  {#if errors.listeners}<p class="field-error">{errors.listeners}</p>{/if}
 </section>

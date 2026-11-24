@@ -52,6 +52,9 @@ export const LOG_LEVELS = ["QUIET", "FATAL", "ERROR", "INFO", "DEBUG", "VERBOSE"
 export const LOG_FORMATS = ["text", "json"] as const;
 export const MIN_CERT_TTL_SECS = 10;
 const MAX_U32 = 4_294_967_295;
+/** Upstream `MAX_TCP_KEEPALIVE_DURATION` / `MAX_TCP_KEEPALIVE_RETRIES` (Linux kernel caps). */
+export const MAX_TCP_KEEPALIVE_SECS = 32_767;
+export const MAX_TCP_KEEPALIVE_RETRIES = 127;
 
 export const isWholeNumber = (value: number, max = Number.MAX_SAFE_INTEGER): boolean =>
   Number.isSafeInteger(value) && value >= 0 && value <= max;
@@ -228,6 +231,20 @@ function tunnelErrors(errors: FieldErrors, tunnel: TunnelConfig): void {
   if (!isWholeNumber(tunnel.server_alive_count_max, MAX_U32)) {
     errors["tunnel.server_alive_count_max"] = `Use a whole number up to ${MAX_U32}.`;
   }
+  if (!isWholeNumber(tunnel.tcp_keepalive, MAX_TCP_KEEPALIVE_SECS)) {
+    errors["tunnel.tcp_keepalive"] = `Use 0 (off) or a whole number from 1 to ${MAX_TCP_KEEPALIVE_SECS}.`;
+  }
+  // Interval and probe count only matter while TCP keepalive is on, as in the engine.
+  if (tunnel.tcp_keepalive !== 0) {
+    const interval = tunnel.tcp_keepalive_interval;
+    if (!isWholeNumber(interval, MAX_TCP_KEEPALIVE_SECS) || interval < 1) {
+      errors["tunnel.tcp_keepalive_interval"] = `Use a whole number from 1 to ${MAX_TCP_KEEPALIVE_SECS}.`;
+    }
+    const retries = tunnel.tcp_keepalive_retries;
+    if (!isWholeNumber(retries, MAX_TCP_KEEPALIVE_RETRIES) || retries < 1) {
+      errors["tunnel.tcp_keepalive_retries"] = `Use a whole number from 1 to ${MAX_TCP_KEEPALIVE_RETRIES}.`;
+    }
+  }
   if (
     !errors["tunnel.reconnect_initial_delay"] &&
     !errors["tunnel.reconnect_max_delay"] &&
@@ -291,8 +308,15 @@ export function sessionErrors(profile: SessionProfile): FieldErrors {
   if (reverseCap !== null && (!Number.isSafeInteger(reverseCap) || reverseCap < 0)) {
     errors["reverse.max_connections"] = "Use a whole number. 0 means unlimited.";
   }
-  if (Object.values(ports).every((port) => port === 0)) {
-    errors.listeners = "Enable at least one forward or reverse port.";
+  // A proxy that is on needs a listener; switched off, its ports are kept but not used.
+  if (forward.enabled && forward.http_port === 0 && forward.socks_port === 0) {
+    errors["forward.ports"] = "Set an HTTP or SOCKS port, or switch the forward proxy off.";
+  }
+  if (reverse.enabled && reverse.reverse_http_port === 0 && reverse.reverse_socks_port === 0) {
+    errors["reverse.ports"] = "Set an HTTP or SOCKS port, or switch the reverse proxy off.";
+  }
+  if (!forward.enabled && !reverse.enabled) {
+    errors.listeners = "Turn on the forward or reverse proxy.";
   }
 
   filterErrors(errors, "forward", forward.allow, forward.block);

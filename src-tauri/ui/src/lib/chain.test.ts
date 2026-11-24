@@ -28,6 +28,7 @@ function profile(hops: HopEntry[], passphrase: string | null): SessionProfile {
     engine: "Russh",
     hops,
     forward: {
+      enabled: true,
       bind: "127.0.0.1",
       http_port: 8080,
       socks_port: 0,
@@ -36,6 +37,7 @@ function profile(hops: HopEntry[], passphrase: string | null): SessionProfile {
       block: [],
     },
     reverse: {
+      enabled: false,
       reverse_bind: "127.0.0.1",
       reverse_http_port: 0,
       reverse_socks_port: 0,
@@ -58,6 +60,9 @@ function profile(hops: HopEntry[], passphrase: string | null): SessionProfile {
       ip_version: "auto",
       server_alive_interval: 30,
       server_alive_count_max: 3,
+      tcp_keepalive: 60,
+      tcp_keepalive_interval: 10,
+      tcp_keepalive_retries: 5,
       no_reconnect: false,
       reconnect_initial_delay: 1,
       reconnect_max_delay: 60,

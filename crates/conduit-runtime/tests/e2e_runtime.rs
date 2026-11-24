@@ -358,6 +358,7 @@ fn concurrent_sessions_stay_isolated() {
             "b-reverse",
             vec![hop(0, &reverse_node, vec![f.password(PASSWORD)])],
         );
+        reverse.reverse.enabled = true;
         reverse.reverse.reverse_http_port = remote_port;
         reverse.reverse.reverse_socks_port = remote_port;
         let reverse_id = f.add(reverse);
