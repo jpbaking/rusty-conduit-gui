@@ -327,6 +327,14 @@ mod macos {
     // SAFETY: as above; `Observer` exposes no shared access to either object.
     unsafe impl Sync for Observer {}
 
+    impl Observer {
+        fn remove(self) {
+            let token: &objc2::runtime::AnyObject = (*self.token).as_ref();
+            // SAFETY: `token` was returned by this center's `addObserverForName:...`.
+            unsafe { self.center.removeObserver(token) };
+        }
+    }
+
     pub(super) fn spawn(on_wake: WakeCallback) -> WakeHandle {
         let center = NSWorkspace::sharedWorkspace().notificationCenter();
         let block = RcBlock::new(move |_note: NonNull<NSNotification>| on_wake());
@@ -343,11 +351,9 @@ mod macos {
         let observer = Observer { center, token };
         WakeHandle {
             active: Arc::new(AtomicBool::new(true)),
-            stop: Some(Box::new(move || {
-                let token: &objc2::runtime::AnyObject = (*observer.token).as_ref();
-                // SAFETY: `token` was returned by this center's `addObserverForName:...`.
-                unsafe { observer.center.removeObserver(token) };
-            })),
+            // Calling a method on `observer` moves the whole `Send + Sync` wrapper instead of
+            // Rust 2021 disjointly capturing its non-Send fields.
+            stop: Some(Box::new(move || observer.remove())),
         }
     }
 }

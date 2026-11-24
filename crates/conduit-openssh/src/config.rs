@@ -233,6 +233,7 @@ fn check_user(user: &str) -> Result<(), ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::runtime_dir::RuntimeDir;
 
     fn hop(id: &str, host: &str) -> ConfigHop {
