@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Lets release.yml run these same gates before packaging.
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  # Override with the repository variables UPSTREAM_REPO and UPSTREAM_REF.
+  UPSTREAM_REPO: ${{ vars.UPSTREAM_REPO || 'jpbaking/rusty-conduit-ssh' }}
+  UPSTREAM_REF: ${{ vars.UPSTREAM_REF || 'main' }}
+  CARGO_TERM_COLOR: always
+
+jobs:
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: rusty-conduit-ssh-gui/src-tauri/ui
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@v4
+        with:
+          path: rusty-conduit-ssh-gui
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: rusty-conduit-ssh-gui/src-tauri/ui/package-lock.json
+
+      - run: npm ci
+      - run: npm run check
+      - run: npm run build
+
+  rust-and-e2e:
+    name: Rust and E2E (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+        working-directory: rusty-conduit-ssh-gui
+    steps:
+      - name: Keep line endings unchanged on Windows
+        if: runner.os == 'Windows'
+        working-directory: ${{ github.workspace }}
+        run: git config --global core.autocrlf false
+
+      - name: Check out this repository
+        uses: actions/checkout@v4
+        with:
+          path: rusty-conduit-ssh-gui
+          persist-credentials: false
+
+      # Cargo.toml depends on ../rusty-conduit-ssh, so upstream must be a sibling directory.
+      - name: Check out upstream rusty-conduit-ssh
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+          path: rusty-conduit-ssh
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyYAML
+        run: python -m pip install pyyaml
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libdbus-1-dev libgtk-3-dev openssh-client
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy --no-self-update
+          rustup default stable
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rusty-conduit-ssh-gui -> target
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests (unit, multi-hop loopback E2E, conduit-openssh)
+        run: cargo test --workspace
+
+      - name: Secret-leak scan
+        run: cargo test -p rusty-conduit-ssh-gui --test secret_leak_scan
+
+      - name: Pure-Rust crypto check
+        run: python scripts/check-pure-rust-crypto.py
+
+      - name: Release config check
+        run: python scripts/validate-release-config.py
+
+      - name: Tauri tray compile check
+        if: runner.os == 'Linux'
+        run: RUSTFLAGS="--cfg conduit_check_tauri_tray" cargo check -p rusty-conduit-ssh-gui --tests

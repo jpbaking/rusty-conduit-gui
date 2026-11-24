@@ -1,57 +1,73 @@
-# phase-0004 — conduit-runtime: wire SshEngine::OpenSsh into runner.rs & real /usr/bin/ssh E2E tests
+# phase-0004 — Release runbook & end-to-end local staging validation
 
 - Status: done
 - Owner: executor
-- Depends on: phase-0003
-- Goal: Wire `SshEngine::OpenSsh` into `crates/conduit-runtime/src/runner.rs` with full state-machine, lockout protection, host-key TOFU, backoff, `LogRingBuffer`, and `StatsDialer` parity, plus real `/usr/bin/ssh` loopback E2E tests.
-- Done when: `cargo test -p conduit-runtime && cargo clippy --workspace --all-targets -- -D warnings` exits 0 with passing real `/usr/bin/ssh` loopback E2E tests in `crates/conduit-runtime/tests/openssh_e2e.rs`.
-- Pattern to follow: `crates/conduit-runtime/src/runner.rs:608-920` (`RusshLink` and `impl Link for RusshLink`), `crates/conduit-runtime/tests/e2e_runtime.rs` (runtime E2E test harness), `../rusty-conduit-ssh/src/net.rs:198-235` (`Socks5UpstreamDialer`).
+- Depends on: phase-0001, phase-0002, phase-0003
+- Goal: Write `docs/RELEASING.md` and run a real local `conduit-worker` staging + full workspace verification pass.
+- Done when: `docs/RELEASING.md` covers version bumps, local packaging, signing secrets, sibling repo checkout, and smoke tests; `scripts/stage-worker.py --profile debug` produces a working ignored sidecar binary that is cleaned up after verification; and the full verification suite exits 0.
+- Pattern to follow: `docs/MASTER-PLAN.md:349-354` for Phase 5 packaging conventions and tone.
 
 ## Context
-`crates/conduit-runtime/src/runner.rs` already defines `trait Engine` and `trait Link`, and `RusshLink::prepare` currently returns `LinkError::Fatal("the OpenSSH engine is not available in this build")` at line 639 when `profile.engine == SshEngine::OpenSsh`.
-In this phase:
-- `RusshEngine::prepare` (or a dispatching `DefaultEngine`) routes `SshEngine::OpenSsh` to `OpenSshLink::prepare`.
-- `OpenSshLink` uses `rusty_conduit_ssh::net::Socks5UpstreamDialer` fed by a `watch::Sender<TunnelState>`, wrapped in `StatsDialer` and `FilteredDialer`, driving `build_engines`, `MitmState`, `ReverseProxy`, `Server`, and `AccessLogger`/`LogRingBuffer` identically to `RusshLink`.
-- Before launching `OpenSshSupervisor`, `OpenSshLink::connect` checks that every hop has an approved pin with `public_key_openssh` in `known_hosts`; if any hop is unpinned (or missing `public_key_openssh`), it probes the chain's host keys via `conduit_ssh::connect_chain` (or a lightweight host-key probe) to surface `LinkError::HostKey(HostKeyPrompt)` so the exact same `AwaitingHostKey` → `approve_host_key` flow works seamlessly for OpenSSH sessions too!
-- Auth failures (`OpenSshError::AuthFailed`) and changed host keys (`OpenSshError::HostKeyChanged`) map to `LinkError::Attention` (zero retries, preventing account lockout). Unsupported binary / invalid config maps to `LinkError::Fatal`. Unexpected `ssh` exit / network drop maps to `LinkError::Transient`.
-- `OpenSshLink::disconnect` updates `TunnelState::Disconnected(...)` and stops the supervisor via `supervisor.shutdown().await` (preferring `shutdown().await` over bare drop so `ssh` is terminated and reaped before the runtime dir is removed) while keeping forward listeners bound; `OpenSshLink::shutdown` drains `Server` → stops supervisor → drains `ReverseProxy` → flushes `AccessLogger`.
-- Note from phase-0003: `OpenSshSupervisor` expects validated `extra_args` (already enforced by `conduit_core::validate(&profile)` in `prepare`). During `conduit-runtime` integration tests, ensure `conduit-worker` is built (`cargo build -p conduit-openssh --bin conduit-worker`) and located via `target/debug/conduit-worker` (sibling of `current_exe().parent().parent()`).
+- This host is Linux x64 without `cargo-tauri` installed globally, so local verification tests real `conduit-worker` staging via `scripts/stage-worker.py --profile debug`, verifies the staged binary executes (`--help` / usage) and is git-ignored, cleans up `src-tauri/binaries/` afterwards so the worktree stays clean, and runs the complete Rust + Svelte + Python verification suite.
+- `docs/RELEASING.md` must document:
+  1. Version bump locations (`src-tauri/Cargo.toml`, `src-tauri/tauri.conf.json`, `src-tauri/ui/package.json`) and tag format (`vX.Y.Z`).
+  2. Sibling `../rusty-conduit-ssh` repository layout (local and CI `UPSTREAM_REPO` / `UPSTREAM_REF`).
+  3. Local packaging commands (`scripts/stage-worker.py` + `cargo tauri build --config src-tauri/tauri.bundle.conf.json` + `scripts/smoke-test-bundle.py`).
+  4. Optional code signing & notarization secrets for macOS (`APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID`) and Windows (`WINDOWS_CERTIFICATE`, `WINDOWS_CERTIFICATE_PASSWORD`), plus behavior when unset (unsigned/ad-hoc).
+  5. Linux glibc baseline (Ubuntu 22.04 / Debian 12) and rationale for deferring Flatpak/Snap.
+  6. Pre-release manual smoke-test checklist across Windows, macOS, and Linux (XFCE/Wayland).
 
 ## Scope
-- In: `crates/conduit-runtime/Cargo.toml`, `crates/conduit-runtime/src/runner.rs`, `crates/conduit-runtime/src/manager.rs`, `crates/conduit-runtime/tests/openssh_e2e.rs`, `Cargo.lock`
-- Out: `docs/MASTER-PLAN.md`, `../rusty-conduit-ssh/**`, `crates/conduit-core/**`, `crates/conduit-ssh/**`, `crates/conduit-openssh/**`, `src-tauri/**`
+- In: `docs/RELEASING.md`, `.github/workflows/release.yml`
+- Out: `docs/MASTER-PLAN.md`, `crates/**`, `src-tauri/**`, `.github/workflows/ci.yml`, `scripts/**`
 
 ## Sub-tasks
-1. [done] Add `conduit-openssh = { path = "../conduit-openssh" }` to `crates/conduit-runtime/Cargo.toml` and implement `OpenSshLink` in `crates/conduit-runtime/src/runner.rs` (dispatched when `profile.engine == SshEngine::OpenSsh`), with full parity for `validate`, vault unlock check (`LinkError::Locked`), `check_openssh_binary` validation, `AccessLogger` + `LogRingBuffer`, `ReverseProxy` (`-R` specs), `Socks5UpstreamDialer` wrapped in `StatsDialer` + `FilteredDialer`, `MitmState`, `Server` bound once across reconnects, `AwaitingHostKey` host-key check, lockout-safe error classification (`LinkError::Attention`), and graceful shutdown — done when: `cargo test -p conduit-runtime --lib` passes.
-2. [done] Add real `/usr/bin/ssh` loopback E2E tests in `crates/conduit-runtime/tests/openssh_e2e.rs` driving `SessionManager` with `SshEngine::OpenSsh`: (a) single-hop key auth + HTTP/SOCKS proxy roundtrip verifying `StatsSnapshot` counters increment and `LogRingBuffer` captures logs, (b) password auth via `conduit-worker askpass` + HTTP proxy roundtrip, (c) bad password transitions immediately to `SessionState::NeedsAttention` with zero retries, (d) host-key mismatch transitions to `SessionState::NeedsAttention`, and (e) clean `stop()` leaves no lingering `ssh` child process — done when: `cargo test -p conduit-runtime --test openssh_e2e` passes.
+1. [done] Write `docs/RELEASING.md` covering version bumps, sibling repo layout, local packaging commands, signing/notarization secrets, Linux glibc baseline, and pre-release smoke-test checklist — done when: `docs/RELEASING.md` exists and references `stage-worker.py`, `tauri.bundle.conf.json`, `smoke-test-bundle.py`, `APPLE_CERTIFICATE`, `WINDOWS_CERTIFICATE`, and `Ubuntu 22.04`.
+2. [done] Run local end-to-end staging check: `python3 scripts/stage-worker.py --profile debug`, confirm the staged binary exists under `src-tauri/binaries/`, is ignored by `git status --porcelain`, prints usage when invoked, and then remove `src-tauri/binaries/` — done when: staging + execution check succeeds and `git status --porcelain` shows no untracked binaries.
+3. [done] Enable `sign_windows: true` on the `windows-arm64` matrix entry in `.github/workflows/release.yml` (so both Windows x64 and arm64 are signed when `WINDOWS_CERTIFICATE` is configured, per `docs/MASTER-PLAN.md:350`) and update `docs/RELEASING.md` accordingly — done when: `python3 scripts/validate-release-config.py` exits 0 and `docs/RELEASING.md` reflects x64 + arm64 Windows signing.
+4. [done] Run the full Phase 5 verification suite and record exact results in `## Evidence` — done when: `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, `npm run check && npm run build`, `check-pure-rust-crypto.py`, `smoke-test-bundle.py --self-test`, and `validate-release-config.py` all exit 0.
 
 ## Verify
 ```sh
-cargo build -p conduit-openssh --bin conduit-worker && cargo test -p conduit-runtime && cargo clippy --workspace --all-targets -- -D warnings
+python3 scripts/stage-worker.py --profile debug
+ls -la src-tauri/binaries/conduit-worker-*
+rm -rf src-tauri/binaries
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+(cd src-tauri/ui && npm run check && npm run build)
+python3 scripts/check-pure-rust-crypto.py
+python3 scripts/smoke-test-bundle.py --self-test
+python3 scripts/validate-release-config.py
 ```
 
 ## Escalate when
-- `conduit-openssh` API is missing a required field or method (e.g. `-R` reverse forward specs or stderr log callback) needed by `OpenSshLink` → stop, set `Status: needs-human — reason: <exact API gap in conduit-openssh>`
-- `conduit-worker` binary is not automatically built before `cargo test -p conduit-runtime` (note: in Cargo, integration tests in `conduit-runtime` do not automatically build binaries from a dependency crate unless `cargo build -p conduit-openssh --bin conduit-worker` ran or a helper builds/locates it) → stop, set `Status: needs-human — reason: <describe worker binary discovery issue>`
+- Any test, clippy lint, frontend check, or validation script fails outside `docs/RELEASING.md` → stop, set `Status: needs-human — reason: <exact failing command and error>`.
 
 ## Log
 - (append-only, one line per event)
-- sub-task 1: added OpenSshLink and DefaultEngine dispatch in runner.rs, moved shared proxy setup into ProxyStack used by both engines, switched manager.rs to DefaultEngine
-- sub-task 2: added crates/conduit-runtime/tests/openssh_e2e.rs with 8 real /usr/bin/ssh tests; test helper builds conduit-worker and passes its path through CARGO_BIN_EXE_conduit-worker
-- sub-task 2 stopped after two failed check runs; port-collision fix not attempted
-- planner unblocked: approved port-collision fix (allocate test ports below ephemeral range as in `e2e_runtime.rs:297-315` and make `OpenSshLink::socks_port()` skip the profile's `forward.http_port`/`forward.socks_port`). Confirmed `agent_forward` on OpenSSH should log a clear notice and continue (per Master Plan Section 3.1 `ssh -N` limitation). Run full `## Verify` including `e2e_runtime` and `openssh_e2e`.
-- sub-task 2: applied the approved fix: test forward ports now come from 30000-31999, below the ephemeral range, and OpenSshLink::socks_port skips the profile forward ports
-- phase verified and closed
+- sub-task 1: wrote docs/RELEASING.md from release.yml, ci.yml, and the packaging scripts
+- sub-task 2: staging failed because the disk is full; removed only this run's partial target/x86_64-unknown-linux-gnu (161M, 1605 entries, all newer than the begin commit); target/debug untouched
+- open finding for planner: release.yml sets sign_windows only for windows-x64, so windows-arm64 stays unsigned although MASTER-PLAN.md:350 calls for signed Windows x64/arm64; documented in RELEASING.md, not changed (.github is out of scope)
+- planner unblocked phase-0004: ran cargo clean (freed 26.1 GiB, 26G available), added .github/workflows/release.yml to Scope: In with sub-task 3 for windows-arm64 signing parity, returned sub-task 2 to [todo], and resumed sub-m5-phase-0004
+- sub-task 2: staged the debug worker, confirmed it is ignored and prints usage with no arguments, removed src-tauri/binaries
+- sub-task 3: added sign_windows: true to windows-arm64 in release.yml and updated the Windows signing note in docs/RELEASING.md
+- sub-task 4: ran the full ## Verify block from a clean build; all nine commands exited 0
 
 ## Evidence
 - (append-only: command → observed result)
-- `cargo test -p conduit-runtime --lib` → test result: ok. 50 passed; 0 failed
-- `cargo test -p conduit-runtime --test openssh_e2e` (run 1) → FAILED 0 passed, 8 failed: conduit-worker was not found near target/debug/build/conduit-runtime/<hash>/out/openssh_e2e-<hash>
-- `cargo test -p conduit-runtime --test openssh_e2e` (run 2) → FAILED 7 passed, 1 failed: key_auth_carries_http_and_socks_with_stats_and_logs, failed to bind SOCKS4/4a/5 listener on 127.0.0.1:41797: Address already in use (os error 98)
-- `cargo clippy --workspace --all-targets -- -D warnings` → exit 0
-- `cargo test -p conduit-runtime --lib` → test result: ok. 50 passed; 0 failed
-- full ## Verify block → not run to completion, because sub-task 2 is blocked
-- `cargo test -p conduit-runtime --test openssh_e2e` (run 3, after approved fix) → test result: ok. 8 passed; 0 failed
-- `cargo build -p conduit-openssh --bin conduit-worker && cargo test -p conduit-runtime && cargo clippy --workspace --all-targets -- -D warnings` → exit 0; lib 50 passed, e2e_runtime 8 passed, openssh_e2e 8 passed, doc 0
-- `cargo test -p conduit-runtime --test openssh_e2e` repeated 5 times → 8 passed, 0 failed each run, no `Address already in use`
-- `ps -axww -o command= | grep -cE '^[/]usr/bin/ssh -F'` after all runs → 0 leftover ssh processes
+- grep -c for stage-worker.py, tauri.bundle.conf.json, smoke-test-bundle.py, APPLE_CERTIFICATE, WINDOWS_CERTIFICATE, Ubuntu 22.04 in docs/RELEASING.md → 4, 3, 2, 3, 3, 2
+- python3 scripts/stage-worker.py --profile debug → exit non-zero: failed to write full.rmeta for crypto-bigint, No space left on device (os error 28)
+- df -h . → /dev/sda2 126G, 120G used, 3.5M free at failure; 165M free after removing this run's partial output
+- du -sh target → 26G, in target/debug
+- NOT RUN: sub-task 3 and ## Verify (cargo test, clippy, npm check/build, check-pure-rust-crypto, smoke-test --self-test, validate-release-config)
+- python3 scripts/stage-worker.py --profile debug → exit 0, staged src-tauri/binaries/conduit-worker-x86_64-unknown-linux-gnu (125396992 bytes)
+- git check-ignore -v <staged binary> → .gitignore:11:/src-tauri/binaries; git status --porcelain listed no binary
+- <staged binary> with no args → prints usage, exit 2 (by design, conduit-worker.rs:28); <staged binary> --help → treated as an askpass prompt, 'prompt is not a password prompt', exit 1 (by design, conduit-worker.rs:25)
+- rm -rf src-tauri/binaries → directory gone, git status --porcelain shows no binaries
+- python3 scripts/validate-release-config.py after arm64 signing change → exit 0; parsed matrix shows sign_windows true for windows-x64 and windows-arm64
+- ## Verify: stage-worker.py --profile debug → exit 0; ls -la staged binary → exit 0; rm -rf src-tauri/binaries → exit 0
+- cargo test --workspace → exit 0, 24 suites, 418 passed, 0 failed, 0 ignored; secret_leak_scan 5 passed, 0 failed
+- cargo clippy --workspace --all-targets -- -D warnings → exit 0
+- (cd src-tauri/ui && npm run check && npm run build) → exit 0, svelte-check 158 files, 0 errors, 0 warnings; vite built
+- check-pure-rust-crypto.py → PURE_RUST_CRYPTO_OK; smoke-test-bundle.py --self-test → SMOKE_TEST_SELF_TEST_OK; validate-release-config.py → RELEASE_CONFIG_OK
+- NOT RUN: cargo tauri build, real installers, GitHub workflows, and Windows signing (no cargo-tauri, certificate, or runners on this host)

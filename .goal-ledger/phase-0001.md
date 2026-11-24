@@ -1,58 +1,87 @@
-# phase-0001 — Hardening follow-ups & host-key public-key storage
+# phase-0001 — Cross-platform icons, Tauri v2 bundle config & NSIS worker-stop hooks
 
 - Status: done
 - Owner: executor
 - Depends on: none
-- Goal: Close Phase 3 Gate D hardening items (attached/case-insensitive `extra_args` denylist in Rust+TS, plain-import path neutralization) and add backwards-compatible `public_key_openssh` to `HostKeyRecord` for Phase 4 `known_hosts` rendering.
-- Done when: `cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && (cd src-tauri/ui && npm run check)` exits 0 with new unit tests covering attached/case-variant `extra_args`, plain-import sanitization, and `HostKeyRecord.public_key_openssh` roundtrips.
-- Pattern to follow: `crates/conduit-core/src/validate.rs:86-100` (denylist), `src-tauri/ui/src/lib/validate.ts:98-121` (TS mirror), `src-tauri/src/controller/export.rs:234-257` (untrusted plain-import stripping), `crates/conduit-ssh/src/host_key.rs:14-35` (`ObservedHostKey`).
+- Goal: Add full Tauri v2 icon assets, bundle metadata, `tauri.bundle.conf.json` sidecar overlay, Windows NSIS worker-stop hooks, and `.gitignore` entry for staged sidecar binaries.
+- Done when: All 6 icon files exist and are valid, `src-tauri/tauri.conf.json` and `src-tauri/tauri.bundle.conf.json` are valid JSON with complete bundle settings, `src-tauri/windows/nsis-hooks.nsh` stops `rusty-conduit-ssh-gui.exe` and `conduit-worker.exe`, and `cargo check --workspace` passes cleanly without pre-staged binaries.
+- Pattern to follow: `src-tauri/tauri.conf.json:1-19` for Tauri v2 schema and `.gitignore:1-8` for ignore comments.
 
 ## Context
-Phase 3 Gate D identified two security hardening follow-ups that must land before OpenSSH execution goes live:
-1. `conduit-core`'s `extra_args` denylist only matched whole case-sensitive tokens (missing `-oProxyCommand=x`, `-Fconfig`, `-i/path`, `-O`, `-S`, `-A`, `-a`, case-insensitive option names, and `-o` followed by a forbidden option in the next token). Both Rust and TS must enforce the hardened denylist identically.
-2. Unauthenticated plain config imports currently preserve `openssh.ssh_bin` and `logging.http_access_log`/`socks_log` paths, which would let a tampered plain export point `ssh_bin` at an arbitrary binary or overwrite arbitrary files via log paths. Neutralize them on plain imports unless unchanged from an existing trusted session with the same ID.
-3. OpenSSH `UserKnownHostsFile` requires `<alias> <algorithm> <base64_key>` (not just `SHA256:` fingerprint). Adding `#[serde(default)] pub public_key_openssh: Option<String>` to `HostKeyRecord` (and threading it through `ObservedHostKey`, `SshError::HostKeyUnknown`, `HostKeyPrompt`, and `approve_host_key`) keeps existing `known_hosts.json` files compatible while giving Phase 4 the exact public key blob.
+- `src-tauri/build.rs` calls `tauri_build::build()`. If `bundle.externalBin` is placed directly in `src-tauri/tauri.conf.json`, `cargo check`/`cargo test` on a clean checkout fails unless `src-tauri/binaries/conduit-worker-<triple>` already exists.
+- Therefore, keep `bundle.active: false` (and no `externalBin`) in `src-tauri/tauri.conf.json` alongside all shared bundle metadata (icons, category, descriptions, license, Linux deb/rpm/AppImage settings, macOS minimumSystemVersion, Windows NSIS/WiX settings), and put `"bundle": { "active": true, "targets": "all", "externalBin": ["binaries/conduit-worker"] }` in `src-tauri/tauri.bundle.conf.json` (passed via `tauri build --config src-tauri/tauri.bundle.conf.json` after staging the worker).
+- `src-tauri/icons/icon.png` is currently a valid 256x256 RGBA PNG; Python 3 with Pillow (`PIL`) is installed on this host. Generate `32x32.png`, `128x128.png`, `128x128@2x.png` (256x256), `icon.ico` (multi-size 16/32/48/64/128/256), and a valid Apple ICNS `icon.icns` (containing `ic07` 128x128 PNG and `ic08` 256x256 PNG chunks with valid `icns` 8-byte header + chunk headers) from `src-tauri/icons/icon.png`.
+- Per Master Plan Section 9 Phase 5, Windows NSIS must be per-user (`"installMode": "currentUser"`) and stop `rusty-conduit-ssh-gui.exe` and `conduit-worker.exe` cleanly before install/upgrade and uninstall via `installerHooks: "windows/nsis-hooks.nsh"`.
+- Planner decisions (unblocking sub-task 3): (1) use `"category": "Utility"` (valid in `tauri-bundler` 2.10.6); (2) use `"copyright": "Copyright (c) 2026, Joseph Baking"` (matching sibling `../rusty-conduit-ssh/LICENSE`).
 
 ## Scope
-- In: `crates/conduit-core/src/validate.rs`, `crates/conduit-core/src/model.rs`, `crates/conduit-core/src/storage.rs`, `crates/conduit-ssh/src/host_key.rs`, `crates/conduit-ssh/src/error.rs`, `crates/conduit-ssh/src/handler.rs`, `crates/conduit-ssh/src/chain/tests.rs`, `crates/conduit-ssh/tests/common/mod.rs`, `crates/conduit-ssh/tests/loopback_multihop.rs`, `crates/conduit-runtime/src/state.rs`, `crates/conduit-runtime/src/runner.rs`, `crates/conduit-runtime/src/manager.rs`, `crates/conduit-runtime/tests/e2e_runtime.rs`, `crates/conduit-tray/src/model.rs`, `src-tauri/src/controller.rs`, `src-tauri/src/controller/export.rs`, `src-tauri/src/controller/sessions.rs`, `src-tauri/src/controller/test_support.rs`, `src-tauri/ui/src/lib/validate.ts`, `src-tauri/ui/src/lib/types.ts`, `src-tauri/ui/src/lib/components/LoggingAdvancedTab.svelte`
-- Out: `docs/MASTER-PLAN.md`, `../rusty-conduit-ssh/**`, `crates/conduit-openssh/**`, `crates/conduit-vault/**`
+- In: `src-tauri/icons/32x32.png`, `src-tauri/icons/128x128.png`, `src-tauri/icons/128x128@2x.png`, `src-tauri/icons/icon.ico`, `src-tauri/icons/icon.icns`, `src-tauri/tauri.conf.json`, `src-tauri/tauri.bundle.conf.json`, `src-tauri/windows/nsis-hooks.nsh`, `.gitignore`
+- Out: `src-tauri/src/**`, `src-tauri/ui/**`, `crates/**`, `docs/**`, `.github/**`, `scripts/**`
 
 ## Sub-tasks
-1. [done] Harden `crates/conduit-core/src/validate.rs` `extra_args` denylist: reject forbidden short flags both standalone and with attached values (`-F`, `-Fconfig`, `-J`, `-Jjump`, `-i`, `-i/path`, `-O`, `-Ocheck`, `-S`, `-S/tmp/ctl`, `-A`, `-a`, `-W`), reject `-o<Option>=...` / `-o<Option> ...` and `-o` followed by `<Option>=...` or `<Option> ...` as well as bare/dashed `<Option>` forms case-insensitively for `ProxyCommand`, `ProxyJump`, `IdentityAgent`, `IdentityFile`, `UserKnownHostsFile`, `GlobalKnownHostsFile`, `StrictHostKeyChecking`, `ControlPath`, `ControlMaster`, `ControlPersist`, `ForwardAgent`, `Include`, `LocalCommand`, `PermitLocalCommand`, `RemoteCommand`, `KnownHostsCommand`, `UpdateHostKeys`, `Host`, `Match`, while still allowing safe options like `["-o", "Compression=yes"]` or `["-oCompression=yes"]` or `["-v"]`; add thorough unit tests — done when: `cargo test -p conduit-core` passes with tests for all attached, case-variant, `-o` pair, and safe-arg cases.
-2. [done] Mirror the exact hardened `extra_args` denylist in `src-tauri/ui/src/lib/validate.ts` (updating `denylistedFlag` / adding a sequence-aware check for `-o` followed by a forbidden option, and updating `opensshErrors` + `LoggingAdvancedTab.svelte` chip highlighting) — done when: `(cd src-tauri/ui && npm run check)` passes with 0 errors.
-3. [done] Neutralize untrusted paths on plain config import in `src-tauri/src/controller/export.rs`: in `strip_untrusted_credentials` (or a sibling helper called from `import_plain`), for each incoming session reset `openssh.ssh_bin` to `"ssh"` unless an existing session with the same `id` already has the exact same `openssh.ssh_bin`, and reset `logging.http_access_log` and `logging.socks_log` to `None` unless the existing session with the same `id` already has the exact same path; keep encrypted bundle imports preserving these fields; add unit tests in `export.rs` verifying both plain-import neutralization and encrypted-import preservation — done when: `cargo test -p rusty-conduit-ssh-gui export` passes.
-4. [done] Add `#[serde(default)] pub public_key_openssh: Option<String>` to `HostKeyRecord` in `crates/conduit-core/src/model.rs`, populate `public_key_openssh: Option<String>` on `ObservedHostKey` (`crates/conduit-ssh/src/host_key.rs`, formatted via `key.to_openssh()` so it holds `<alg> <base64>`), carry it through `SshError::HostKeyUnknown`, `HostKeyPrompt` (`crates/conduit-runtime/src/state.rs`), `runner.rs`, and `SessionManager::approve_host_key` (`crates/conduit-runtime/src/manager.rs`), and update all struct literal sites in tests and `src-tauri/ui/src/lib/types.ts` — done when: `cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && (cd src-tauri/ui && npm run check)` passes with a deserialization backwards-compat test for `HostKeyRecord` without `public_key_openssh` and a test verifying `approve_host_key` stores `public_key_openssh`.
+1. [done] Generate `src-tauri/icons/32x32.png`, `src-tauri/icons/128x128.png`, `src-tauri/icons/128x128@2x.png`, `src-tauri/icons/icon.ico`, and `src-tauri/icons/icon.icns` from `src-tauri/icons/icon.png` (leaving `icon.png` intact) — done when: a Python check verifies all 5 generated files exist, have expected PNG dimensions / ICO format / `icns` magic header with valid total length matching file size.
+2. [done] Create `src-tauri/windows/nsis-hooks.nsh` defining `NSIS_HOOK_PREINSTALL` and `NSIS_HOOK_PREUNINSTALL` macros that terminate `rusty-conduit-ssh-gui.exe` and `conduit-worker.exe` using `nsExec::ExecToLog 'taskkill /F /IM ...'` (ignoring exit code when not running) — done when: file exists and contains both hook macros and both process names.
+3. [done] Update `src-tauri/tauri.conf.json` with full bundle metadata (`category: "Utility"`, `shortDescription`, `longDescription`, `copyright: "Copyright (c) 2026, Joseph Baking"`, `license: "BSD-3-Clause"`, `icon` array listing `32x32.png`, `128x128.png`, `128x128@2x.png`, `icon.icns`, `icon.ico`, `linux.deb` with `section: "net"` and `desktopTemplate` omitted/default, `linux.rpm`, `linux.appimage`, `macOS.minimumSystemVersion: "11.0"`, `windows.nsis` with `installMode: "currentUser"` and `installerHooks: "windows/nsis-hooks.nsh"`, `windows.wix`) while keeping `bundle.active: false` — done when: `python3 -c "import json; json.load(open('src-tauri/tauri.conf.json'))"` exits 0.
+4. [done] Create `src-tauri/tauri.bundle.conf.json` enabling `"bundle": { "active": true, "targets": "all", "externalBin": ["binaries/conduit-worker"] }` and add `/src-tauri/binaries` to `.gitignore` — done when: `tauri.bundle.conf.json` parses as JSON and `git check-ignore -q src-tauri/binaries/conduit-worker-x86_64-unknown-linux-gnu` exits 0.
 
 ## Verify
 ```sh
-cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && (cd src-tauri/ui && npm run check)
+python3 - <<'PY'
+import json, struct
+from pathlib import Path
+from PIL import Image
+
+icons = Path("src-tauri/icons")
+for name, size in [("32x32.png", (32, 32)), ("128x128.png", (128, 128)), ("128x128@2x.png", (256, 256))]:
+    with Image.open(icons / name) as img:
+        assert img.size == size, f"{name}: {img.size} != {size}"
+with Image.open(icons / "icon.ico") as ico:
+    assert ico.format == "ICO"
+icns = (icons / "icon.icns").read_bytes()
+assert icns[:4] == b"icns"
+assert struct.unpack(">I", icns[4:8])[0] == len(icns)
+
+conf = json.loads(Path("src-tauri/tauri.conf.json").read_text())
+assert conf["bundle"]["active"] is False
+assert conf["bundle"]["windows"]["nsis"]["installMode"] == "currentUser"
+assert conf["bundle"]["windows"]["nsis"]["installerHooks"] == "windows/nsis-hooks.nsh"
+
+overlay = json.loads(Path("src-tauri/tauri.bundle.conf.json").read_text())
+assert overlay["bundle"]["active"] is True
+assert overlay["bundle"]["externalBin"] == ["binaries/conduit-worker"]
+
+nsh = Path("src-tauri/windows/nsis-hooks.nsh").read_text()
+assert "NSIS_HOOK_PREINSTALL" in nsh and "NSIS_HOOK_PREUNINSTALL" in nsh
+assert "conduit-worker.exe" in nsh and "rusty-conduit-ssh-gui.exe" in nsh
+print("PHASE1_ASSETS_OK")
+PY
+git check-ignore -q src-tauri/binaries/conduit-worker-x86_64-unknown-linux-gnu
+cargo check --workspace --all-targets
 ```
 
 ## Escalate when
-- `russh::keys::PublicKey` does not expose `.to_openssh()` or equivalent OpenSSH public-key formatting method in `russh` 0.65 → stop, set `Status: needs-human — reason: <exact method signature gap>`
-- Any file outside `Scope: In` fails to compile due to the `HostKeyRecord` or `HostKeyPrompt` field addition → stop, set `Status: needs-human — reason: <list exact file paths>`
+- `tauri_build::build()` rejects any bundle field in `src-tauri/tauri.conf.json` for Tauri v2 schema → stop, set `Status: needs-human — reason: <exact tauri-build schema error>`.
+- `cargo check --workspace --all-targets` fails due to a change outside `Scope: In` → stop, set `Status: needs-human — reason: <exact compiler error>`.
 
 ## Log
 - (append-only, one line per event)
-- sub-task 1: hardened the Rust denylist (short flags, getopt clusters, case-insensitive options, quoted and spaced keywords) and added tests. Every token is checked as a possible option, so the value after a separate `-o` is caught without position tracking.
-- sub-task 2: mirrored the denylist in validate.ts with ASCII-only case folding. LoggingAdvancedTab.svelte needed no edit because its chips and opensshErrors already call denylistedFlag per token.
-- sub-task 3: added neutralize_untrusted_paths to plain import only, with plain and encrypted tests.
-- sub-task 4: applied the field to all Scope: In files, then stopped on the phase's escalation rule because two files outside Scope: In no longer compile.
-- planner unblocked: added `crates/conduit-tray/src/model.rs` and `src-tauri/src/controller.rs` to `Scope: In` so the two test literals can be updated with `public_key_openssh: None,`. Leaving `-I`/`PKCS11Provider`/`SecurityKeyProvider` allowed to preserve FIDO2/hardware-key use case per Master Plan Section 3.1.
-- sub-task 4: added `public_key_openssh: None,` to the two test literals the planner brought into scope (conduit-tray model.rs, src-tauri controller.rs).
-- phase verified and closed.
+- sub-task 1: generated 32x32.png, 128x128.png, 128x128@2x.png, icon.ico (16/32/48/64/128/256), icon.icns (ic07+ic08 PNG chunks) from icon.png; icon.png unchanged
+- sub-task 2: wrote src-tauri/windows/nsis-hooks.nsh with PREINSTALL and PREUNINSTALL hooks stopping both processes, exit codes ignored
+- sub-task 3 (partial): applied all bundle fields except category and copyright, which need a planner decision
+- escalated at sub-task 3; sub-task 4 and ## Verify not run as a phase gate
+- planner unblocked sub-task 3: use category "Utility" and copyright "Copyright (c) 2026, Joseph Baking"; returned sub-task 3 to [todo] and resumed sub-m5-phase-0001
+- sub-task 3: added category Utility and the planner's copyright string to bundle metadata; bundle.active stays false
+- sub-task 4: created src-tauri/tauri.bundle.conf.json and added /src-tauri/binaries to .gitignore
+- ran ## Verify: all checks passed
 
 ## Evidence
 - (append-only: command → observed result)
-- `cargo test -p conduit-core --lib` (after sub-task 1) → 39 passed, 0 failed
-- `(cd src-tauri/ui && npm run check)` → 158 files, 0 errors, 0 warnings
-- `node --experimental-strip-types parity.mts` (scratch script, TS denylist) → 28 denied, 15 allowed, no mismatches
-- `cargo test -p rusty-conduit-ssh-gui export` (after sub-task 3, before sub-task 4) → 17 passed, 0 failed
-- `cargo test -p conduit-core -p conduit-ssh -p conduit-runtime` (after sub-task 4) → all passed (41, 48, 8, 64, 5, 12)
-- `cargo clippy -p conduit-core -p conduit-ssh -p conduit-runtime --all-targets -- -D warnings` → clean
-- `cargo check --workspace --all-targets --keep-going` → E0063 missing `public_key_openssh` at crates/conduit-tray/src/model.rs:509 and src-tauri/src/controller.rs:640
-- Phase `## Verify` → not run to completion: the workspace tests do not compile until the blocker is resolved
-- `cargo check` blocker resolved: both literals updated at crates/conduit-tray/src/model.rs:515 and src-tauri/src/controller.rs:644
-- `cargo test -p rusty-conduit-ssh-gui export` (after sub-task 4) → 17 passed, 0 failed
-- Phase `## Verify`: `cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && (cd src-tauri/ui && npm run check)` → exit 0; 345 tests passed, 0 failed; clippy clean; 158 files, 0 errors, 0 warnings
-- Correction to the line numbers above: `grep -n "public_key_openssh: None"` → crates/conduit-tray/src/model.rs:516 and src-tauri/src/controller.rs:645
+- sub-task 1 Python icon check → 32x32/128x128/256x256 RGBA PNGs; ICO sizes 16,32,48,64,128,256; icns header length 8927 == file size, chunks ic07 (7188) + ic08 (1731); icon.png sha256 074053900a70… unchanged
+- sub-task 2 grep → both hook macros and both process names present; makensis not installed, so the script was not compiled
+- tauri-bundler 2.10.6 src/bundle/category.rs:68-94 → from_str returns Err unless the input exactly matches a known category; `network` is not in CATEGORY_STRINGS. tauri-cli 2.12.6 src/interface/rust.rs:1541-1545 turns that Err into `invalid category`
+- git grep for copyright/authors and git ls-files for LICENSE/NOTICE → no copyright holder recorded in the repo
+- python3 -c json.load(tauri.conf.json) → exit 0 (partial config, without category and copyright)
+- cargo check --workspace --all-targets → exit 0 with the partial config
+- sub-task 3: python3 -c json.load(tauri.conf.json) → exit 0; tauri-bundler 2.10.6 category.rs:346 lists `utility`
+- sub-task 4: python3 -c json.load(tauri.bundle.conf.json) → exit 0; git check-ignore -q src-tauri/binaries/conduit-worker-x86_64-unknown-linux-gnu → exit 0
+- ## Verify: Python block → PHASE1_ASSETS_OK; git check-ignore → exit 0; cargo check --workspace --all-targets → exit 0 with no src-tauri/binaries directory

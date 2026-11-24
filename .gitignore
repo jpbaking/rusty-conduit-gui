@@ -6,3 +6,6 @@
 
 # Frontend dependencies. ui/dist stays tracked: tauri::generate_context!() needs it at build time.
 /src-tauri/ui/node_modules
+
+# Staged conduit-worker sidecar binaries, created at packaging time.
+/src-tauri/binaries

@@ -1,57 +1,58 @@
-# phase-0002 — conduit-openssh core: binary check, hardened -F config, known_hosts & isolated agent socket
+# phase-0002 — Automated secret-leak scan tests & packaging/smoke-test scripts
 
 - Status: done
 - Owner: executor
 - Depends on: phase-0001
-- Goal: Create `crates/conduit-openssh` (added to workspace `Cargo.toml`) implementing OpenSSH binary discovery & version check, short space-free `0700` runtime directory, app-owned `known_hosts` renderer, hardened per-session `-F` config generator, and isolated local `ssh-agent` server over Unix socket (and `cfg(windows)` named-pipe abstraction).
-- Done when: `cargo test -p conduit-openssh && cargo clippy --workspace --all-targets -- -D warnings` exits 0 with passing tests for `ssh -V` parsing (including real `/usr/bin/ssh`), `0700`/`0600` runtime dir & config generation, `HostKeyAlias` `known_hosts` rendering, and Unix-socket `ScopedAgent` wire roundtrips.
-- Pattern to follow: `crates/conduit-ssh/src/agent_wire.rs:68-86` (`serve` over `AsyncRead + AsyncWrite + Unpin`), `crates/conduit-core/src/model.rs:463-511` (`OpenSshOptions`, `SessionProfile`), `Cargo.toml:5-14` (workspace members).
+- Goal: Add an automated secret-leak scan integration test suite covering logs, exports, and OpenSSH files, plus cross-platform Python scripts for sidecar staging, bundle smoke testing, pure-Rust crypto checking, and release config validation.
+- Done when: `cargo test -p rusty-conduit-ssh-gui --test secret_leak_scan`, `cargo clippy --workspace --all-targets -- -D warnings`, `python3 scripts/check-pure-rust-crypto.py`, and `python3 scripts/smoke-test-bundle.py --self-test` all exit 0.
+- Pattern to follow: `src-tauri/src/commands.rs:567-616` for sentinel secret fragment scanning, and `crates/conduit-openssh/tests/openssh_loopback.rs:1-80` for temp dirs and SSH config helpers.
 
 ## Context
-Master Plan Section 3.6 requires every `SshEngine::OpenSsh` session to run completely isolated from `~/.ssh/config`, `/etc/ssh/ssh_config`, `~/.ssh/id_*`, `~/.ssh/known_hosts`, and ambient `SSH_AUTH_SOCK`.
-This phase builds the foundational modules of `crates/conduit-openssh`:
-- Binary discovery & version check (`binary.rs`): executes `<ssh_bin> -V` (which OpenSSH prints to stderr), parses `OpenSSH_<major>.<minor>` (including `OpenSSH_for_Windows_<major>.<minor>`), enforces `>= 8.4` on Windows (for `SSH_ASKPASS_REQUIRE=force`), and returns a serializable `OpenSshBinaryInfo`.
-- Short space-free runtime dir (`runtime_dir.rs`): creates `<base>/rc-<short_hex>` with `0700` permissions on Unix (`$XDG_RUNTIME_DIR` on Linux if space-free and short enough for Unix socket path limits `<= 64` chars, else `/tmp`; short temp dir on macOS/Windows), with RAII `Drop` cleanup.
-- App-owned `known_hosts` (`known_hosts.rs`): deterministic `HostKeyAlias` (`rc-<hex>`) per `(hop_id, host, port)` and renderer writing `<alias> <public_key_openssh>\n` (`0600` on Unix) for all approved `HostKeyRecord`s with `public_key_openssh`.
-- Hardened `-F` config (`config.rs`): generates per-hop and target `Host` stanzas with `HostKeyAlias`, `UserKnownHostsFile`, `GlobalKnownHostsFile none`, `StrictHostKeyChecking yes`, `IdentitiesOnly yes`, `IdentityAgent <socket|none>`, `ControlMaster no`, `ControlPath none`, `UpdateHostKeys no`, `NumberOfPasswordPrompts 1`, `ServerAliveInterval`, `ServerAliveCountMax`, `AddressFamily`, `ForwardAgent`, and multi-hop `ProxyCommand` invoking `conduit-worker hop-proxy ...` (never `ProxyJump`).
-- Isolated local agent server (`agent_server.rs`): serves `conduit_ssh::ScopedAgent` via `conduit_ssh::agent_wire::serve` on a Unix domain socket (`0600` inside runtime dir) on `cfg(unix)` and via `tokio::net::windows::named_pipe::ServerOptions` on `cfg(windows)`.
+- Master Plan Section 9 Phase 5 requires automated secret-leak scanning of logs and exports, plus installer smoke tests and pure-Rust crypto enforcement.
+- `src-tauri/src/commands.rs` already tests IPC responses; `src-tauri/tests/secret_leak_scan.rs` must complement it by scanning: (1) runtime diagnostic/access log lines (`conduit_runtime::SessionManager` / `AppController` log ring buffers and auth/host-key error states), (2) plain config exports (zero sentinel secrets) and encrypted config exports (zero plaintext sentinel secrets in the file bytes), and (3) `conduit_openssh::write_config` / `write_known_hosts` output files (zero passwords or private key material).
+- All scripts in `scripts/` must use Python 3 standard library only (except `validate-release-config.py` may use `yaml` if installed and fall back or require `PyYAML` cleanly — `PyYAML` is installed on this host and standard in GitHub Actions) so they run identically on Linux, macOS, and Windows without Bash or PowerShell divergence. In `validate-release-config.py`, validate PNG dimensions (IHDR bytes 16..24), ICO header (`\x00\x00\x01\x00`), and ICNS magic/length using stdlib `struct` so Pillow (`PIL`) is not required on CI runners.
+- `scripts/stage-worker.py` must support `--target <triple>` (single target) and `--universal-macos` (builds `aarch64-apple-darwin` + `x86_64-apple-darwin` and runs `lipo -create` into `src-tauri/binaries/conduit-worker-universal-apple-darwin`), plus `--profile <debug|release>` (default `release`).
+- `scripts/smoke-test-bundle.py` must support `--self-test` (creates synthetic test fixtures in a temp dir to unit-test its own `.deb`/directory/checksum checks) and `--bundle-dir <path> --platform <linux|macos|windows>` to verify real artifacts in CI (checking main binary + `conduit-worker` presence in `.deb` via `dpkg-deb -c`, `.rpm` via `rpm -qlp`, `.AppImage` non-empty executable, macOS `.app` Mach-O slices via `lipo -info` + `.dmg` non-empty, Windows NSIS `.exe` / `.msi` non-empty).
 
 ## Scope
-- In: `Cargo.toml`, `Cargo.lock`, `crates/conduit-openssh/**`
-- Out: `docs/MASTER-PLAN.md`, `../rusty-conduit-ssh/**`, `crates/conduit-core/**`, `crates/conduit-ssh/**`, `crates/conduit-runtime/**`, `src-tauri/**`
+- In: `src-tauri/tests/secret_leak_scan.rs`, `scripts/stage-worker.py`, `scripts/smoke-test-bundle.py`, `scripts/check-pure-rust-crypto.py`, `scripts/validate-release-config.py`
+- Out: `src-tauri/src/**`, `src-tauri/ui/**`, `crates/**`, `.github/**`, `docs/**`
 
 ## Sub-tasks
-1. [done] Add `"crates/conduit-openssh"` to `Cargo.toml` workspace members and create `crates/conduit-openssh/Cargo.toml` (with `[[bin]] name = "conduit-worker" path = "src/bin/conduit-worker.rs"` stub, depending on `conduit-core`, `conduit-ssh`, `rusty-conduit-ssh`, `tokio` with `process`/`net`/`io-util`/`sync`/`time`/`rt`/`macros`, `serde`, `thiserror`, `sha2` or `ring`, `hex` or simple hex helper, `zeroize`, `libc` on unix) and `crates/conduit-openssh/src/lib.rs` — done when: `cargo check -p conduit-openssh` exits 0.
-2. [done] Implement `crates/conduit-openssh/src/binary.rs`: `OpenSshBinaryInfo { requested, resolved_path, version_raw, major, minor, supported, message }` (`Serialize`, `Deserialize`, `Clone`, `Debug`, `PartialEq`, `Eq`), `parse_openssh_version(&str) -> Option<(u32, u32)>`, `check_openssh_binary(ssh_bin: &str) -> OpenSshBinaryInfo`, and `check_version_for_platform(major, minor, is_windows)` requiring `>= (8, 4)` on Windows with clear upgrade guidance; add unit tests covering Linux/macOS/Windows OpenSSH version strings (including `8.3` rejected on Windows, `8.4`/`8.6`/`10.2` accepted) and a test invoking `/usr/bin/ssh` on this host — done when: `cargo test -p conduit-openssh binary` passes.
-3. [done] Implement `crates/conduit-openssh/src/runtime_dir.rs` (short space-free `0700` directory with RAII cleanup, verified path contains no spaces and is `<= 80` bytes on Unix) and `crates/conduit-openssh/src/known_hosts.rs` (deterministic `host_key_alias(hop_id, host, port) -> String`, `render_known_hosts(&KnownHostsStore, &[(hop_id, host, port)]) -> String`, `write_known_hosts(...)` writing `0600` file, never touching `~/.ssh/known_hosts`) with unit tests — done when: `cargo test -p conduit-openssh runtime_dir && cargo test -p conduit-openssh known_hosts` passes.
-4. [done] Implement `crates/conduit-openssh/src/config.rs`: hardened per-session `-F` generator writing `0600` config files for single-hop and multi-hop chains (`HostKeyAlias`, `UserKnownHostsFile`, `GlobalKnownHostsFile none`, `StrictHostKeyChecking yes`, `IdentitiesOnly yes`, `IdentityAgent`, `ControlMaster no`, `ControlPath none`, `UpdateHostKeys no`, `NumberOfPasswordPrompts 1`, `ServerAliveInterval`, `ServerAliveCountMax`, `AddressFamily`, `ForwardAgent`, `ProxyCommand` for multi-hop using `conduit-worker hop-proxy`, never `ProxyJump`, proper Windows backslash escaping for named-pipe `IdentityAgent` paths) with unit tests verifying every directive and asserting zero `~/.ssh` or `ProxyJump` strings — done when: `cargo test -p conduit-openssh config` passes.
-5. [done] Implement `crates/conduit-openssh/src/agent_server.rs`: `IsolatedAgentServer::start(runtime_dir, name, Arc<ScopedAgent>)` serving `conduit_ssh::agent_wire::serve` over a `0600` Unix domain socket on `cfg(unix)` and `tokio::net::windows::named_pipe` on `cfg(windows)`, with graceful shutdown handle and `endpoint_path() -> String`; add async tests connecting to the Unix socket and verifying `REQUEST_IDENTITIES`, `SIGN_REQUEST`, and `ADD_IDENTITY` rejection (`SSH_AGENT_FAILURE`) — done when: `cargo test -p conduit-openssh agent_server` passes.
+1. [done] Create `src-tauri/tests/secret_leak_scan.rs` testing sentinel passwords, private keys (PEM/OpenSSH body lines), key passphrases, and MITM CA passphrases across `AppController` plain exports, encrypted exports, session diagnostic logs / error messages, and `conduit_openssh` generated `-F` config + `known_hosts` files — done when: `cargo test -p rusty-conduit-ssh-gui --test secret_leak_scan` exits 0 with at least 4 passing tests.
+2. [done] Create `scripts/check-pure-rust-crypto.py` running `cargo tree --workspace --edges normal` and failing non-zero if `openssl-sys` or `aws-lc-sys` appears anywhere in the dependency graph (printing `PURE_RUST_CRYPTO_OK` on pass) — done when: `python3 scripts/check-pure-rust-crypto.py` exits 0.
+3. [done] Create `scripts/stage-worker.py` supporting `--target <triple>`, `--universal-macos`, `--profile <debug|release>`, and `--dry-run`, copying the built `conduit-worker[.exe]` into `src-tauri/binaries/conduit-worker-<triple>[.exe]` — done when: `python3 scripts/stage-worker.py --dry-run` exits 0 and prints the resolved target triple and destination path.
+4. [done] Create `scripts/smoke-test-bundle.py` supporting `--bundle-dir <path> --platform <linux|macos|windows>` and `--self-test`, verifying packaged artifacts contain both `rusty-conduit-ssh-gui` and `conduit-worker` (and macOS universal slices / non-empty installers) — done when: `python3 scripts/smoke-test-bundle.py --self-test` exits 0.
+5. [done] Create `scripts/validate-release-config.py` validating `src-tauri/tauri.conf.json`, `src-tauri/tauri.bundle.conf.json`, `src-tauri/windows/nsis-hooks.nsh`, all icon files in `src-tauri/icons/`, version parity across `src-tauri/Cargo.toml`, `src-tauri/tauri.conf.json`, and `src-tauri/ui/package.json`, and (when `.github/workflows/*.yml` exist) YAML syntax + required CI/release jobs — done when: `python3 scripts/validate-release-config.py` exits 0.
 
 ## Verify
 ```sh
-cargo test -p conduit-openssh && cargo clippy --workspace --all-targets -- -D warnings
+cargo test -p rusty-conduit-ssh-gui --test secret_leak_scan
+cargo clippy --workspace --all-targets -- -D warnings
+python3 scripts/check-pure-rust-crypto.py
+python3 scripts/stage-worker.py --dry-run
+python3 scripts/smoke-test-bundle.py --self-test
+python3 scripts/validate-release-config.py
 ```
 
 ## Escalate when
-- Adding a new crate dependency would pull in `openssl-sys` or `aws-lc-sys` (violating pure-Rust crypto requirement) → stop, set `Status: needs-human — reason: <dependency name>`
-- `ssh -V` is missing or behaves unexpectedly on this host → stop, set `Status: needs-human — reason: <observed output>`
+- `AppController` or `conduit_openssh` lacks a public API needed by `src-tauri/tests/secret_leak_scan.rs` → stop, set `Status: needs-human — reason: <missing public symbol and crate>`.
+- `cargo tree` reports `openssl-sys` or `aws-lc-sys` → stop, set `Status: needs-human — reason: <offending crate chain>`.
 
 ## Log
 - (append-only, one line per event)
-- sub-task 1: added crates/conduit-openssh to the workspace with manifest, lib.rs and conduit-worker stub
-- sub-task 2: implemented binary.rs with version parsing, Windows >= 8.4 gate, timeout-guarded -V check
-- sub-task 3: implemented runtime_dir.rs and known_hosts.rs
-- sub-task 4: implemented config.rs hardened -F generator with value validation; added IdentityFile lines (none by default) so ssh cannot fall back to ~/.ssh/id_*
-- sub-task 5: implemented agent_server.rs with Unix socket and cfg(windows) named pipe; Windows branch not compiled on this host (target not installed)
-- phase verified; note for phase-0003: pass each hop's public key path in ConfigHop.identity_files or agent key auth fails
-- loopback sshd check of IdentitiesOnly with an isolated agent
+- sub-task 1: added src-tauri/tests/secret_leak_scan.rs with 5 tests (plain export, encrypted export including decoded payload bytes, session logs and auth/host-key/MITM failure states, rejected-input errors, generated OpenSSH files)
+- sub-task 2: added scripts/check-pure-rust-crypto.py; uses --target all so Windows and macOS dependencies are also checked from Linux
+- sub-task 3: added scripts/stage-worker.py; --universal-macos also stages the two thin sidecars beside the universal binary
+- sub-task 4: added scripts/smoke-test-bundle.py with fixture self-test, including a real .deb built by dpkg-deb
+- sub-task 5: added scripts/validate-release-config.py; workflow job check requires only the job names phase-0003 already fixes (ci: frontend; release: verify, release)
 
 ## Evidence
 - (append-only: command → observed result)
-- cargo check -p conduit-openssh → exit 0; Cargo.lock has 0 openssl-sys/aws-lc-sys packages
-- cargo test -p conduit-openssh binary → 7 passed, includes real /usr/bin/ssh (OpenSSH_10.2p1)
-- cargo test -p conduit-openssh runtime_dir → 5 passed; cargo test -p conduit-openssh known_hosts → 5 passed
-- cargo test -p conduit-openssh config → 10 passed, includes real ssh -G parse of generated config
-- cargo test -p conduit-openssh agent_server → 6 passed
-- cargo test -p conduit-openssh && cargo clippy --workspace --all-targets -- -D warnings → exit 0, 33 tests passed, clippy clean
-- throwaway sshd + ssh-agent: IdentityFile none → exit 255 Permission denied (publickey); IdentityFile <key>.pub → exit 0
+- cargo test -p rusty-conduit-ssh-gui --test secret_leak_scan → exit 0, 5 passed, 0 failed
+- cargo clippy --workspace --all-targets -- -D warnings → exit 0
+- python3 scripts/check-pure-rust-crypto.py → exit 0, PURE_RUST_CRYPTO_OK; with a fake cargo reporting openssl-sys → exit 1
+- python3 scripts/stage-worker.py --dry-run → exit 0, target x86_64-unknown-linux-gnu, destination src-tauri/binaries/conduit-worker-x86_64-unknown-linux-gnu
+- python3 scripts/smoke-test-bundle.py --self-test → exit 0, SMOKE_TEST_SELF_TEST_OK
+- python3 scripts/validate-release-config.py → exit 0, RELEASE_CONFIG_OK; on a scratch copy with bad version, truncated icns and ci.yml lacking frontend → exit 1 with all 3 errors
+- not run: real stage-worker builds, lipo, rpm, and real bundle checks (no lipo or rpm on this Linux host, no bundles built in this phase)
