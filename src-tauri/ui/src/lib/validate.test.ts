@@ -10,6 +10,7 @@ import {
   isPort,
   redactArgs,
   sessionErrors,
+  configLineArgs,
 } from "./validate.ts";
 
 function validProfile(): SessionProfile {
@@ -32,9 +33,6 @@ function validProfile(): SessionProfile {
           auth: [],
           host_key_pin: null,
         },
-        agent_forward: false,
-        agent_forward_keys: [],
-        agent_forward_command: null,
       },
     ],
     forward: {
@@ -398,5 +396,26 @@ describe("sessionErrors", () => {
       errors["openssh.extra_args:1"],
       '"-oProxyCommand=nc %h %p" uses the forbidden flag ProxyCommand.',
     );
+  });
+});
+
+describe("configLineArgs", () => {
+  test("finds ssh_config lines and offers the -o form", () => {
+    assert.deepEqual(configLineArgs(["Compression yes", "-v", "ServerAliveInterval=30"]), [
+      { index: 0, keyword: "Compression", fix: ["-o", "Compression=yes"] },
+      { index: 2, keyword: "ServerAliveInterval", fix: ["-o", "ServerAliveInterval=30"] },
+    ]);
+  });
+
+  test("leaves real command-line arguments alone", () => {
+    assert.deepEqual(configLineArgs(["-o", "Compression=yes"]), []);
+    assert.deepEqual(configLineArgs(["-o", "ServerAliveInterval 30"]), []);
+    assert.deepEqual(configLineArgs(["-oCompression=yes", "-v", "-C", "-p", "2222"]), []);
+    assert.deepEqual(configLineArgs(["-c", "aes256-gcm@openssh.com"]), []);
+  });
+
+  test("has no -o fix for Host and Match blocks", () => {
+    assert.deepEqual(configLineArgs(["Host example"]), [{ index: 0, keyword: "Host", fix: null }]);
+    assert.deepEqual(configLineArgs(["match all"]), [{ index: 0, keyword: "match", fix: null }]);
   });
 });

@@ -9,9 +9,6 @@ function hop(name: string, host: string, auth: AuthMethod[] = []): HopEntry {
     hop_id: `hop-${name || host}`,
     name,
     host: { ...blankHost(), host, user: "me", auth },
-    agent_forward: false,
-    agent_forward_keys: [],
-    agent_forward_command: null,
   };
 }
 

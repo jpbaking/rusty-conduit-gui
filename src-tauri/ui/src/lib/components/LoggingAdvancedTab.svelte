@@ -1,9 +1,9 @@
 <script lang="ts">
   import { untrack } from "svelte";
-  import { api, errorMessage } from "../api";
+  import { opensshCheck } from "../opensshCheck.svelte";
   import { store } from "../stores.svelte";
-  import type { LoggingConfig, OpenSshBinaryInfo, OpenSshOptions, SessionProfile } from "../types";
-  import { denylistedFlag, LOG_FORMATS, LOG_LEVELS, redactArgs } from "../validate";
+  import type { LoggingConfig, OpenSshOptions, SessionProfile } from "../types";
+  import { configLineArgs, denylistedFlag, isIpAddress, isLoopback, LOG_FORMATS, LOG_LEVELS, redactArgs } from "../validate";
   import PortField from "./PortField.svelte";
 
   /** Long enough that a path being typed is not run one partial value at a time. */
@@ -29,6 +29,16 @@
   const argErrors = $derived(
     openssh.extra_args.flatMap((_, index) => errors[`openssh.extra_args:${index}`] ?? []),
   );
+  // Lines written like ssh_config, which ssh would not read as options.
+  const configLines = $derived(configLineArgs(openssh.extra_args));
+
+  /** Rewrites one ssh_config-style line as `-o` and `Keyword=value`. */
+  function fixConfigLine(index: number, fix: [string, string]) {
+    const args = [...openssh.extra_args];
+    args.splice(index, 1, ...fix);
+    setOpenssh({ extra_args: args });
+  }
+
   const preview = $derived(
     [openssh.ssh_bin.trim() || "ssh", "[managed options]", ...redactArgs(openssh.extra_args)].join(" "),
   );
@@ -44,45 +54,28 @@
   // Primitive values, so edits to other draft fields do not trigger a new check.
   const sshBin = $derived(openssh.ssh_bin.trim());
   const usesOpenssh = $derived(draft.engine === "OpenSsh");
+  // ssh's own SOCKS listener has no filters or MITM, so it should stay on this machine.
+  const socksExposed = $derived(
+    isIpAddress(openssh.ssh_socks_bind) && !isLoopback(openssh.ssh_socks_bind),
+  );
 
-  let checkingBin = $state(false);
-  let binInfo = $state.raw<OpenSshBinaryInfo | null>(null);
-  let binError = $state<string | null>(null);
-  let binRun = 0;
+  const check = opensshCheck;
+  // Only a result for the program in the field is shown, never one for an earlier value.
+  const shown = $derived(usesOpenssh && check.bin === sshBin);
+  const binInfo = $derived(shown ? check.info : null);
+  const binStatus = $derived(shown ? check.status : null);
+  const binError = $derived(shown ? check.error : null);
+  const checkingBin = $derived(shown && check.checking);
 
-  const binStatus = $derived.by(() => {
-    if (!binInfo) return null;
-    if (binInfo.supported) return { tone: "ok", label: "Supported" };
-    if (binInfo.major !== null) return { tone: "busy", label: "Version too old" };
-    if (binInfo.resolved_path !== null) return { tone: "alert", label: "Not usable" };
-    return { tone: "alert", label: "Not found" };
-  });
-
-  async function checkBinary() {
-    const run = ++binRun;
-    checkingBin = true;
-    binInfo = null;
-    binError = null;
-    try {
-      const info = await api.checkOpensshBinary(sshBin || undefined);
-      if (run === binRun) binInfo = info;
-    } catch (error) {
-      if (run === binRun) binError = errorMessage(error);
-    } finally {
-      if (run === binRun) checkingBin = false;
-    }
+  function checkBinary() {
+    void check.run(sshBin);
   }
 
-  // A result only describes the exact program it was read from.
+  // While the OpenSSH engine is chosen, a changed program is checked once typing pauses.
   $effect(() => {
-    void sshBin;
-    const autoCheck = usesOpenssh;
-    binRun += 1;
-    checkingBin = false;
-    binInfo = null;
-    binError = null;
-    if (!autoCheck) return;
-    const timer = setTimeout(checkBinary, AUTO_CHECK_DELAY_MS);
+    const bin = sshBin;
+    if (!usesOpenssh || check.covers(bin)) return;
+    const timer = setTimeout(() => check.ensure(bin), AUTO_CHECK_DELAY_MS);
     return () => clearTimeout(timer);
   });
 
@@ -167,7 +160,7 @@
     </div>
     <div class="field grow">
       <label class="field">
-        SOCKS bind address
+        Internal SOCKS bind
         <input
           value={openssh.ssh_socks_bind}
           spellcheck="false"
@@ -180,12 +173,24 @@
       {/if}
     </div>
     <PortField
-      label="SOCKS port"
+      label="Internal SOCKS port"
       value={openssh.ssh_socks_port}
       error={errors["openssh.ssh_socks_port"]}
       onValue={(ssh_socks_port) => setOpenssh({ ssh_socks_port })}
     />
   </div>
+  <p class="note">
+    <strong>Not the proxy your apps use.</strong> With the OpenSSH engine, <code>ssh</code> opens its
+    own SOCKS listener here (<code>ssh -D</code>), and the proxy on the Proxy tab sends its traffic
+    through it. Point browsers and tools at the Proxy tab's ports. Port 0 picks a free port each
+    time the session connects.
+  </p>
+  {#if socksExposed}
+    <p class="warning">
+      This address is not loopback, so other devices may reach ssh's SOCKS listener directly. It
+      skips the Proxy tab's filters and MITM. Use 127.0.0.1 unless you need otherwise.
+    </p>
+  {/if}
 
   <div role="status">
     {#if binInfo && binStatus}
@@ -196,7 +201,9 @@
         <dt>Path</dt>
         <dd>{binInfo.resolved_path ?? "Not found"}</dd>
       </dl>
-      {#if binStatus.tone === "busy"}
+      {#if binInfo.supported && binInfo.note}
+        <p class="warning">{binInfo.note}</p>
+      {:else if binStatus.tone === "busy"}
         <p class="warning">{binInfo.message}</p>
       {:else if binStatus.tone === "alert"}
         <p class="field-error">{binInfo.message}</p>
@@ -206,11 +213,16 @@
   </div>
 
   <label class="field">
-    <span>Extra arguments <small class="muted">one per line, passed to ssh as written</small></span>
+    <span>
+      Extra arguments
+      <small class="muted">ssh command-line arguments, not ssh_config lines · one argument per line</small>
+    </span>
     <textarea
       class="code-text"
       bind:value={argsText}
       spellcheck="false"
+      placeholder={"-o\nCompression=yes\n-v"}
+      aria-describedby={`${uid}-args-help`}
       aria-invalid={argErrors.length > 0}
       oninput={(e) => setOpenssh({ extra_args: parseArgs(e.currentTarget.value) })}
     ></textarea>
@@ -223,6 +235,29 @@
       {/each}
     </ul>
   {/if}
+  <p id={`${uid}-args-help`} class="note">
+    Each line is passed to <code>ssh</code> as one command-line argument, exactly as written. To
+    set an ssh_config option, put <code>-o</code> on one line and <code>Option=value</code> on the
+    next, such as <code>-o</code> then <code>Compression=yes</code>. A flag and its value can also
+    share a line with no space: <code>-oCompression=yes</code>.
+  </p>
+  {#each configLines as line (line.index)}
+    <div class="warning config-line">
+      <span>
+        Line {line.index + 1}, <code>{openssh.extra_args[line.index]}</code>, is written like an
+        ssh_config line, so ssh would not read it as an option.
+        {#if line.fix}
+          Write it as <code>{line.fix[0]}</code> then <code>{line.fix[1]}</code>.
+        {:else}
+          {line.keyword} blocks are not supported here: every option applies to the whole session.
+        {/if}
+      </span>
+      {#if line.fix}
+        {@const fix = line.fix}
+        <button type="button" onclick={() => fixConfigLine(line.index, fix)}>Fix</button>
+      {/if}
+    </div>
+  {/each}
   {#each argErrors as problem, index (index)}
     <span class="field-error">{problem} It breaks tunnel isolation.</span>
   {/each}

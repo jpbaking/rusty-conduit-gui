@@ -1,6 +1,6 @@
 // Pure display helpers shared by the shell components.
 
-import type { ListenerInfo, SessionState } from "./types";
+import type { ListenerInfo, OpenSshBinaryInfo, SessionState } from "./types";
 
 export type StatusTone = "ok" | "busy" | "alert" | "idle";
 
@@ -114,4 +114,17 @@ export function logLevel(text: string): LogLevel {
 
 export function passesLevel(level: LogLevel, filter: LogFilter): boolean {
   return filter === "all" || LEVEL_RANK[level] <= LEVEL_RANK[filter];
+}
+
+export interface CheckStatus {
+  tone: "ok" | "busy" | "alert";
+  label: string;
+}
+
+/** How an `ssh` program check reads at a glance. A supported version with a limit is amber. */
+export function checkStatus(info: OpenSshBinaryInfo): CheckStatus {
+  if (info.supported) return { tone: info.note ? "busy" : "ok", label: "Supported" };
+  if (info.major !== null) return { tone: "busy", label: "Version too old" };
+  if (info.resolved_path !== null) return { tone: "alert", label: "Not usable" };
+  return { tone: "alert", label: "Not found" };
 }

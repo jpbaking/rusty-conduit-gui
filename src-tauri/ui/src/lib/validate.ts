@@ -163,6 +163,34 @@ export function denylistedFlag(token: string): string | null {
   return null;
 }
 
+/** An extra argument written the way `ssh_config` is, which `ssh` would not read as an option. */
+export interface ConfigLineArg {
+  index: number;
+  keyword: string;
+  /** The arguments to put in its place, or `null` when `-o` cannot express it (Host, Match). */
+  fix: [string, string] | null;
+}
+
+/**
+ * Finds `Keyword value` or `Keyword=value` lines in the extra arguments. Each line is one
+ * command-line argument, so these need `-o` in front. A value right after a flag that takes one
+ * (`-o`, `-p`, ...) is left alone.
+ */
+export function configLineArgs(args: readonly string[]): ConfigLineArg[] {
+  const found: ConfigLineArg[] = [];
+  args.forEach((arg, index) => {
+    if (arg.startsWith("-")) return;
+    const previous = args[index - 1];
+    if (previous && /^-[A-Za-z]$/.test(previous) && VALUE_FLAGS.includes(previous[1]!)) return;
+    const match = /^([A-Za-z][A-Za-z0-9]*)(?:[ \t]*=[ \t]*|[ \t]+)(\S.*)$/.exec(arg.trim());
+    if (!match) return;
+    const [, keyword, value] = match as unknown as [string, string, string];
+    const block = ["host", "match"].includes(asciiLower(keyword));
+    found.push({ index, keyword, fix: block ? null : ["-o", `${keyword}=${value.trim()}`] });
+  });
+  return found;
+}
+
 const REDACTED = "<redacted>";
 
 /** Keeps flag and option names so the shape is readable, and hides every value. */

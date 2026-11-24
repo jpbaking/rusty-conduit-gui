@@ -172,6 +172,13 @@ button.danger { color: var(--alert); border-color: var(--alert); }
 button.icon { min-height: 22px; min-width: 22px; padding: 0 4px; background: transparent; border-color: transparent; }
 .route-add { align-self: stretch; border-style: dashed; color: var(--muted); background: transparent; }
 .route .reason, .route .ok { margin: 0; font-size: 12px; }
+/* An extra argument written like ssh_config, with its one-click fix. */
+.warning.config-line { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+/* OpenSSH check under the Engine picker. */
+.engine-check { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; font-size: 12px; }
+.engine-check p { margin: 0; }
+.engine-check-head { display: flex; align-items: center; gap: 6px; }
+.engine-check .path { overflow-wrap: anywhere; }
 button.link-button { min-height: 0; padding: 0; color: var(--accent); background: none; border: 0; text-decoration: underline; }
 .field-inline { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }
 .field-inline select { max-width: 300px; color: var(--text); }
@@ -203,8 +210,6 @@ button.link-button { min-height: 0; padding: 0; color: var(--accent); background
 .hop-card .auth-add select { max-width: 170px; }
 .hop-card .password-form { flex-wrap: nowrap; }
 .hop-card .password-form input { width: 150px; }
-.key-picker { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; margin: 0; padding: 6px 10px; border: 1px solid var(--border); border-radius: 5px; }
-.key-picker legend { padding: 0 4px; color: var(--muted); }
 .note { padding: 5px 8px; color: var(--muted); background: var(--surface-2); border-left: 3px solid var(--accent); font-size: 12px; }
 .warning { padding: 5px 8px; color: var(--text); background: var(--surface-2); border-left: 3px solid var(--busy); }
 

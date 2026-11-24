@@ -2,6 +2,7 @@
   import { tick } from "svelte";
   import { stateReason } from "../format";
   import { store } from "../stores.svelte";
+  import { opensshCheck, type Fallback } from "../opensshCheck.svelte";
   import type { HopEntry, SessionProfile } from "../types";
   import type { FieldErrors } from "../validate";
   import FiltersTab from "./FiltersTab.svelte";
@@ -11,6 +12,8 @@
   import KeepaliveTab from "./KeepaliveTab.svelte";
   import ListenerStrip from "./ListenerStrip.svelte";
   import LoggingAdvancedTab from "./LoggingAdvancedTab.svelte";
+  import EngineCheck from "./EngineCheck.svelte";
+  import OpensshFallbackDialog from "./OpensshFallbackDialog.svelte";
   import MitmTab from "./MitmTab.svelte";
   import ProxyTab from "./ProxyTab.svelte";
 
@@ -86,6 +89,33 @@
     void focusTab(target);
   }
 
+  /** Set while the "OpenSSH can't be used" dialog is open. */
+  let fallback = $state<Fallback | null>(null);
+
+  function setEngine(engine: SessionProfile["engine"]) {
+    store.updateDraft((p) => ({ ...p, engine }));
+  }
+
+  /** OpenSSH is checked as soon as it is chosen; an unusable program falls back to Rust SSH. */
+  async function chooseEngine(engine: SessionProfile["engine"]) {
+    setEngine(engine);
+    if (engine !== "OpenSsh") return;
+    const session = store.selectedId;
+    const bin = draft.openssh.ssh_bin.trim();
+    await opensshCheck.run(bin);
+    // Ignore a result that no longer applies: another session, or the choice changed meanwhile.
+    if (store.selectedId !== session || draft.engine !== "OpenSsh" || opensshCheck.bin !== bin) return;
+    if (opensshCheck.info?.supported) return;
+    setEngine("Russh");
+    fallback = { bin, info: opensshCheck.info, error: opensshCheck.error };
+  }
+
+  /** The dialog found a supported program: use it. */
+  function useOpenssh(bin: string) {
+    store.updateDraft((p) => ({ ...p, engine: "OpenSsh", openssh: { ...p.openssh, ssh_bin: bin } }));
+    fallback = null;
+  }
+
   function editHop(id: string, edit: (hop: HopEntry) => HopEntry) {
     store.updateDraft((profile) => ({
       ...profile,
@@ -153,15 +183,15 @@
             Engine
             <select
               value={draft.engine}
-              onchange={(e) => {
-                const engine = e.currentTarget.value as SessionProfile["engine"];
-                store.updateDraft((p) => ({ ...p, engine }));
-              }}
+              onchange={(e) => void chooseEngine(e.currentTarget.value as SessionProfile["engine"])}
             >
               <option value="Russh">Built-in Rust SSH</option>
-              <option value="OpenSsh" disabled>OpenSSH (Phase 4)</option>
+              <option value="OpenSsh">OpenSSH (system ssh)</option>
             </select>
           </label>
+          {#if draft.engine === "OpenSsh"}
+            <EngineCheck onChangeProgram={() => void focusTab(LOGGING_TAB)} />
+          {/if}
         </section>
       </aside>
 
@@ -214,3 +244,7 @@
   {/key}
 
 </div>
+
+{#if fallback}
+  <OpensshFallbackDialog {fallback} onUse={useOpenssh} onClose={() => (fallback = null)} />
+{/if}

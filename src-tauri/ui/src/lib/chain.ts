@@ -14,9 +14,6 @@ export function newHop(): HopEntry {
     hop_id: crypto.randomUUID(),
     name: "",
     host: blankHost(),
-    agent_forward: false,
-    agent_forward_keys: [],
-    agent_forward_command: null,
   };
 }
 

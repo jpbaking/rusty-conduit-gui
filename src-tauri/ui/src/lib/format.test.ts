@@ -1,8 +1,9 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 
-import type { SessionState } from "./types.ts";
+import type { OpenSshBinaryInfo, SessionState } from "./types.ts";
 import {
+  checkStatus,
   formatBytes,
   formatUptime,
   isActive,
@@ -179,5 +180,36 @@ describe("passesLevel", () => {
     for (const level of ["error", "warn", "info", "debug"] as const) {
       assert.equal(passesLevel(level, "all"), true, level);
     }
+  });
+});
+
+describe("checkStatus", () => {
+  const info = (patch: Partial<OpenSshBinaryInfo>): OpenSshBinaryInfo => ({
+    requested: "ssh",
+    resolved_path: "/usr/bin/ssh",
+    version_raw: "OpenSSH_10.5p1",
+    major: 10,
+    minor: 5,
+    supported: true,
+    message: "OpenSSH 10.5 is supported.",
+    note: null,
+    ...patch,
+  });
+
+  test("reads each kind of result", () => {
+    assert.deepEqual(checkStatus(info({})), { tone: "ok", label: "Supported" });
+    assert.deepEqual(checkStatus(info({ note: "prompts" })), { tone: "busy", label: "Supported" });
+    assert.deepEqual(checkStatus(info({ supported: false, major: 7, minor: 2 })), {
+      tone: "busy",
+      label: "Version too old",
+    });
+    assert.deepEqual(checkStatus(info({ supported: false, major: null, minor: null })), {
+      tone: "alert",
+      label: "Not usable",
+    });
+    assert.deepEqual(
+      checkStatus(info({ supported: false, resolved_path: null, major: null, minor: null })),
+      { tone: "alert", label: "Not found" },
+    );
   });
 });

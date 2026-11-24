@@ -16,7 +16,8 @@ pub mod supervisor;
 pub use agent_server::IsolatedAgentServer;
 pub use askpass::{run_askpass_client, AskpassError, AskpassServer};
 pub use binary::{
-    check_openssh_binary, check_version_for_platform, parse_openssh_version, OpenSshBinaryInfo,
+    check_openssh_binary, check_version_for_platform, parse_openssh_version, version_note,
+    OpenSshBinaryInfo, FORCED_ASKPASS_VERSION, MIN_VERSION, MIN_WINDOWS_VERSION,
 };
 pub use config::{
     hop_alias, render_config, write_config, ConfigError, ConfigHop, SessionConfig, WriteConfigError,

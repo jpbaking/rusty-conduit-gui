@@ -51,7 +51,7 @@ function profile(id: string, name: string, host: string, httpPort: number): Sess
     autostart: false,
     enabled: true,
     engine: "Russh",
-    hops: [{ hop_id: `${id}-hop`, name, host: hostProfile, agent_forward: false, agent_forward_keys: [], agent_forward_command: null }],
+    hops: [{ hop_id: `${id}-hop`, name, host: hostProfile }],
     forward: {
       enabled: true,
       bind: "127.0.0.1",
@@ -238,6 +238,7 @@ function mockOpensshCheck(args?: Record<string, unknown>): OpenSshBinaryInfo {
       minor: null,
       supported: false,
       message: `OpenSSH binary "${requested}" was not found.`,
+      note: null,
     };
   }
   return {
@@ -248,6 +249,7 @@ function mockOpensshCheck(args?: Record<string, unknown>): OpenSshBinaryInfo {
     minor: 6,
     supported: true,
     message: "OpenSSH 9.6 is supported.",
+    note: null,
   };
 }
 

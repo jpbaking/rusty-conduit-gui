@@ -8,6 +8,11 @@ use serde::{Deserialize, Serialize};
 
 /// Oldest OpenSSH on Windows with `SSH_ASKPASS_REQUIRE=force`.
 pub const MIN_WINDOWS_VERSION: (u32, u32) = (8, 4);
+/// Oldest OpenSSH elsewhere: the generated config needs `IdentityAgent` (OpenSSH 7.3).
+pub const MIN_VERSION: (u32, u32) = (7, 3);
+/// Oldest OpenSSH that always uses the app's askpass helper (`SSH_ASKPASS_REQUIRE=force`).
+/// Older clients use it only when the app has no controlling terminal.
+pub const FORCED_ASKPASS_VERSION: (u32, u32) = (8, 4);
 
 const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -21,6 +26,9 @@ pub struct OpenSshBinaryInfo {
     pub minor: Option<u32>,
     pub supported: bool,
     pub message: String,
+    /// A limit of a supported version, such as when password prompts may not reach the app.
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 /// Finds `OpenSSH_<major>.<minor>` or `OpenSSH_for_Windows_<major>.<minor>` in `-V` output.
@@ -51,14 +59,35 @@ fn leading_number(input: &str) -> Option<(u32, &str)> {
 
 /// Whether this version can run here. The error is guidance to show the user.
 pub fn check_version_for_platform(major: u32, minor: u32, is_windows: bool) -> Result<(), String> {
-    let (min_major, min_minor) = MIN_WINDOWS_VERSION;
-    if is_windows && (major, minor) < MIN_WINDOWS_VERSION {
+    if is_windows {
+        let (min_major, min_minor) = MIN_WINDOWS_VERSION;
+        if (major, minor) < MIN_WINDOWS_VERSION {
+            return Err(format!(
+                "OpenSSH {major}.{minor} is too old for Windows. Upgrade to OpenSSH \
+                 {min_major}.{min_minor} or newer, for example from the Win32-OpenSSH releases."
+            ));
+        }
+        return Ok(());
+    }
+    let (min_major, min_minor) = MIN_VERSION;
+    if (major, minor) < MIN_VERSION {
         return Err(format!(
-            "OpenSSH {major}.{minor} is too old for Windows. Upgrade to OpenSSH \
-             {min_major}.{min_minor} or newer, for example from the Win32-OpenSSH releases."
+            "OpenSSH {major}.{minor} is too old. The OpenSSH engine needs OpenSSH \
+             {min_major}.{min_minor} or newer."
         ));
     }
     Ok(())
+}
+
+/// A limit of a supported version worth telling the user about, if any.
+pub fn version_note(major: u32, minor: u32, is_windows: bool) -> Option<String> {
+    let (forced_major, forced_minor) = FORCED_ASKPASS_VERSION;
+    (!is_windows && (major, minor) < FORCED_ASKPASS_VERSION).then(|| {
+        format!(
+            "Password and passphrase prompts may not reach the app when it is started from a \
+             terminal. OpenSSH {forced_major}.{forced_minor} or newer avoids this."
+        )
+    })
 }
 
 /// Runs `<ssh_bin> -V` and reports whether the binary can be used.
@@ -71,6 +100,7 @@ pub fn check_openssh_binary(ssh_bin: &str) -> OpenSshBinaryInfo {
         minor: None,
         supported: false,
         message: String::new(),
+        note: None,
     };
     let Some(path) = resolve(ssh_bin) else {
         info.message = format!("OpenSSH binary {ssh_bin:?} was not found.");
@@ -98,6 +128,7 @@ pub fn check_openssh_binary(ssh_bin: &str) -> OpenSshBinaryInfo {
         Ok(()) => {
             info.supported = true;
             info.message = format!("OpenSSH {major}.{minor} is supported.");
+            info.note = version_note(major, minor, cfg!(windows));
         }
         Err(message) => info.message = message,
     }
@@ -196,8 +227,23 @@ mod tests {
     }
 
     #[test]
-    fn other_platforms_accept_older_versions() {
-        assert!(check_version_for_platform(8, 3, false).is_ok());
+    fn other_platforms_require_7_3() {
+        let error = check_version_for_platform(7, 2, false).unwrap_err();
+        assert!(error.contains("7.3 or newer"), "{error}");
+        assert!(check_version_for_platform(6, 9, false).is_err());
+        for (major, minor) in [(7, 3), (8, 3), (8, 4), (10, 5)] {
+            assert!(check_version_for_platform(major, minor, false).is_ok());
+        }
+    }
+
+    #[test]
+    fn versions_before_forced_askpass_get_a_note_off_windows() {
+        assert!(version_note(8, 3, false).unwrap().contains("8.4 or newer"));
+        assert!(version_note(7, 3, false).is_some());
+        assert_eq!(version_note(8, 4, false), None);
+        assert_eq!(version_note(10, 5, false), None);
+        // Windows already requires 8.4.
+        assert_eq!(version_note(8, 4, true), None);
     }
 
     #[cfg(unix)]

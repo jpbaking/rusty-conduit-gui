@@ -139,11 +139,6 @@ export interface HopEntry {
   hop_id: string;
   name: string;
   host: HostProfile;
-  agent_forward: boolean;
-  /** Vault keys exposed to this hop while `agent_forward` is on. Nothing else is exposed. */
-  agent_forward_keys: KeyId[];
-  /** Optional command run on this hop's agent-forwarding session channel. */
-  agent_forward_command: string | null;
 }
 
 export interface ForwardConfig {
@@ -373,6 +368,8 @@ export interface OpenSshBinaryInfo {
   supported: boolean;
   /** Guidance to show the user. */
   message: string;
+  /** A limit of a supported version, such as when password prompts may not reach the app. */
+  note: string | null;
 }
 
 /** At most one source may be set. */
