@@ -22,6 +22,10 @@ pkcs8 = { workspace = true }
 p256 = { workspace = true }
 elliptic-curve = { workspace = true }
 
+# Maps Argon2's working memory on its own, so it is returned to the OS right after use.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # Dev-dependencies: only needed by the key tests, which encrypt an OpenSSH key
 # via ssh-key's `PrivateKey::encrypt` (requires a `rand_core 0.10` `TryCryptoRng`).
 [dev-dependencies]

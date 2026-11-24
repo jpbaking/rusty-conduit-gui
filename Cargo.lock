@@ -1033,6 +1033,7 @@ dependencies = [
  "elliptic-curve",
  "getrandom 0.4.3",
  "keyring-core",
+ "libc",
  "p256",
  "pkcs8",
  "rand 0.8.8",

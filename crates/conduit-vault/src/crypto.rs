@@ -11,8 +11,7 @@
 
 use std::fmt;
 
-use argon2::password_hash::{PasswordHash, PasswordHasher, SaltString};
-use argon2::{Algorithm, Argon2, Version};
+use argon2::{Algorithm, Argon2, Block, Version};
 use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
 use rand::rngs::OsRng;
@@ -199,34 +198,101 @@ pub fn generate_dek() -> Dek {
 /// Derive a 32-byte master key from `password`, `params`, and `salt` using Argon2id.
 ///
 /// The derived key is wrapped in [`Zeroizing`] so it is zeroized when it goes out of scope.
+/// Argon2's working memory is a [`WorkMemory`], so it is wiped and handed back to the OS as soon
+/// as the key is derived.
 pub fn derive_master_key(
     password: &[u8],
     params: &Argon2Params,
     salt: &[u8],
 ) -> Result<Zeroizing<[u8; 32]>, VaultError> {
     let argon2 = params.to_argon2()?;
-    let salt_b64 = SaltString::encode_b64(salt).map_err(|e| VaultError::Crypto {
-        reason: format!("failed to encode salt: {e}"),
-    })?;
-    let hash: PasswordHash = argon2
-        .hash_password(password, &salt_b64)
+    let mut memory = WorkMemory::new(argon2.params().block_count())?;
+    let mut key = Zeroizing::new([0u8; 32]);
+    argon2
+        .hash_password_into_with_memory(password, salt, &mut key[..], memory.blocks())
         .map_err(|e| VaultError::Crypto {
             reason: format!("Argon2id key derivation failed: {e}"),
         })?;
-    let output = hash
-        .hash
-        .ok_or_else(|| VaultError::Crypto {
-            reason: "Argon2id produced no derived key".into(),
+    Ok(key)
+}
+
+/// Argon2's working memory: 128 MiB at the baseline.
+///
+/// It is mapped on its own and unmapped after use, so the OS gets it back at once. Freed through
+/// the allocator instead, macOS keeps those pages in the process for reuse, which left the app
+/// about 128 MiB larger after every unlock. It holds state derived from the password, so it is
+/// zeroized before it is released.
+struct WorkMemory {
+    #[cfg(unix)]
+    ptr: std::ptr::NonNull<Block>,
+    #[cfg(not(unix))]
+    blocks: Vec<Block>,
+    len: usize,
+}
+
+impl WorkMemory {
+    #[cfg(unix)]
+    fn new(len: usize) -> Result<Self, VaultError> {
+        let bytes = len.checked_mul(std::mem::size_of::<Block>()).ok_or_else(|| VaultError::Crypto {
+            reason: "Argon2 memory size overflows".into(),
         })?;
-    let bytes = output.as_bytes();
-    if bytes.len() != 32 {
-        return Err(VaultError::Crypto {
-            reason: format!("derived key length is {}, expected 32", bytes.len()),
-        });
+        // SAFETY: an anonymous private mapping has no preconditions. The kernel returns it
+        // zero-filled and page-aligned, which is a valid, aligned array of `Block`s.
+        let mapped = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                bytes,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        if mapped == libc::MAP_FAILED {
+            return Err(VaultError::Crypto {
+                reason: format!(
+                    "could not reserve Argon2 memory: {}",
+                    std::io::Error::last_os_error()
+                ),
+            });
+        }
+        let ptr = std::ptr::NonNull::new(mapped.cast::<Block>()).ok_or_else(|| VaultError::Crypto {
+            reason: "could not reserve Argon2 memory".into(),
+        })?;
+        Ok(Self { ptr, len })
     }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(bytes);
-    Ok(Zeroizing::new(out))
+
+    #[cfg(not(unix))]
+    fn new(len: usize) -> Result<Self, VaultError> {
+        Ok(Self { blocks: vec![Block::default(); len], len })
+    }
+
+    fn blocks(&mut self) -> &mut [Block] {
+        #[cfg(unix)]
+        // SAFETY: `ptr` maps `len` blocks that this value owns until `drop`.
+        return unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) };
+        #[cfg(not(unix))]
+        return &mut self.blocks[..self.len];
+    }
+
+    fn as_bytes(&mut self) -> &mut [u8] {
+        let blocks = self.blocks();
+        let bytes = std::mem::size_of_val(blocks);
+        // SAFETY: `Block` is plain `u64` words, so its memory is valid as bytes.
+        unsafe { std::slice::from_raw_parts_mut(blocks.as_mut_ptr().cast::<u8>(), bytes) }
+    }
+}
+
+impl Drop for WorkMemory {
+    fn drop(&mut self) {
+        self.as_bytes().zeroize();
+        #[cfg(unix)]
+        {
+            let bytes = self.len * std::mem::size_of::<Block>();
+            // SAFETY: unmaps exactly the mapping made in `new`, which nothing uses after this.
+            unsafe { libc::munmap(self.ptr.as_ptr().cast(), bytes) };
+        }
+    }
 }
 
 /// Wrap (encrypt) a DEK with a master key derived from `password` + `salt`.
@@ -470,6 +536,21 @@ mod tests {
             decrypt_record(&sample_dek(), b"rec-1", b"key", &ct),
             Err(VaultError::UnlockFailed)
         ));
+    }
+
+    /// Existing vaults were created through the PHC `hash_password` path. The direct derivation
+    /// must produce the same key from the same inputs, or those vaults would no longer unlock.
+    #[test]
+    fn derive_master_key_matches_the_phc_derivation_existing_vaults_used() {
+        use argon2::password_hash::{PasswordHasher, SaltString};
+        for (password, salt) in [(&b"pw"[..], [7u8; SALT_BYTES]), (&b"hunter2 \xf0\x9f\x94\x91"[..], [0xA5; SALT_BYTES])] {
+            let params = Argon2Params::FAST;
+            let salt_b64 = SaltString::encode_b64(&salt).unwrap();
+            let phc = params.to_argon2().unwrap().hash_password(password, &salt_b64).unwrap();
+            let expected = phc.hash.unwrap();
+            let derived = derive_master_key(password, &params, &salt).unwrap();
+            assert_eq!(&derived[..], expected.as_bytes());
+        }
     }
 
     #[test]
