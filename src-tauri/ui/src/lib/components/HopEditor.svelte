@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { tooltip } from "../tooltip";
   import { api, errorMessage } from "../api";
   import { moved } from "../chain";
   import { store } from "../stores.svelte";
@@ -284,7 +285,8 @@
     {#if pin}
       <div class="host-key-row">
         <div class="host-key-info">
-          <code>{pin.record.fingerprint_sha256}</code>
+          <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+          <code class="truncate has-tip" tabindex="0" use:tooltip={pin.record.fingerprint_sha256}>{pin.record.fingerprint_sha256}</code>
           <small class="muted">{pin.record.algorithm} · first seen {new Date(pin.record.first_seen * 1000).toLocaleString()}</small>
         </div>
         {#if !confirmReset}
