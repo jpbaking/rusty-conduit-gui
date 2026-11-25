@@ -350,6 +350,7 @@ mod tests {
                 addr: "127.0.0.1:1080".parse().unwrap(),
             }],
             remote_listeners: Vec::new(),
+            port_forwards: Vec::new(),
         }
     }
 
