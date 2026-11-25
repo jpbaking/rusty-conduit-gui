@@ -283,6 +283,7 @@ button.link-button { min-height: 0; padding: 0; color: var(--accent); background
 .view-header h1 { margin: 0; }
 .view-header h2 { margin: 0; }
 .vault-section { margin-top: 24px; }
+.vault-section.first { margin-top: 12px; }
 .host-list { display: flex; flex-direction: column; gap: 4px; max-width: 760px; margin: 0 0 12px; padding: 0; list-style: none; }
 .host-list li { display: flex; align-items: center; gap: 6px; padding: 6px 8px; background: var(--surface); border: 1px solid var(--border); border-radius: 5px; }
 .host-list li.active { border-color: var(--accent); }

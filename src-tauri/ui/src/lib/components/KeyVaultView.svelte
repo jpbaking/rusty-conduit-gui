@@ -101,11 +101,6 @@
 <main class="content">
   <div class="view-header">
     <h1>Key Vault</h1>
-    <div class="vault-actions">
-      <button disabled={!ready} onclick={() => (adding = "upload")}>Upload File</button>
-      <button disabled={!ready} onclick={() => (adding = "paste")}>Paste Private Key</button>
-      <button class="primary" disabled={!ready} onclick={() => (adding = "generate")}>Generate New Key</button>
-    </div>
   </div>
 
   {#if !ready}
@@ -116,6 +111,16 @@
       </button>
     </p>
   {/if}
+
+  <section class="vault-section first" aria-labelledby={`${uid}-keys-heading`}>
+  <div class="view-header">
+    <h2 id={`${uid}-keys-heading`}>SSH Keys <small class="muted">used to log in to hops and targets</small></h2>
+    <div class="vault-actions">
+      <button disabled={!ready} onclick={() => (adding = "upload")}>Upload File</button>
+      <button disabled={!ready} onclick={() => (adding = "paste")}>Paste Private Key</button>
+      <button class="primary" disabled={!ready} onclick={() => (adding = "generate")}>Generate New Key</button>
+    </div>
+  </div>
 
   {#if store.keys.length === 0}
     <p class="muted">No keys stored.</p>
@@ -159,6 +164,7 @@
       </table>
     </div>
   {/if}
+  </section>
 
   <CaVaultSection />
 </main>
