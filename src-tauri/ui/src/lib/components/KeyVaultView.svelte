@@ -1,8 +1,9 @@
 <script lang="ts">
+  import { tooltip } from "../tooltip";
   import { api, errorMessage } from "../api";
   import { formatDate } from "../format";
   import { store } from "../stores.svelte";
-  import type { KeyView, Usage } from "../types";
+  import type { KeySource, KeyView, Usage } from "../types";
   import AddKeyModal, { type AddKeyMode } from "./AddKeyModal.svelte";
   import CaVaultSection from "./CaVaultSection.svelte";
   import ModalDialog from "./ModalDialog.svelte";
@@ -96,6 +97,18 @@
       busy = false;
     }
   }
+
+  const SOURCES: Record<KeySource, string> = { Uploaded: "uploaded", Pasted: "pasted", Generated: "generated here" };
+
+  /** Everything about a key, for its name's tooltip. */
+  function keyDetails(key: KeyView): string {
+    return [
+      key.name,
+      `Algorithm: ${key.algorithm}`,
+      `SHA-256: ${key.fingerprint_sha256.replace(/^SHA256:/, "")}`,
+      `Added: ${formatDate(key.created_at)} (${SOURCES[key.source]})`,
+    ].join("\n");
+  }
 </script>
 
 <main class="content">
@@ -131,7 +144,6 @@
           <tr>
             <th scope="col">Name</th>
             <th scope="col">Algorithm</th>
-            <th scope="col">SHA-256 fingerprint</th>
             <th scope="col">Created</th>
             <th scope="col">Usage</th>
             <th scope="col"><span class="sr-only">Actions</span></th>
@@ -140,9 +152,11 @@
         <tbody>
           {#each store.keys as key (key.id)}
             <tr>
-              <td><strong>{key.name}</strong></td>
+              <td>
+                <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+                <strong class="has-tip" tabindex="0" use:tooltip={keyDetails(key)}>{key.name}</strong>
+              </td>
               <td>{key.algorithm}</td>
-              <td><code>{key.fingerprint_sha256}</code></td>
               <td>{formatDate(key.created_at)}</td>
               <td>
                 <span class="usage-badge" class:used={key.used_by > 0} title={usageNames(key.usage)}>

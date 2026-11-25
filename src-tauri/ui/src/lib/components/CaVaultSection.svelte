@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { tooltip } from "../tooltip";
   import { api, errorMessage } from "../api";
   import { caExpiry, formatDate, isActive } from "../format";
   import { store } from "../stores.svelte";
@@ -80,6 +81,17 @@
       busy = false;
     }
   }
+
+  /** Everything about a CA, for its name's tooltip. */
+  function caDetails(ca: CaView): string {
+    return [
+      ca.name,
+      `Subject: ${ca.subject}`,
+      `SHA-256: ${ca.fingerprint_sha256.replace(/^SHA256:/, "")}`,
+      `Expires: ${formatDate(ca.not_after)}`,
+      `Added: ${formatDate(ca.created_at)}`,
+    ].join("\n");
+  }
 </script>
 
 <section class="vault-section" aria-labelledby={`${uid}-heading`}>
@@ -98,8 +110,6 @@
         <thead>
           <tr>
             <th scope="col">Name</th>
-            <th scope="col">Subject</th>
-            <th scope="col">SHA-256 fingerprint</th>
             <th scope="col">Expiry</th>
             <th scope="col">Created</th>
             <th scope="col">Usage</th>
@@ -110,9 +120,10 @@
           {#each store.cas as ca (ca.id)}
             {@const expiry = caExpiry(ca.not_after)}
             <tr>
-              <td><strong>{ca.name}</strong></td>
-              <td>{ca.subject}</td>
-              <td><code>{ca.fingerprint_sha256}</code></td>
+              <td>
+                <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+                <strong class="has-tip" tabindex="0" use:tooltip={caDetails(ca)}>{ca.name}</strong>
+              </td>
               <td><span class={`pill ${expiry.tone}`} title={formatDate(ca.not_after)}>{expiry.label}</span></td>
               <td>{formatDate(ca.created_at)}</td>
               <td>
