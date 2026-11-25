@@ -97,13 +97,16 @@
     <form class="preset-form" onsubmit={save} aria-labelledby={`${uid}-form-heading`}>
       <h3 id={`${uid}-form-heading`}>{isNew ? "New preset" : `Edit ${draft.name || "preset"}`}</h3>
       <div class="field-row">
-        <div class="segmented" role="group" aria-label="Direction">
-          <button type="button" aria-pressed={draft.direction === "local"} onclick={() => setDirection("local")}>
-            Local -L
-          </button>
-          <button type="button" aria-pressed={draft.direction === "remote"} onclick={() => setDirection("remote")}>
-            Remote -R
-          </button>
+        <div class="field">
+          <span id={`${uid}-direction`}>Direction</span>
+          <div class="segmented" role="group" aria-labelledby={`${uid}-direction`}>
+            <button type="button" aria-pressed={draft.direction === "local"} onclick={() => setDirection("local")}>
+              Local -L
+            </button>
+            <button type="button" aria-pressed={draft.direction === "remote"} onclick={() => setDirection("remote")}>
+              Remote -R
+            </button>
+          </div>
         </div>
         <div class="field grow">
           <label class="field">

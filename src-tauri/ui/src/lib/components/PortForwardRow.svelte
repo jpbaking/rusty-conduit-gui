@@ -115,13 +115,16 @@
   <fieldset class="card-body">
     <legend class="sr-only">Port forward settings</legend>
     <div class="field-row">
-      <div class="segmented" role="group" aria-label="Direction">
-        <button type="button" aria-pressed={local} onclick={() => setDirection("local")} title="ssh -L: listen here, connect from the target">
-          Local -L
-        </button>
-        <button type="button" aria-pressed={!local} onclick={() => setDirection("remote")} title="ssh -R: listen on the target, connect from here">
-          Remote -R
-        </button>
+      <div class="field">
+        <span id={`${uid}-direction`}>Direction</span>
+        <div class="segmented" role="group" aria-labelledby={`${uid}-direction`}>
+          <button type="button" aria-pressed={local} onclick={() => setDirection("local")} title="ssh -L: listen here, connect from the target">
+            Local -L
+          </button>
+          <button type="button" aria-pressed={!local} onclick={() => setDirection("remote")} title="ssh -R: listen on the target, connect from here">
+            Remote -R
+          </button>
+        </div>
       </div>
       <label class="field grow">
         <span>Name <small class="muted">optional</small></span>
