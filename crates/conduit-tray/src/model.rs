@@ -352,6 +352,7 @@ mod tests {
                 })
                 .collect(),
             remote_listeners: Vec::new(),
+            port_forwards: Vec::new(),
         }
     }
 

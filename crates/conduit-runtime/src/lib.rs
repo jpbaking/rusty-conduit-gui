@@ -11,6 +11,7 @@ pub mod events;
 pub mod hardening;
 pub mod logs;
 pub mod manager;
+mod port_forward;
 mod mitm_ca_file;
 pub(crate) mod runner;
 pub mod state;
@@ -23,5 +24,6 @@ pub use manager::{ManagerConfig, RuntimeError, SessionManager};
 pub use wake::{spawn_wake_listener, WakeCallback, WakeHandle};
 pub use logs::{redact, LogLine, LogRingBuffer, LogWriter, DEFAULT_LOG_CAPACITY};
 pub use state::{
-    HostKeyPrompt, ListenerInfo, SessionSnapshot, SessionState, SessionStatsSnapshot,
+    ForwardStatus, HostKeyPrompt, ListenerInfo, SessionSnapshot, SessionState,
+    SessionStatsSnapshot,
 };

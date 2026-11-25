@@ -378,6 +378,90 @@ impl ReverseConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Port forwards (`ssh -L` / `ssh -R`).
+// ---------------------------------------------------------------------------
+
+/// Which side listens for a [`PortForward`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ForwardDirection {
+    /// `ssh -L`: listens on this machine, connects from the SSH target.
+    Local,
+    /// `ssh -R`: listens on the SSH target, connects from this machine.
+    Remote,
+}
+
+/// One fixed TCP port forward, like `ssh -L` or `ssh -R`.
+///
+/// Both engines run it the same way. A local forward listens here and opens each connection
+/// through the tunnel, and a remote forward asks the target to listen and relays each
+/// connection to the destination from this machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortForward {
+    /// Stable id, so the runtime can report each forward's state.
+    #[serde(default)]
+    pub id: Uuid,
+    /// Off keeps the forward saved without running it.
+    #[serde(default = "enabled_by_default")]
+    pub enabled: bool,
+    pub direction: ForwardDirection,
+    /// Free-text label shown in the UI.
+    #[serde(default)]
+    pub name: String,
+    /// Listen address: on this machine for `Local`, on the target for `Remote`.
+    #[serde(default = "default_bind")]
+    pub bind: IpAddr,
+    /// Listen port, `1..=65535`.
+    pub port: u16,
+    /// Host connected to: resolved by the target for `Local`, by this machine for `Remote`.
+    pub dest_host: String,
+    pub dest_port: u16,
+}
+
+impl Default for PortForward {
+    fn default() -> Self {
+        Self {
+            id: Uuid::nil(),
+            enabled: true,
+            direction: ForwardDirection::Local,
+            name: String::new(),
+            bind: default_bind(),
+            port: 0,
+            dest_host: String::new(),
+            dest_port: 0,
+        }
+    }
+}
+
+impl PortForward {
+    /// The destination as `host:port`, with an IPv6 literal in brackets.
+    pub fn destination(&self) -> String {
+        let host = self.dest_host_unbracketed();
+        if host.contains(':') {
+            format!("[{host}]:{}", self.dest_port)
+        } else {
+            format!("{host}:{}", self.dest_port)
+        }
+    }
+
+    /// The destination host without IPv6 brackets.
+    pub fn dest_host_unbracketed(&self) -> &str {
+        let host = self.dest_host.trim();
+        host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host)
+    }
+
+    /// The listen address.
+    pub fn listen(&self) -> std::net::SocketAddr {
+        std::net::SocketAddr::new(self.bind, self.port)
+    }
+
+    /// The equivalent `ssh` argument value, such as `127.0.0.1:8080:db.internal:5432`.
+    pub fn spec(&self) -> String {
+        format!("{}:{}", self.listen(), self.destination())
+    }
+}
+
 /// On-disk shapes. Profiles saved before the on/off switch have no `enabled`, so it is inferred
 /// from the ports: a proxy with any non-zero port was running.
 mod wire {
@@ -656,6 +740,9 @@ pub struct SessionProfile {
     pub hops: Vec<HopEntry>,
     pub forward: ForwardConfig,
     pub reverse: ReverseConfig,
+    /// Fixed `-L` / `-R` port forwards, run by either engine.
+    #[serde(default)]
+    pub port_forwards: Vec<PortForward>,
     #[serde(default)]
     pub mitm: Option<MitmConfig>,
     #[serde(default)]
@@ -681,11 +768,27 @@ impl Default for SessionProfile {
             hops: Vec::new(),
             forward: ForwardConfig::default(),
             reverse: ReverseConfig::default(),
+            port_forwards: Vec::new(),
             mitm: None,
             tunnel: TunnelConfig::default(),
             logging: LoggingConfig::default(),
             openssh: OpenSshOptions::default(),
         }
+    }
+}
+
+impl SessionProfile {
+    /// The port forwards that are switched on.
+    pub fn active_forwards(&self) -> impl Iterator<Item = &PortForward> {
+        self.port_forwards.iter().filter(|f| f.enabled)
+    }
+
+    /// The switched-on forwards in one direction.
+    pub fn active_forwards_in(
+        &self,
+        direction: ForwardDirection,
+    ) -> impl Iterator<Item = &PortForward> {
+        self.active_forwards().filter(move |f| f.direction == direction)
     }
 }
 

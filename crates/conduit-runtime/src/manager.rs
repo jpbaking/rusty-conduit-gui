@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 use crate::events::{EventBus, RuntimeEvent, DEFAULT_EVENT_CAPACITY};
 use crate::logs::{LogRingBuffer, DEFAULT_LOG_CAPACITY};
+use crate::port_forward::SharedForwards;
 use crate::runner::{
     run_session, Control, DefaultEngine, Engine, SessionContext, SharedListeners, SharedVault,
 };
@@ -72,6 +73,7 @@ struct Slot {
     stats: Arc<AtomicStats>,
     listeners: SharedListeners,
     remote_listeners: SharedListeners,
+    forwards: SharedForwards,
     cell: Arc<StateCell>,
     control: Mutex<Option<mpsc::UnboundedSender<Control>>>,
     /// Serializes start and stop, so a session never has two supervisors.
@@ -95,6 +97,7 @@ impl Slot {
             stats: SessionStatsSnapshot::from_stats(self.stats.snapshot(), self.cell.uptime_secs()),
             listeners: lock(&self.listeners).clone(),
             remote_listeners: lock(&self.remote_listeners).clone(),
+            port_forwards: lock(&self.forwards).clone(),
         }
     }
 }
@@ -162,6 +165,7 @@ impl SessionManager {
                     stats: Arc::new(AtomicStats::default()),
                     listeners: Arc::default(),
                     remote_listeners: Arc::default(),
+                    forwards: Arc::default(),
                     cell: Arc::new(StateCell::new(id, self.inner.events.clone())),
                     control: Mutex::new(None),
                     lifecycle: tokio::sync::Mutex::new(None),
@@ -223,6 +227,7 @@ impl SessionManager {
             stats: Arc::clone(&slot.stats),
             listeners: Arc::clone(&slot.listeners),
             remote_listeners: Arc::clone(&slot.remote_listeners),
+            forwards: Arc::clone(&slot.forwards),
         };
         let cancel = CancellationToken::new();
         let session = tokio::spawn(run_session(

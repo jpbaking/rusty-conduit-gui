@@ -29,5 +29,5 @@ pub use dialer::RusshDialer;
 pub use error::SshError;
 pub use handler::{ChannelPolicy, DisconnectEvent, ForwardAllowlist, HopHandler, InboundForward};
 pub use host_key::{HopIdentity, HostKeyDecision, HostKeyVerifier, ObservedHostKey};
-pub use reverse::{reverse_policy, ReverseError, ReverseInbound, ReverseRelay};
+pub use reverse::{reverse_policy, RemoteForward, ReverseError, ReverseInbound, ReverseRelay};
 pub use stats::{AtomicStats, StatsDialer, StatsSnapshot};

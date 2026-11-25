@@ -1,6 +1,13 @@
 // Client-side checks that mirror the backend's rules, so problems show next to the field.
 
-import type { HostProfile, LoggingConfig, MitmConfig, SessionProfile, TunnelConfig } from "./types";
+import type {
+  HostProfile,
+  LoggingConfig,
+  MitmConfig,
+  PortForward,
+  SessionProfile,
+  TunnelConfig,
+} from "./types";
 
 /** Field path, such as `forward.bind` or `hop:<id>:host`, mapped to its message. */
 export type FieldErrors = Record<string, string>;
@@ -301,6 +308,55 @@ function opensshErrors(errors: FieldErrors, profile: SessionProfile): void {
   });
 }
 
+const MAX_HOST_LEN = 253;
+
+/** Mirrors `forward_host_problem`: an IP address (IPv6 may be in brackets) or a host name. */
+export function forwardHostError(raw: string): string | null {
+  const host = raw.trim();
+  if (!host) return "Enter a host name or IP address.";
+  if (isIpAddress(stripBrackets(host))) return null;
+  const valid =
+    host.length <= MAX_HOST_LEN &&
+    host
+      .split(".")
+      .every((label) => label.length > 0 && label.length <= 63 && /^[A-Za-z0-9_][A-Za-z0-9_-]*$/.test(label));
+  return valid ? null : "Use a host name or an IP address, with no port or spaces.";
+}
+
+const bindsOverlap = (a: string, b: string): boolean =>
+  a === b || a === "0.0.0.0" || a === "::" || b === "0.0.0.0" || b === "::";
+
+/** Field errors for each forward, keyed `forwards:<id>:<field>`. Mirrors `port_forward_problem`. */
+function portForwardErrors(errors: FieldErrors, profile: SessionProfile): void {
+  const { forward, reverse } = profile;
+  profile.port_forwards.forEach((f: PortForward, index) => {
+    const key = (field: string) => `forwards:${f.id}:${field}`;
+    if (!isIpAddress(f.bind)) errors[key("bind")] = "Use an IP address, such as 127.0.0.1.";
+    if (!isPort(f.port)) errors[key("port")] = "Use a port from 1 to 65535.";
+    if (!isPort(f.dest_port)) errors[key("dest_port")] = "Use a port from 1 to 65535.";
+    const hostError = forwardHostError(f.dest_host);
+    if (hostError) errors[key("dest_host")] = hostError;
+    if (!f.enabled || errors[key("port")] || errors[key("bind")]) return;
+
+    const [proxyBind, ports, side] =
+      f.direction === "local"
+        ? [forward.bind, forward.enabled ? [forward.http_port, forward.socks_port] : [], "forward"]
+        : [
+            reverse.reverse_bind,
+            reverse.enabled ? [reverse.reverse_http_port, reverse.reverse_socks_port] : [],
+            "reverse",
+          ];
+    if (bindsOverlap(f.bind, proxyBind) && ports.includes(f.port)) {
+      errors[key("port")] = `Port ${f.port} is already used by the ${side} proxy.`;
+      return;
+    }
+    const earlier = profile.port_forwards
+      .slice(0, index)
+      .some((o) => o.enabled && o.direction === f.direction && o.port === f.port && bindsOverlap(o.bind, f.bind));
+    if (earlier) errors[key("port")] = `Another forward already listens on port ${f.port}.`;
+  });
+}
+
 export function sessionErrors(profile: SessionProfile): FieldErrors {
   const errors: FieldErrors = {};
   if (!profile.name.trim()) errors.name = "Enter a session name.";
@@ -335,9 +391,10 @@ export function sessionErrors(profile: SessionProfile): FieldErrors {
   if (reverse.enabled && reverse.reverse_http_port === 0 && reverse.reverse_socks_port === 0) {
     errors["reverse.ports"] = "Set an HTTP or SOCKS port, or switch the reverse proxy off.";
   }
-  if (!forward.enabled && !reverse.enabled) {
-    errors.listeners = "Turn on the forward or reverse proxy.";
+  if (!forward.enabled && !reverse.enabled && !profile.port_forwards.some((f) => f.enabled)) {
+    errors.listeners = "Turn on the forward or reverse proxy, or a port forward.";
   }
+  portForwardErrors(errors, profile);
 
   filterErrors(errors, "forward", forward.allow, forward.block);
   filterErrors(errors, "reverse", reverse.reverse_allow, reverse.reverse_block);

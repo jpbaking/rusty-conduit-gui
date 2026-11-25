@@ -3,6 +3,7 @@
 use std::net::SocketAddr;
 use std::sync::{Mutex, PoisonError};
 
+use conduit_core::ForwardDirection;
 use conduit_ssh::StatsSnapshot;
 use serde::Serialize;
 use tokio::time::Instant;
@@ -77,6 +78,20 @@ pub struct ListenerInfo {
     pub addr: SocketAddr,
 }
 
+/// The live state of one port forward. A forward that is not listed is not running.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ForwardStatus {
+    /// The [`conduit_core::PortForward`] id.
+    pub id: Uuid,
+    pub direction: ForwardDirection,
+    /// Where it listens: on this computer for `local`, on the target host for `remote`.
+    pub listen: SocketAddr,
+    /// `host:port` it connects to.
+    pub destination: String,
+    /// Why it is not listening, or `None` while it is.
+    pub error: Option<String>,
+}
+
 /// Live traffic counters for one session.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct SessionStatsSnapshot {
@@ -113,6 +128,8 @@ pub struct SessionSnapshot {
     pub listeners: Vec<ListenerInfo>,
     /// Reverse proxy (`-R`) listeners bound on the target host, while connected.
     pub remote_listeners: Vec<ListenerInfo>,
+    /// Port forwards: local ones once bound, remote ones while connected.
+    pub port_forwards: Vec<ForwardStatus>,
 }
 
 #[derive(Debug)]

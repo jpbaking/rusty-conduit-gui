@@ -183,6 +183,15 @@ impl AppController {
                 hop.hop_id = Uuid::new_v4().to_string();
             }
         }
+        // A forward's id keys its live status, so a missing or repeated one gets a new id.
+        let mut forward_ids = HashSet::new();
+        for forward in &mut profile.port_forwards {
+            if forward.id.is_nil() || !forward_ids.insert(forward.id) {
+                forward.id = Uuid::new_v4();
+                forward_ids.insert(forward.id);
+            }
+            forward.dest_host = forward.dest_host.trim().to_string();
+        }
         // `hop_id` keys known_hosts, so two hops sharing one would share a host-key pin.
         let mut seen = HashSet::new();
         if let Some(hop) = profile.hops.iter().find(|h| !seen.insert(h.hop_id.as_str())) {

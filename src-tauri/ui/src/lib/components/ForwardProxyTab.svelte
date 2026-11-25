@@ -13,6 +13,7 @@
   const uid = $props.id();
   const forward = $derived((store.draft as SessionProfile).forward);
   const reverseOn = $derived((store.draft as SessionProfile).reverse.enabled);
+  const portForwardOn = $derived((store.draft as SessionProfile).port_forwards.some((f) => f.enabled));
   const errors = $derived(store.draftErrors);
   const forwardOn = $derived(forward.enabled && (forward.http_port !== 0 || forward.socks_port !== 0));
   const exposed = $derived(forwardOn && isIpAddress(forward.bind) && !isLoopback(forward.bind));
@@ -72,7 +73,7 @@
     <ProxySwitch
       name="Forward proxy"
       on={forward.enabled}
-      lockedReason={reverseOn ? undefined : "To turn this off, turn on the reverse proxy first"}
+      lockedReason={reverseOn || portForwardOn ? undefined : "To turn this off, turn on the reverse proxy or a port forward first"}
       onToggle={setEnabled}
     />
   </div>

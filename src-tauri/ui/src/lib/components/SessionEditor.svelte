@@ -15,12 +15,14 @@
   import EngineCheck from "./EngineCheck.svelte";
   import OpensshFallbackDialog from "./OpensshFallbackDialog.svelte";
   import MitmTab from "./MitmTab.svelte";
+  import PortForwardsTab from "./PortForwardsTab.svelte";
   import ProxyTab from "./ProxyTab.svelte";
 
   // Short labels keep the tab row on one line; the full name is the tooltip.
   const TABS = [
     { label: "Connection", title: "Connection & jump chain" },
     { label: "Proxy", title: "Forward & reverse (-R) proxy" },
+    { label: "Ports", title: "Port forwards (-L / -R)" },
     { label: "Filters", title: "Destination filters" },
     { label: "MITM", title: "HTTPS MITM" },
     { label: "Keepalive", title: "Keepalive & reconnect" },
@@ -28,19 +30,21 @@
   ] as const;
   const CONNECTION_TAB = 0;
   const PROXY_TAB = 1;
-  const FILTERS_TAB = 2;
-  const MITM_TAB = 3;
-  const KEEPALIVE_TAB = 4;
-  const LOGGING_TAB = 5;
+  const PORTS_TAB = 2;
+  const FILTERS_TAB = 3;
+  const MITM_TAB = 4;
+  const KEEPALIVE_TAB = 5;
+  const LOGGING_TAB = 6;
 
   /** The tabs that show a field's error. */
   function tabsForField(field: string): number[] {
     if (field === "hops" || field.startsWith("hop:") || field === "tunnel.ip_version") {
       return [CONNECTION_TAB];
     }
-    if (field.startsWith("forward.") || field.startsWith("reverse.") || field === "listeners") {
-      return [PROXY_TAB];
-    }
+    // Both tabs show the "at least one listener" error.
+    if (field === "listeners") return [PROXY_TAB, PORTS_TAB];
+    if (field.startsWith("forward.") || field.startsWith("reverse.")) return [PROXY_TAB];
+    if (field.startsWith("forwards:")) return [PORTS_TAB];
     if (field.startsWith("filters.")) return [FILTERS_TAB];
     if (field.startsWith("mitm.")) return [MITM_TAB];
     if (field.startsWith("tunnel.")) return [KEEPALIVE_TAB];
@@ -226,6 +230,10 @@
 
   <!-- Keyed so per-session editor state, such as a typed rule, never carries across sessions. -->
   {#key store.selectedId}
+    <div class="tab-panel" role="tabpanel" id={panelId(PORTS_TAB)} aria-labelledby={tabId(PORTS_TAB)} hidden={activeTab !== PORTS_TAB}>
+      <PortForwardsTab />
+    </div>
+
     <div class="tab-panel" role="tabpanel" id={panelId(FILTERS_TAB)} aria-labelledby={tabId(FILTERS_TAB)} hidden={activeTab !== FILTERS_TAB}>
       <FiltersTab />
     </div>

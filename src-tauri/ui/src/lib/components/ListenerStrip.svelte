@@ -10,6 +10,10 @@
   );
   const local = $derived(urlsOf(runtime?.listeners));
   const remote = $derived(urlsOf(runtime?.remote_listeners));
+  const forwards = $derived(runtime?.port_forwards ?? []);
+  const names = $derived(
+    new Map((store.selected?.profile.port_forwards ?? []).map((f) => [f.id, f.name.trim()])),
+  );
   const target = $derived.by(() => {
     const hops = store.selected?.profile.hops ?? [];
     const last = hops[hops.length - 1];
@@ -58,10 +62,39 @@
   </section>
 {/snippet}
 
-{#if local.length > 0 || remote.length > 0}
+{#snippet forwardCard()}
+  <section class="listener-card forward-listeners" class:has-error={forwards.some((f) => f.error)} aria-label="Port forwards">
+    <header>
+      <span class="ok" aria-hidden="true">●</span>
+      <strong>Port forwards</strong>
+    </header>
+    <ul>
+      {#each forwards as forward (forward.id)}
+        <li title={forward.error ?? undefined}>
+          <span class="listener-label">{forward.direction === "local" ? "-L" : "-R"}</span>
+          {#if forward.error}<span class="alert" aria-label="Failed">⚠</span>{/if}
+          <code>{forward.listen}</code>
+          <span class="muted" aria-hidden="true">→</span>
+          <code>{forward.destination}</code>
+          {#if names.get(forward.id)}<small class="muted">{names.get(forward.id)}</small>{/if}
+          {#if forward.error}
+            <span class="sr-only">failed: {forward.error}</span>
+          {:else if forward.direction === "local"}
+            <button class="icon" title="Copy {forward.listen}" aria-label="Copy forward address {forward.listen}" onclick={() => copy(forward.listen)}>
+              {copied === forward.listen ? "✓" : "⧉"}
+            </button>
+          {/if}
+        </li>
+      {/each}
+    </ul>
+  </section>
+{/snippet}
+
+{#if local.length > 0 || remote.length > 0 || forwards.length > 0}
   <div class="listener-cards">
     {#if local.length > 0}{@render card("Local", "on this computer", local)}{/if}
     {#if remote.length > 0}{@render card("Remote", `on ${target}`, remote)}{/if}
+    {#if forwards.length > 0}{@render forwardCard()}{/if}
   </div>
   <p class="sr-only" role="status">{copied ? "Copied." : ""}</p>
 {/if}

@@ -14,6 +14,7 @@
   const reverse = $derived((store.draft as SessionProfile).reverse);
   const forwardCap = $derived((store.draft as SessionProfile).forward.max_connections);
   const forwardEnabled = $derived((store.draft as SessionProfile).forward.enabled);
+  const portForwardOn = $derived((store.draft as SessionProfile).port_forwards.some((f) => f.enabled));
   const capError = $derived(store.draftErrors["reverse.max_connections"]);
   const errors = $derived(store.draftErrors);
   const reverseOn = $derived(
@@ -53,7 +54,7 @@
     <ProxySwitch
       name="Reverse proxy"
       on={reverse.enabled}
-      lockedReason={forwardEnabled ? undefined : "To turn this off, turn on the forward proxy first"}
+      lockedReason={forwardEnabled || portForwardOn ? undefined : "To turn this off, turn on the forward proxy or a port forward first"}
       onToggle={setEnabled}
     />
   </div>

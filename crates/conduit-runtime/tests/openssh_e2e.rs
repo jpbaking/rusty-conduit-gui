@@ -20,7 +20,7 @@ use common::{
     spawn_node, spawn_origin, Node, PASSWORD, REMOTE_ONLY_HOST,
 };
 use conduit_core::{
-    AuthMethod, ForwardConfig, HopEntry, HostKeyLookup, HostKeyRecord, HostProfile, KeyId,
+    AuthMethod, ForwardConfig, ForwardDirection, HopEntry, PortForward, HostKeyLookup, HostKeyRecord, HostProfile, KeyId,
     KnownHostsStore, LoggingConfig, OpenSshOptions, SecretRef, SessionProfile, SshEngine,
     Timestamp, TunnelConfig,
 };
@@ -29,7 +29,7 @@ use conduit_runtime::{ManagerConfig, SessionManager, SessionState};
 use conduit_vault::{generate_key, Argon2Params, KeyGenAlgorithm, Vault};
 use russh::keys::ssh_key::LineEnding;
 use russh::keys::{HashAlg, PrivateKey, PublicKey};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use uuid::Uuid;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(90);
@@ -558,5 +558,64 @@ fn reconnect_keeps_the_forward_listeners_bound() {
         assert!(!pid_exists(&first[0]), "the old ssh must be gone");
         assert_http_roundtrip(http_port, &payload(PAYLOAD_LEN)).await;
         f.manager.stop(id).await.unwrap();
+    });
+}
+
+#[test]
+fn port_forwards_carry_traffic_both_ways() {
+    e2e(async {
+        let f = Fixture::new();
+        let node = spawn_node(None).await;
+        f.pin(0, &node, &node.host_key);
+        let echo = spawn_echo().await;
+        let local_port = free_port().await;
+        let remote_port = free_port().await;
+        let (mut session, _, _) =
+            profile("forwards", vec![hop(0, &node, vec![f.password(PASSWORD)])]).await;
+        session.forward.enabled = false;
+        let local = PortForward {
+            id: Uuid::new_v4(),
+            direction: ForwardDirection::Local,
+            port: local_port,
+            // Only the target resolves this name, so the connection went through `ssh`.
+            dest_host: REMOTE_ONLY_HOST.into(),
+            dest_port: echo,
+            ..Default::default()
+        };
+        let remote = PortForward {
+            id: Uuid::new_v4(),
+            direction: ForwardDirection::Remote,
+            port: remote_port,
+            dest_host: "127.0.0.1".into(),
+            dest_port: echo,
+            ..Default::default()
+        };
+        session.port_forwards = vec![local.clone(), remote.clone()];
+        let id = f.add(session);
+
+        f.manager.start(id).await.unwrap();
+        f.until_connected(id).await;
+
+        let body = payload(PAYLOAD_LEN);
+        let through_local = TcpStream::connect(loopback(local_port)).await.unwrap();
+        assert!(echo_roundtrip(through_local, &body).await == body, "-L payload corrupted");
+        assert!(node.hosts().iter().any(|h| h == REMOTE_ONLY_HOST));
+        // `ssh -R` is set up after the SOCKS port answers, so give it a moment.
+        let deadline = tokio::time::Instant::now() + STATE_TIMEOUT;
+        let through_remote = loop {
+            if let Ok(stream) = TcpStream::connect(loopback(remote_port)).await {
+                break stream;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "logs:\n{}", f.log_text(id));
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(echo_roundtrip(through_remote, &body).await == body, "-R payload corrupted");
+
+        let statuses = f.manager.snapshot(id).unwrap().port_forwards;
+        assert_eq!(statuses.len(), 2, "{statuses:?}");
+        assert!(statuses.iter().all(|s| s.error.is_none()), "{statuses:?}");
+
+        f.manager.stop(id).await.unwrap();
+        assert!(f.manager.snapshot(id).unwrap().port_forwards.is_empty());
     });
 }

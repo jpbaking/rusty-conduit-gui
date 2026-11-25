@@ -15,6 +15,26 @@ use tokio::task::{JoinHandle, JoinSet};
 use crate::chain::SshChain;
 use crate::handler::{ChannelPolicy, ForwardAllowlist, InboundForward};
 
+/// One `tcpip-forward` to request on the final hop, and where its connections go.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteForward {
+    /// Address and port to listen on, on the final hop.
+    pub remote: SocketAddr,
+    /// Destination host, resolved by this machine. A name or an IP literal.
+    pub host: String,
+    pub port: u16,
+}
+
+impl From<&ReverseForward> for RemoteForward {
+    fn from(forward: &ReverseForward) -> Self {
+        Self {
+            remote: forward.remote,
+            host: forward.local.ip().to_string(),
+            port: forward.local.port(),
+        }
+    }
+}
+
 /// A reverse forward could not be established.
 #[derive(Debug, Error)]
 pub enum ReverseError {
@@ -64,7 +84,7 @@ impl ReverseRelay {
     /// All-or-nothing: on failure, forwards already granted are cancelled.
     pub async fn start(
         chain: &SshChain,
-        forwards: &[ReverseForward],
+        forwards: &[RemoteForward],
         inbound: ReverseInbound,
     ) -> Result<Self, ReverseError> {
         let ReverseInbound {
@@ -96,7 +116,7 @@ impl ReverseRelay {
                 Ok(assigned) => {
                     let port = if requested == 0 { assigned } else { requested };
                     allowlist.allow(address.clone(), port);
-                    routes.insert((address.clone(), port), forward.local);
+                    routes.insert((address.clone(), port), (forward.host.clone(), forward.port));
                     bound.push((address, port));
                 }
                 Err(source) => {
@@ -152,7 +172,7 @@ async fn cancel_all(chain: &SshChain, allowlist: &ForwardAllowlist, bound: &[(St
 /// Aborting this task drops the `JoinSet`, which aborts every per-connection relay.
 async fn relay_inbound(
     mut receiver: mpsc::Receiver<InboundForward>,
-    routes: HashMap<(String, u32), SocketAddr>,
+    routes: HashMap<(String, u32), (String, u16)>,
 ) {
     let mut relays = JoinSet::new();
     loop {
@@ -161,8 +181,8 @@ async fn relay_inbound(
                 let Some(inbound) = inbound else { break };
                 let route = (inbound.connected_address.clone(), inbound.connected_port);
                 // An unrouted channel is dropped, which closes it.
-                if let Some(&local) = routes.get(&route) {
-                    relays.spawn(relay_one(inbound.channel, local));
+                if let Some((host, port)) = routes.get(&route) {
+                    relays.spawn(relay_one(inbound.channel, host.clone(), *port));
                 }
             }
             Some(_) = relays.join_next(), if !relays.is_empty() => {}
@@ -171,8 +191,8 @@ async fn relay_inbound(
     while relays.join_next().await.is_some() {}
 }
 
-async fn relay_one(channel: Channel<Msg>, local: SocketAddr) {
-    let Ok(mut upstream) = TcpStream::connect(local).await else {
+async fn relay_one(channel: Channel<Msg>, host: String, port: u16) {
+    let Ok(mut upstream) = TcpStream::connect((host.as_str(), port)).await else {
         return;
     };
     let _ = upstream.set_nodelay(true);

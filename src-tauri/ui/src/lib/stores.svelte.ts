@@ -71,6 +71,7 @@ function blankProfile(): SessionProfile {
       reverse_allow: [],
       reverse_block: [],
     },
+    port_forwards: [],
     mitm: null,
     tunnel: {
       ip_version: "4",

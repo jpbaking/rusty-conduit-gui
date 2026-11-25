@@ -42,6 +42,7 @@ function profile(hops: HopEntry[], ca: string | null): SessionProfile {
       reverse_allow: [],
       reverse_block: [],
     },
+    port_forwards: [],
     mitm:
       ca === null
         ? null

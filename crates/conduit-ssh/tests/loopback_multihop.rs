@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use common::*;
 use conduit_ssh::{
-    connect_chain, reverse_policy, AtomicStats, HopAuth, HopSpec, KeyboardAnswer, ReverseRelay,
+    connect_chain, reverse_policy, AtomicStats, HopAuth, HopSpec, KeyboardAnswer, RemoteForward, ReverseRelay,
     RusshDialer, SshChain, SshError, StatsDialer,
 };
 use russh::keys::PrivateKey;
@@ -206,7 +206,8 @@ async fn assert_reverse_roundtrip(hops: &mut [HopSpec], verifier: &conduit_ssh::
     let (policy, inbound) = reverse_policy(16);
     hops.last_mut().unwrap().policy = policy;
     let chain = connect_chain(hops, verifier, &options(), None).await.unwrap();
-    let relay = ReverseRelay::start(&chain, proxy.forwards(), inbound)
+    let remote: Vec<RemoteForward> = proxy.forwards().iter().map(RemoteForward::from).collect();
+    let relay = ReverseRelay::start(&chain, &remote, inbound)
         .await
         .unwrap();
     assert_eq!(relay.bound(), [("127.0.0.1".to_string(), u32::from(remote_port))]);

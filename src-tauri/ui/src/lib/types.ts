@@ -191,6 +191,23 @@ export interface ReverseConfig {
   reverse_block: string[];
 }
 
+/** `local` is `ssh -L` (listens here), `remote` is `ssh -R` (listens on the target). */
+export type ForwardDirection = "local" | "remote";
+
+export interface PortForward {
+  id: Uuid;
+  /** Off keeps the forward saved without running it. */
+  enabled: boolean;
+  direction: ForwardDirection;
+  name: string;
+  /** Listen address: on this computer for `local`, on the target for `remote`. */
+  bind: string;
+  port: number;
+  /** Resolved by the target for `local`, by this computer for `remote`. */
+  dest_host: string;
+  dest_port: number;
+}
+
 export interface MitmConfig {
   /** A CA in the vault. `null` until one is chosen; the session cannot start without it. */
   ca: MitmCaId | null;
@@ -244,6 +261,7 @@ export interface SessionProfile {
   hops: HopEntry[];
   forward: ForwardConfig;
   reverse: ReverseConfig;
+  port_forwards: PortForward[];
   mitm: MitmConfig | null;
   tunnel: TunnelConfig;
   logging: LoggingConfig;
@@ -298,6 +316,18 @@ export interface SessionSnapshot {
   listeners: ListenerInfo[];
   /** Reverse proxy (-R) listeners bound on the target host, while connected. */
   remote_listeners: ListenerInfo[];
+  /** Port forwards: local ones once bound, remote ones while connected. */
+  port_forwards: ForwardStatus[];
+}
+
+/** A port forward that is running, or failed to start. One that is not listed is not running. */
+export interface ForwardStatus {
+  id: Uuid;
+  direction: ForwardDirection;
+  listen: string;
+  destination: string;
+  /** Why it is not listening, or `null` while it is. */
+  error: string | null;
 }
 
 export interface SessionView {

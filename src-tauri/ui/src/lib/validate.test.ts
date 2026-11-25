@@ -53,6 +53,7 @@ function validProfile(): SessionProfile {
       reverse_allow: [],
       reverse_block: [],
     },
+    port_forwards: [],
     mitm: null,
     tunnel: {
       ip_version: "auto",
@@ -318,8 +319,58 @@ describe("sessionErrors", () => {
     const profile = validProfile();
     profile.forward.enabled = false;
     const errors = sessionErrors(profile);
-    assert.equal(errors.listeners, "Turn on the forward or reverse proxy.");
+    assert.equal(errors.listeners, "Turn on the forward or reverse proxy, or a port forward.");
     assert.equal(errors["forward.ports"], undefined);
+  });
+
+  test("a port forward alone is enough, and its fields are checked", () => {
+    const profile = validProfile();
+    profile.forward.enabled = false;
+    const forward = {
+      id: "f1",
+      enabled: true,
+      direction: "local" as const,
+      name: "",
+      bind: "127.0.0.1",
+      port: 15432,
+      dest_host: "db.internal",
+      dest_port: 5432,
+    };
+    profile.port_forwards = [forward];
+    assert.deepEqual(sessionErrors(profile), {});
+
+    profile.port_forwards = [{ ...forward, port: 0, dest_host: "db:5432", dest_port: Number.NaN, bind: "x" }];
+    const errors = sessionErrors(profile);
+    assert.equal(errors["forwards:f1:port"], "Use a port from 1 to 65535.");
+    assert.equal(errors["forwards:f1:dest_port"], "Use a port from 1 to 65535.");
+    assert.equal(errors["forwards:f1:bind"], "Use an IP address, such as 127.0.0.1.");
+    assert.ok(errors["forwards:f1:dest_host"]);
+    assert.equal(errors.listeners, undefined);
+  });
+
+  test("port forwards must not collide with a proxy or each other", () => {
+    const profile = validProfile();
+    const base = {
+      enabled: true,
+      direction: "local" as const,
+      name: "",
+      bind: "0.0.0.0",
+      dest_host: "db",
+      dest_port: 1,
+    };
+    profile.port_forwards = [
+      { ...base, id: "a", port: profile.forward.http_port },
+      { ...base, id: "b", port: 9000 },
+      { ...base, id: "c", port: 9000, bind: "127.0.0.1" },
+      { ...base, id: "d", port: 9000, direction: "remote" },
+      { ...base, id: "e", port: 9000, enabled: false },
+    ];
+    const errors = sessionErrors(profile);
+    assert.equal(errors["forwards:a:port"], `Port ${profile.forward.http_port} is already used by the forward proxy.`);
+    assert.equal(errors["forwards:b:port"], undefined);
+    assert.equal(errors["forwards:c:port"], "Another forward already listens on port 9000.");
+    assert.equal(errors["forwards:d:port"], undefined);
+    assert.equal(errors["forwards:e:port"], undefined);
   });
 
   test("rejects an allowlist and blocklist together", () => {

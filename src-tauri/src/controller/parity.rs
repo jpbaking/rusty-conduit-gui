@@ -5,6 +5,7 @@ use std::io::ErrorKind;
 use std::net::{IpAddr, TcpListener};
 use std::str::FromStr;
 
+use conduit_core::ForwardDirection;
 use conduit_openssh::OpenSshBinaryInfo;
 use rusty_conduit_ssh::filter::{FilterRule, HostFilter};
 use serde::{Deserialize, Serialize};
@@ -136,9 +137,18 @@ impl AppController {
         socks_port: u16,
     ) -> PortConflictReport {
         let config = self.config_snapshot();
-        let own_listeners = session_id
+        // What this session holds now: its proxy listeners and its bound local forwards.
+        let own_listeners: Vec<std::net::SocketAddr> = session_id
             .and_then(|id| self.manager().snapshot(id).ok())
-            .map(|snapshot| snapshot.listeners)
+            .map(|snapshot| {
+                let proxies = snapshot.listeners.into_iter().map(|l| l.addr);
+                let forwards = snapshot
+                    .port_forwards
+                    .into_iter()
+                    .filter(|f| f.direction == ForwardDirection::Local && f.error.is_none())
+                    .map(|f| f.listen);
+                proxies.chain(forwards).collect()
+            })
             .unwrap_or_default();
         let ports: BTreeSet<u16> = [http_port, socks_port].into_iter().filter(|p| *p != 0).collect();
 
@@ -162,9 +172,26 @@ impl AppController {
                     });
                 }
             }
+            for other in config.sessions.iter().filter(|s| Some(s.id) != session_id) {
+                let forwards = other
+                    .active_forwards_in(ForwardDirection::Local)
+                    .filter(|f| f.port == port && binds_overlap(bind, f.bind));
+                for forward in forwards {
+                    conflicts.push(PortConflict {
+                        port,
+                        kind: CONFLICT_SESSION,
+                        detail: format!(
+                            "session \"{}\" forwards {} to {}",
+                            other.name,
+                            forward.listen(),
+                            forward.destination()
+                        ),
+                    });
+                }
+            }
             let owned = own_listeners
                 .iter()
-                .any(|l| l.addr.port() == port && binds_overlap(bind, l.addr.ip()));
+                .any(|addr| addr.port() == port && binds_overlap(bind, addr.ip()));
             if owned {
                 continue;
             }
@@ -237,6 +264,39 @@ mod tests {
         let id = add_session(&c, "self", "127.0.0.1", port, 0);
         assert!(c.check_port_conflicts(Some(id), LOOPBACK, port, 0).conflicts.is_empty());
         assert!(c.check_port_conflicts(None, LOOPBACK, 0, 0).conflicts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn parity_port_check_sees_other_sessions_local_forwards() {
+        let dir = TempDir::new();
+        let c = controller(&dir);
+        let port = free_port();
+        let mut s = profile("db", 22);
+        s.port_forwards = vec![conduit_core::PortForward {
+            id: Uuid::new_v4(),
+            port,
+            dest_host: "db.internal".into(),
+            dest_port: 5432,
+            ..Default::default()
+        }];
+        let mut remote = s.port_forwards[0].clone();
+        remote.direction = ForwardDirection::Remote;
+        remote.port = free_port();
+        s.port_forwards.push(remote.clone());
+        let id = s.id;
+        c.mutate_config(|config| {
+            config.sessions.push(s.clone());
+            Ok(())
+        })
+        .unwrap();
+
+        let report = c.check_port_conflicts(None, LOOPBACK, port, 0);
+        assert_eq!(report.conflicts.len(), 1, "{report:?}");
+        assert!(report.conflicts[0].detail.contains("forwards 127.0.0.1"));
+        // A remote forward listens on the target, not here.
+        assert!(c.check_port_conflicts(None, LOOPBACK, remote.port, 0).conflicts.is_empty());
+        // The session's own forwards are not a conflict.
+        assert!(c.check_port_conflicts(Some(id), LOOPBACK, port, 0).conflicts.is_empty());
     }
 
     #[tokio::test]

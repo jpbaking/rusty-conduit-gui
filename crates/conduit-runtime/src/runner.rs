@@ -13,17 +13,17 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
 use conduit_core::{
-    to_config, validate, AuthMethod, HostKeyLookup, KnownHostsStore, SessionProfile,
-    SshEngine,
+    to_config, validate, AuthMethod, ForwardDirection, HostKeyLookup, KnownHostsStore,
+    PortForward, SessionProfile, SshEngine,
 };
 use conduit_openssh::{
     check_openssh_binary, render_known_hosts, LogFn, OpenSshError, OpenSshSupervisor,
     SupervisorHop, SupervisorOptions,
 };
 use conduit_ssh::{
-    connect_chain, reverse_policy, AtomicStats, ChainOptions, ChannelPolicy, DisconnectEvent, HopAuth, HopSpec, HostKeyVerifier,
-    ReverseError, ReverseInbound, ReverseRelay, RusshDialer, ScopedAgent, SignAudit, SignAuditFn,
-    SshError, StatsDialer,
+    connect_chain, reverse_policy, AtomicStats, ChainOptions, ChannelPolicy, DisconnectEvent,
+    HopAuth, HopSpec, HostKeyVerifier, RemoteForward, ReverseError, ReverseInbound, ReverseRelay,
+    RusshDialer, ScopedAgent, SignAudit, SignAuditFn, SshError, StatsDialer,
 };
 use conduit_vault::{import_key, Vault, VaultError};
 use rusty_conduit_ssh::build_engines;
@@ -44,6 +44,7 @@ use zeroize::Zeroizing;
 use crate::backoff::Backoff;
 use crate::logs::LogRingBuffer;
 use crate::mitm_ca_file::MitmCaFile;
+use crate::port_forward::{self, LocalForwards, SharedForwards};
 use crate::state::{HostKeyPrompt, ListenerInfo, SessionState, StateCell};
 
 /// Queued inbound reverse channels per connection.
@@ -108,6 +109,8 @@ pub(crate) struct SessionContext {
     pub(crate) listeners: SharedListeners,
     /// Reverse listeners on the target host. Set while connected, cleared on disconnect.
     pub(crate) remote_listeners: SharedListeners,
+    /// Port forward states: local ones once bound, remote ones while connected.
+    pub(crate) forwards: SharedForwards,
 }
 
 /// Runs one session until it stops or halts, then records its final state.
@@ -121,6 +124,7 @@ pub(crate) async fn run_session(
     let logs = ctx.logs.clone();
     let listeners = Arc::clone(&ctx.listeners);
     let remote_listeners = Arc::clone(&ctx.remote_listeners);
+    let forwards = Arc::clone(&ctx.forwards);
     let backoff = Backoff::new(
         ctx.profile.tunnel.reconnect_initial_delay,
         ctx.profile.tunnel.reconnect_max_delay,
@@ -155,6 +159,7 @@ pub(crate) async fn run_session(
     for shared in [&listeners, &remote_listeners] {
         shared.lock().unwrap_or_else(PoisonError::into_inner).clear();
     }
+    forwards.lock().unwrap_or_else(PoisonError::into_inner).clear();
     logs.push(&format!("session ended: {}", describe(&final_state)));
     cell.set(final_state);
 }
@@ -554,6 +559,11 @@ struct ProxyStack {
     mitm: Option<MitmState>,
     server: Option<RunningServer>,
     listeners: SharedListeners,
+    /// Dials through the tunnel with no destination filter, for the port forwards.
+    tunnel: Arc<dyn UpstreamDialer>,
+    local_forwards: Option<LocalForwards>,
+    forward_states: SharedForwards,
+    port_forwards: Vec<PortForward>,
 }
 
 impl ProxyStack {
@@ -564,6 +574,7 @@ impl ProxyStack {
         logs: &LogRingBuffer,
         stats: Arc<AtomicStats>,
         listeners: SharedListeners,
+        forward_states: SharedForwards,
         base: Arc<dyn UpstreamDialer>,
     ) -> Result<Self, LinkError> {
         // Lives only until the MITM state below has loaded it.
@@ -607,6 +618,8 @@ impl ProxyStack {
         };
 
         let counted: Arc<dyn UpstreamDialer> = Arc::new(StatsDialer::new(base, stats));
+        // Port forwards name their destination on purpose, so the proxy's filters skip them.
+        let tunnel = Arc::clone(&counted);
         let upstream: Arc<dyn UpstreamDialer> = match cfg.forward_filter() {
             Some(filter) => Arc::new(FilteredDialer::new(counted, Arc::new(filter))),
             None => counted,
@@ -633,11 +646,63 @@ impl ProxyStack {
             mitm,
             server: None,
             listeners,
+            tunnel,
+            local_forwards: None,
+            forward_states,
+            port_forwards: profile.port_forwards.clone(),
         })
     }
 
-    /// Binds the forward listeners once. They then stay bound across reconnects.
+    /// The switched-on remote port forwards.
+    fn remote_forwards(&self) -> impl Iterator<Item = &PortForward> {
+        self.port_forwards
+            .iter()
+            .filter(|f| f.enabled && f.direction == ForwardDirection::Remote)
+    }
+
+    /// Reports the remote forwards as listening on `bound`, or clears them when it is `None`.
+    fn publish_remote(&self, bound: Option<&[(String, u32)]>) {
+        let statuses = match bound {
+            None => Vec::new(),
+            Some(bound) => self
+                .remote_forwards()
+                .zip(bound)
+                .map(|(forward, (address, port))| {
+                    let mut status = port_forward::status(forward, None);
+                    status.listen = SocketAddr::new(
+                        address.parse().unwrap_or(forward.bind),
+                        u16::try_from(*port).unwrap_or(forward.port),
+                    );
+                    status
+                })
+                .collect(),
+        };
+        port_forward::publish(&self.forward_states, ForwardDirection::Remote, statuses);
+    }
+
+    /// Reports the remote forward listening on `failed` as the reason a connect failed.
+    fn publish_remote_failure(&self, failed: SocketAddr, message: &str) {
+        let statuses = self
+            .remote_forwards()
+            .filter(|forward| forward.listen() == failed)
+            .map(|forward| port_forward::status(forward, Some(message.to_string())))
+            .collect();
+        port_forward::publish(&self.forward_states, ForwardDirection::Remote, statuses);
+    }
+
+    /// Binds the local port forwards and the forward listeners once. They then stay bound
+    /// across reconnects.
     async fn ensure_server(&mut self) -> Result<(), LinkError> {
+        if self.local_forwards.is_none() {
+            let local = self
+                .port_forwards
+                .iter()
+                .filter(|f| f.enabled && f.direction == ForwardDirection::Local);
+            self.local_forwards = Some(
+                LocalForwards::bind(local, Arc::clone(&self.tunnel), &self.logger, &self.forward_states)
+                    .await,
+            );
+        }
         if self.server.is_some() || !self.cfg.forward_enabled() {
             return Ok(());
         }
@@ -677,8 +742,12 @@ impl ProxyStack {
         Ok(())
     }
 
-    /// First shutdown step: stop accepting and drain the forward listeners.
+    /// First shutdown step: close the local port forwards, then stop accepting and drain the
+    /// forward listeners.
     async fn drain_server(&mut self) {
+        if let Some(forwards) = self.local_forwards.take() {
+            forwards.shutdown().await;
+        }
         if let Some(server) = self.server.take() {
             server.token.cancel();
             if let Ok(report) = server.run.await {
@@ -729,6 +798,7 @@ impl RusshLink {
             stats,
             listeners,
             remote_listeners,
+            forwards,
         } = ctx;
 
         validate(&profile).map_err(|e| LinkError::Fatal(e.to_string()))?;
@@ -741,6 +811,7 @@ impl RusshLink {
             &logs,
             stats,
             listeners,
+            forwards,
             Arc::clone(&dialer) as Arc<dyn UpstreamDialer>,
         )
         .await?;
@@ -765,6 +836,7 @@ impl RusshLink {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
+        self.stack.publish_remote(None);
         if let Some(chain) = self.dialer.detach() {
             if let Some(relay) = relay {
                 relay.stop(&chain).await;
@@ -779,7 +851,7 @@ impl RusshLink {
 
 /// Describes the reverse listeners bound on the target host.
 ///
-/// `forwards` and `bound` are in the same order, because the relay binds all or nothing. The
+/// `forwards` and `bound` start in the same order, because the relay binds all or nothing. The
 /// role comes from the configured ports, since one port serving both is multiplexed.
 fn remote_listener_info(
     cfg: &conduit_core::ReverseConfig,
@@ -835,8 +907,21 @@ impl Link for RusshLink {
     fn connect(&mut self) -> BoxFut<'_, Result<(), LinkError>> {
         Box::pin(async move {
             // The relay's receiver is consumed per connection, so build a fresh pair each time.
+            // The reverse proxy's listeners first, then the remote port forwards.
+            let mut remote: Vec<RemoteForward> = self
+                .stack
+                .reverse
+                .as_ref()
+                .map(|reverse| reverse.forwards().iter().map(RemoteForward::from).collect())
+                .unwrap_or_default();
+            let proxy_forwards = remote.len();
+            remote.extend(self.stack.remote_forwards().map(|forward| RemoteForward {
+                remote: forward.listen(),
+                host: forward.dest_host_unbracketed().to_string(),
+                port: forward.dest_port,
+            }));
             let (policy, inbound): (ChannelPolicy, Option<ReverseInbound>) =
-                if self.stack.reverse.is_some() {
+                if !remote.is_empty() {
                     let (policy, inbound) = reverse_policy(REVERSE_CHANNEL_CAPACITY);
                     (policy, Some(inbound))
                 } else {
@@ -856,18 +941,25 @@ impl Link for RusshLink {
                 .map_err(classify)?;
             drop(hops);
 
-            if let (Some(reverse), Some(inbound)) = (&self.stack.reverse, inbound) {
-                match ReverseRelay::start(&chain, reverse.forwards(), inbound).await {
+            if let Some(inbound) = inbound {
+                match ReverseRelay::start(&chain, &remote, inbound).await {
                     Ok(relay) => {
-                        *self
-                            .remote_listeners
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner) =
-                            remote_listener_info(&self.profile.reverse, reverse.forwards(), relay.bound());
+                        let (proxy_bound, forward_bound) = relay.bound().split_at(proxy_forwards);
+                        if let Some(reverse) = &self.stack.reverse {
+                            *self
+                                .remote_listeners
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner) =
+                                remote_listener_info(&self.profile.reverse, reverse.forwards(), proxy_bound);
+                        }
+                        self.stack.publish_remote(Some(forward_bound));
                         self.relay = Some(relay);
                     }
                     Err(error) => {
                         chain.disconnect().await;
+                        if let ReverseError::Request { remote, .. } = &error {
+                            self.stack.publish_remote_failure(*remote, &error.to_string());
+                        }
                         return Err(classify_reverse(error));
                     }
                 }
@@ -1034,6 +1126,7 @@ impl OpenSshLink {
             listeners,
             // The OpenSSH engine does not report what `ssh -R` bound, so it shows none.
             remote_listeners: _,
+            forwards,
         } = ctx;
 
         validate(&profile).map_err(|e| LinkError::Fatal(e.to_string()))?;
@@ -1053,7 +1146,8 @@ impl OpenSshLink {
 
         let (tunnel, state) = watch::channel(TunnelState::Connecting);
         let base: Arc<dyn UpstreamDialer> = Arc::new(Socks5UpstreamDialer::new(state));
-        let stack = ProxyStack::start(&profile, &vault, &logs, stats, listeners, base).await?;
+        let stack =
+            ProxyStack::start(&profile, &vault, &logs, stats, listeners, forwards, base).await?;
 
         Ok(Self {
             profile,
@@ -1117,15 +1211,20 @@ impl OpenSshLink {
                 .local_addr()
                 .map_err(|e| failed(e.to_string()))?
                 .port();
-            if port != forward.http_port && port != forward.socks_port {
+            let local_forward = self
+                .profile
+                .active_forwards_in(ForwardDirection::Local)
+                .any(|f| f.port == port);
+            if port != forward.http_port && port != forward.socks_port && !local_forward {
                 return Ok(port);
             }
             rejected.push(listener);
         }
-        Err(failed("every port offered is a forward port".into()))
+        Err(failed("every port offered is a forward or port-forward port".into()))
     }
 
     async fn stop_supervisor(&mut self, reason: &str) {
+        self.stack.publish_remote(None);
         self.tunnel
             .send_replace(TunnelState::Disconnected(reason.to_string()));
         self.supervisor_state = None;
@@ -1162,12 +1261,14 @@ impl Link for OpenSshLink {
                 .read()
                 .unwrap_or_else(PoisonError::into_inner)
                 .clone();
-            let reverse_forwards = self
+            let mut reverse_forwards: Vec<String> = self
                 .stack
                 .reverse
                 .as_ref()
                 .map(|reverse| reverse.forwards().iter().map(|f| f.spec()).collect())
                 .unwrap_or_default();
+            // Validated: each part is an IP, a port, or a host name, so `ssh` reads it as is.
+            reverse_forwards.extend(self.stack.remote_forwards().map(PortForward::spec));
             let sink = self.logs.clone();
             let log: LogFn = Arc::new(move |line: &str| sink.push(line));
             let tunnel = &self.profile.tunnel;
@@ -1200,6 +1301,14 @@ impl Link for OpenSshLink {
                 .send_replace(TunnelState::Ready(supervisor.socks_addr()));
             self.supervisor_state = Some(supervisor.state());
             self.supervisor = Some(supervisor);
+            // `ExitOnForwardFailure` makes `ssh` exit if the target refuses one, and that is
+            // reported as a lost connection.
+            let requested: Vec<(String, u32)> = self
+                .stack
+                .remote_forwards()
+                .map(|f| (f.bind.to_string(), u32::from(f.port)))
+                .collect();
+            self.stack.publish_remote(Some(&requested));
             self.stack.ensure_server().await
         })
     }

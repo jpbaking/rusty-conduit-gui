@@ -5,6 +5,7 @@
 //! parsing of the human-friendly string fields (`ip_version`, `level`, `format`) and the
 //! `rusty-conduit-ssh` filter syntax that this crate stores as strings.
 
+use std::net::IpAddr;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -15,13 +16,13 @@ use rusty_conduit_ssh::filter::FilterRule;
 use rusty_conduit_ssh::logging::{LogFormat, LogLevel};
 use thiserror::Error;
 
-use crate::SessionProfile;
+use crate::{ForwardDirection, PortForward, SessionProfile};
 
 /// Errors raised when a [`SessionProfile`] fails validation. Every variant is `FATAL`.
 #[derive(Debug, Error)]
 pub enum ValidateError {
     #[error(
-        "no listeners: turn on the forward or reverse proxy with at least one non-zero port"
+        "no listeners: turn on the forward or reverse proxy with at least one non-zero port, or a port forward"
     )]
     NoListeners,
     #[error("MITM is on but no CA is selected: upload a CA in the Key Vault and choose it")]
@@ -64,6 +65,12 @@ pub enum ValidateError {
         flag: &'static str,
         arg: String,
     },
+    #[error("port forward {} ({spec}): {message}", .index + 1)]
+    InvalidPortForward {
+        index: usize,
+        spec: String,
+        message: String,
+    },
 }
 
 /// Whether the forward (`ssh -D`) proxy is on with at least one listener.
@@ -74,6 +81,73 @@ fn forward_enabled(profile: &SessionProfile) -> bool {
 /// Whether the reverse (`ssh -R`) proxy is on with at least one listener.
 fn reverse_enabled(profile: &SessionProfile) -> bool {
     profile.reverse.effective_ports() != (0, 0)
+}
+
+/// Longest DNS name, as in RFC 1035.
+const MAX_HOST_LEN: usize = 253;
+
+/// A forward destination is an IP literal (IPv6 with or without brackets) or a DNS name. Only
+/// name characters are allowed, so the value cannot change how `ssh` reads a `-R` argument.
+fn forward_host_problem(host: &str) -> Option<&'static str> {
+    if host.is_empty() {
+        return Some("enter a destination host");
+    }
+    let bare = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+    if bare.parse::<IpAddr>().is_ok() {
+        return None;
+    }
+    if host.len() > MAX_HOST_LEN {
+        return Some("the destination host name is too long");
+    }
+    let valid = host
+        .split('.')
+        .all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        });
+    if valid { None } else { Some("the destination host must be a host name or an IP address") }
+}
+
+/// Two binds collide on the same IP, or when either listens on all interfaces.
+fn binds_overlap(a: IpAddr, b: IpAddr) -> bool {
+    a == b || a.is_unspecified() || b.is_unspecified()
+}
+
+/// What makes forward `index` unusable, given the rest of the profile.
+fn port_forward_problem(profile: &SessionProfile, index: usize, forward: &PortForward) -> Option<String> {
+    if forward.port == 0 {
+        return Some("choose a listen port from 1 to 65535".into());
+    }
+    if forward.dest_port == 0 {
+        return Some("choose a destination port from 1 to 65535".into());
+    }
+    if let Some(problem) = forward_host_problem(forward.dest_host.trim()) {
+        return Some(problem.into());
+    }
+    if !forward.enabled {
+        return None;
+    }
+    let (proxy_bind, (http, socks), side) = match forward.direction {
+        ForwardDirection::Local => (profile.forward.bind, profile.forward.effective_ports(), "forward"),
+        ForwardDirection::Remote => {
+            (profile.reverse.reverse_bind, profile.reverse.effective_ports(), "reverse")
+        }
+    };
+    if binds_overlap(forward.bind, proxy_bind) && [http, socks].contains(&forward.port) {
+        return Some(format!("port {} is already used by the {side} proxy", forward.port));
+    }
+    let earlier = profile.port_forwards[..index].iter().any(|other| {
+        other.enabled
+            && other.direction == forward.direction
+            && other.port == forward.port
+            && binds_overlap(other.bind, forward.bind)
+    });
+    if earlier {
+        return Some(format!("another forward already listens on port {}", forward.port));
+    }
+    None
 }
 
 /// Short `ssh` flags that break tunnel isolation. Case-sensitive, as `ssh` treats them.
@@ -170,8 +244,21 @@ fn tcp_keepalive(profile: &SessionProfile) -> Result<(), ValidateError> {
 /// `format`) and the `rusty-conduit-ssh` filter syntax.
 pub fn validate(profile: &SessionProfile) -> Result<(), ValidateError> {
     // At least one listener must be enabled.
-    if !forward_enabled(profile) && !reverse_enabled(profile) {
+    if !forward_enabled(profile)
+        && !reverse_enabled(profile)
+        && profile.active_forwards().next().is_none()
+    {
         return Err(ValidateError::NoListeners);
+    }
+
+    for (index, forward) in profile.port_forwards.iter().enumerate() {
+        if let Some(message) = port_forward_problem(profile, index, forward) {
+            return Err(ValidateError::InvalidPortForward {
+                index,
+                spec: forward.spec(),
+                message,
+            });
+        }
     }
 
     // MITM: a CA must be chosen, and the cert TTL must be long enough.
@@ -277,7 +364,8 @@ pub fn validate(profile: &SessionProfile) -> Result<(), ValidateError> {
 mod tests {
     use super::*;
     use crate::{
-        ForwardConfig, HopEntry, HostProfile, MitmCaId, ReverseConfig, SessionProfile,
+        ForwardConfig, ForwardDirection, HopEntry, HostProfile, MitmCaId, PortForward,
+        ReverseConfig, SessionProfile,
     };
 
     fn target_hop() -> HopEntry {
@@ -579,4 +667,87 @@ mod tests {
         p.logging.format = "json".into();
         assert!(validate(&p).is_ok());
     }
+
+    fn local_forward(port: u16, dest: &str, dest_port: u16) -> PortForward {
+        PortForward {
+            direction: ForwardDirection::Local,
+            port,
+            dest_host: dest.into(),
+            dest_port,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_port_forward_alone_counts_as_a_listener() {
+        let mut p = forward_profile();
+        p.forward.enabled = false;
+        p.port_forwards = vec![local_forward(15432, "db.internal", 5432)];
+        assert!(validate(&p).is_ok());
+        p.port_forwards[0].enabled = false;
+        assert!(matches!(validate(&p), Err(ValidateError::NoListeners)));
+    }
+
+    #[test]
+    fn port_forward_ports_and_hosts_are_checked() {
+        let cases = [
+            (local_forward(0, "db", 5432), "listen port"),
+            (local_forward(15432, "db", 0), "destination port"),
+            (local_forward(15432, " ", 5432), "destination host"),
+            (local_forward(15432, "db:5432", 5432), "host name or an IP"),
+            (local_forward(15432, "-oProxyCommand=x", 5432), "host name or an IP"),
+            (local_forward(15432, "db host", 5432), "host name or an IP"),
+        ];
+        for (forward, expected) in cases {
+            let mut p = forward_profile();
+            p.port_forwards = vec![forward];
+            match validate(&p) {
+                Err(ValidateError::InvalidPortForward { index: 0, message, .. }) => {
+                    assert!(message.contains(expected), "{message}");
+                }
+                other => panic!("expected an invalid forward, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn port_forward_accepts_names_and_ip_literals() {
+        for host in ["db.internal", "10.0.0.5", "::1", "[fe80::1]", "my_host-1"] {
+            let mut p = forward_profile();
+            p.port_forwards = vec![local_forward(15432, host, 5432)];
+            assert!(validate(&p).is_ok(), "{host}");
+        }
+    }
+
+    #[test]
+    fn port_forwards_must_not_collide() {
+        let mut p = forward_profile();
+        // The forward proxy's HTTP port on an overlapping bind.
+        let mut clash = local_forward(3128, "db", 5432);
+        clash.bind = "0.0.0.0".parse().unwrap();
+        p.port_forwards = vec![clash.clone()];
+        assert!(matches!(validate(&p), Err(ValidateError::InvalidPortForward { .. })));
+        // A remote forward on the same number is on another machine.
+        clash.direction = ForwardDirection::Remote;
+        p.port_forwards = vec![clash];
+        assert!(validate(&p).is_ok());
+
+        p.port_forwards = vec![local_forward(9000, "a", 1), local_forward(9000, "b", 2)];
+        assert!(matches!(
+            validate(&p),
+            Err(ValidateError::InvalidPortForward { index: 1, .. })
+        ));
+        // Switched off, a duplicate is kept but does not clash.
+        p.port_forwards[1].enabled = false;
+        assert!(validate(&p).is_ok());
+    }
+
+    #[test]
+    fn port_forward_spec_brackets_ipv6() {
+        let mut f = local_forward(9000, "fe80::1", 22);
+        f.bind = "::1".parse().unwrap();
+        assert_eq!(f.spec(), "[::1]:9000:[fe80::1]:22");
+        assert_eq!(local_forward(15432, "db", 5432).spec(), "127.0.0.1:15432:db:5432");
+    }
+
 }

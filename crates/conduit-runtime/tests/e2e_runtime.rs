@@ -20,7 +20,7 @@ use common::{
     spawn_origin, Node, PASSWORD, REMOTE_ONLY_HOST,
 };
 use conduit_core::{
-    AuthMethod, ForwardConfig, HopEntry, HostKeyLookup, HostKeyRecord, HostProfile, KeyId,
+    AuthMethod, ForwardConfig, ForwardDirection, HopEntry, PortForward, HostKeyLookup, HostKeyRecord, HostProfile, KeyId,
     KnownHostsStore, LoggingConfig, MitmCaId, MitmConfig, SecretRef, SessionProfile, Timestamp, TunnelConfig,
 };
 use conduit_runtime::{ManagerConfig, RuntimeError, RuntimeEvent, SessionManager, SessionState};
@@ -441,6 +441,75 @@ fn concurrent_sessions_stay_isolated() {
         assert!(!forward_log.contains(&reverse_origin.to_string()), "{forward_log}");
         assert!(!reverse_log.contains(&forward_origin.to_string()), "{reverse_log}");
         assert!(!reverse_log.contains(REMOTE_ONLY_HOST), "{reverse_log}");
+        f.finish().await;
+    });
+}
+
+#[test]
+fn port_forwards_carry_traffic_both_ways() {
+    e2e(async {
+        let f = Fixture::new();
+        let node = spawn_node(None).await;
+        f.pin(0, &node, &node.host_key);
+        let echo = spawn_echo().await;
+        let local_port = free_port().await;
+        let remote_port = free_port().await;
+
+        // Only port forwards: no proxy listens at all.
+        let mut session = profile("forwards", vec![hop(0, &node, vec![f.password(PASSWORD)])]);
+        session.forward.enabled = false;
+        let local = PortForward {
+            id: Uuid::new_v4(),
+            direction: ForwardDirection::Local,
+            port: local_port,
+            // Only the target resolves this name, so the connection went through the tunnel.
+            dest_host: REMOTE_ONLY_HOST.into(),
+            dest_port: echo,
+            ..Default::default()
+        };
+        let remote = PortForward {
+            id: Uuid::new_v4(),
+            direction: ForwardDirection::Remote,
+            port: remote_port,
+            dest_host: "127.0.0.1".into(),
+            dest_port: echo,
+            ..Default::default()
+        };
+        let off = PortForward {
+            id: Uuid::new_v4(),
+            enabled: false,
+            port: free_port().await,
+            dest_host: "127.0.0.1".into(),
+            dest_port: echo,
+            ..Default::default()
+        };
+        session.port_forwards = vec![local.clone(), remote.clone(), off.clone()];
+        let id = f.add(session);
+
+        f.manager.start(id).await.unwrap();
+        f.until_connected(id).await;
+
+        let body = payload(PAYLOAD_LEN);
+        let through_local = TcpStream::connect(loopback(local_port)).await.unwrap();
+        assert!(echo_roundtrip(through_local, &body).await == body, "-L payload corrupted");
+        assert!(node.hosts().iter().any(|h| h == REMOTE_ONLY_HOST));
+        // The in-process server listens for `tcpip-forward` on loopback.
+        let through_remote = TcpStream::connect(loopback(remote_port)).await.unwrap();
+        assert!(echo_roundtrip(through_remote, &body).await == body, "-R payload corrupted");
+        assert!(TcpStream::connect(off.listen()).await.is_err(), "a forward that is off listens");
+
+        let statuses = f.manager.snapshot(id).unwrap().port_forwards;
+        assert_eq!(statuses.len(), 2, "{statuses:?}");
+        for forward in [&local, &remote] {
+            let status = statuses.iter().find(|s| s.id == forward.id).unwrap();
+            assert_eq!(status.error, None);
+            assert_eq!(status.listen.port(), forward.port);
+            assert_eq!(status.direction, forward.direction);
+        }
+
+        f.manager.stop(id).await.unwrap();
+        assert!(f.manager.snapshot(id).unwrap().port_forwards.is_empty());
+        assert!(TcpStream::connect(loopback(local_port)).await.is_err());
         f.finish().await;
     });
 }

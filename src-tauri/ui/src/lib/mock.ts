@@ -70,6 +70,7 @@ function profile(id: string, name: string, host: string, httpPort: number): Sess
       reverse_allow: [],
       reverse_block: [],
     },
+    port_forwards: [],
     mitm: null,
     tunnel: {
       ip_version: "4",
@@ -90,6 +91,29 @@ function profile(id: string, name: string, host: string, httpPort: number): Sess
 
 function withReverse(p: SessionProfile, httpPort: number): SessionProfile {
   return { ...p, reverse: { ...p.reverse, enabled: true, reverse_http_port: httpPort } };
+}
+
+function withForwards(p: SessionProfile): SessionProfile {
+  const base = { enabled: true, bind: "127.0.0.1" };
+  return {
+    ...p,
+    port_forwards: [
+      { ...base, id: "f0000000-0000-4000-8000-000000000001", direction: "local", name: "Staging DB", port: 15432, dest_host: "db.staging.internal", dest_port: 5432 },
+      { ...base, id: "f0000000-0000-4000-8000-000000000002", direction: "remote", name: "Webhook receiver", port: 9000, dest_host: "localhost", dest_port: 3000 },
+    ],
+  };
+}
+
+function forwardStatuses(p: SessionProfile): SessionSnapshot["port_forwards"] {
+  return p.port_forwards
+    .filter((f) => f.enabled)
+    .map((f) => ({
+      id: f.id,
+      direction: f.direction,
+      listen: `${f.bind}:${f.port}`,
+      destination: `${f.dest_host}:${f.dest_port}`,
+      error: null,
+    }));
 }
 
 function view(p: SessionProfile, state: SessionState, active = 0): SessionView {
@@ -118,12 +142,17 @@ function view(p: SessionProfile, state: SessionState, active = 0): SessionView {
       connected && p.reverse.reverse_http_port
         ? [{ role: "HTTP/HTTPS", addr: `${p.reverse.reverse_bind}:${p.reverse.reverse_http_port}` }]
         : [],
+    port_forwards: connected ? forwardStatuses(p) : [],
   };
   return { profile: p, runtime };
 }
 
 const sessions: SessionView[] = [
-  view(withReverse(profile("11111111-1111-4111-8111-111111111111", "Staging bastion", "192.0.2.10", 3128), 8080), { state: "connected" }, 3),
+  view(
+    withForwards(withReverse(profile("11111111-1111-4111-8111-111111111111", "Staging bastion", "192.0.2.10", 3128), 8080)),
+    { state: "connected" },
+    3,
+  ),
   view(profile("22222222-2222-4222-8222-222222222222", "Lab gateway", "198.51.100.7", 3130), {
     state: "reconnecting",
     attempt: 2,
@@ -293,6 +322,7 @@ function dispatch(command: string, args?: Record<string, unknown>): unknown {
     case "start_session": {
       const session = find(args);
       session.runtime.state = { state: "connected" };
+      session.runtime.port_forwards = forwardStatuses(session.profile);
       return null;
     }
     case "stop_session": {
@@ -301,6 +331,7 @@ function dispatch(command: string, args?: Record<string, unknown>): unknown {
       session.runtime.stats = { ...IDLE_STATS };
       session.runtime.listeners = [];
       session.runtime.remote_listeners = [];
+      session.runtime.port_forwards = [];
       return null;
     }
     case "upsert_session": {
