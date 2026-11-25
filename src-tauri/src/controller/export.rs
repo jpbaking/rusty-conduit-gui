@@ -39,6 +39,9 @@ const VERSION: u32 = 1;
 /// Bound into the ciphertext as authenticated data.
 const BUNDLE_RECORD_ID: &[u8] = b"conduit-config-bundle";
 const BUNDLE_RECORD_TYPE: &[u8] = b"config-bundle-v1";
+/// The payload of an encrypted export without secrets: the config alone. A different AAD
+/// type, so a file edited to claim the other kind fails to decrypt.
+const CONFIG_ONLY_RECORD_TYPE: &[u8] = b"config-only-v1";
 const SALT_LEN: usize = 16;
 const MAX_IMPORT_BYTES: u64 = 64 * 1024 * 1024;
 /// What an untrusted `openssh.ssh_bin` is reset to.
@@ -56,6 +59,14 @@ struct Probe {
     encrypted: bool,
 }
 
+/// A key-only backup from the earlier "Encrypted key backup" flow (`b"CVBK"`).
+#[derive(Deserialize)]
+struct LegacyKeyBackupProbe {
+    magic: [u8; 4],
+}
+
+const LEGACY_KEY_BACKUP_MAGIC: [u8; 4] = *b"CVBK";
+
 #[derive(Serialize, Deserialize)]
 struct PlainExport {
     format: String,
@@ -69,9 +80,16 @@ struct EncryptedExport {
     format: String,
     version: u32,
     encrypted: bool,
+    /// Whether the payload holds secrets. Files written before this was optional always did.
+    #[serde(default = "with_secrets_by_default")]
+    secrets: bool,
     argon2: Argon2Params,
     salt: Vec<u8>,
     payload: Vec<u8>,
+}
+
+fn with_secrets_by_default() -> bool {
+    true
 }
 
 /// One vault record inside the encrypted payload. Zeroized on drop.
@@ -100,6 +118,8 @@ struct BundlePayload {
 pub struct ExportSummary {
     pub path: PathBuf,
     pub encrypted: bool,
+    /// Vault secrets were included. Always encrypted when so.
+    pub with_secrets: bool,
     pub session_count: usize,
     pub host_count: usize,
     pub key_count: usize,
@@ -114,6 +134,10 @@ pub struct ExportSummary {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ImportSummary {
     pub encrypted: bool,
+    /// The file carried vault secrets, which were restored into the vault.
+    pub with_secrets: bool,
+    /// The file was an older key-only backup: only `keys_added` and `keys_skipped` apply.
+    pub key_only_backup: bool,
     pub sessions_added: usize,
     pub sessions_updated: usize,
     pub sessions_skipped: usize,
@@ -124,6 +148,8 @@ pub struct ImportSummary {
     pub presets_updated: usize,
     pub presets_skipped: usize,
     pub keys_added: usize,
+    /// Keys from a key-only backup that the vault already holds.
+    pub keys_skipped: usize,
     pub cas_added: usize,
     pub secrets_added: usize,
     pub known_hosts_added: usize,
@@ -422,7 +448,8 @@ impl RestoredRecords {
 }
 
 impl AppController {
-    /// Writes a config export, owner-only. Secrets are included only in the encrypted form.
+    /// Writes a config export, owner-only. With `passphrase` it is encrypted; secrets need one,
+    /// and are included only on request. A given passphrase must meet the password policy.
     pub fn export_config(
         &self,
         path: &Path,
@@ -432,7 +459,8 @@ impl AppController {
         let config = self.config_snapshot();
         let mut summary = ExportSummary {
             path: path.to_path_buf(),
-            encrypted: include_secrets,
+            encrypted: passphrase.is_some(),
+            with_secrets: include_secrets,
             session_count: config.sessions.len(),
             host_count: config.hosts.len(),
             key_count: config.keys.len(),
@@ -440,12 +468,18 @@ impl AppController {
             secret_count: 0,
             missing_secrets: 0,
         };
+        if let Some(passphrase) = &passphrase {
+            super::password::check_new_password(passphrase, "backup password")?;
+        }
         if !include_secrets {
-            // Refuse rather than write plaintext for someone who expected encryption.
-            if passphrase.is_some() {
-                return Err(AppError::Invalid(
-                    "a passphrase is only used when the export includes secrets".into(),
-                ));
+            if let Some(passphrase) = passphrase {
+                let plaintext = Zeroizing::new(
+                    serde_json::to_vec(&config)
+                        .map_err(|e| AppError::Io(format!("failed to encode the export: {e}")))?,
+                );
+                return self
+                    .write_encrypted(path, &passphrase, false, CONFIG_ONLY_RECORD_TYPE, &plaintext)
+                    .map(|()| summary);
             }
             let file = PlainExport {
                 format: FORMAT.into(),
@@ -460,8 +494,7 @@ impl AppController {
         }
 
         let passphrase = passphrase
-            .ok_or_else(|| AppError::Invalid("an export with secrets needs a passphrase".into()))?;
-        passphrase.require_non_empty("export passphrase")?;
+            .ok_or_else(|| AppError::Invalid("a backup with secrets needs a backup password".into()))?;
         let mut secrets = Vec::new();
         {
             let vault = self.vault_read();
@@ -492,7 +525,19 @@ impl AppController {
                 .map_err(|e| AppError::Io(format!("failed to encode the export: {e}")))?,
         );
         drop(payload);
+        self.write_encrypted(path, &passphrase, true, BUNDLE_RECORD_TYPE, &plaintext)?;
+        Ok(summary)
+    }
 
+    /// Encrypts `plaintext` under a key derived from `passphrase` and writes it, owner-only.
+    fn write_encrypted(
+        &self,
+        path: &Path,
+        passphrase: &SecretInput,
+        secrets: bool,
+        record_type: &[u8],
+        plaintext: &[u8],
+    ) -> Result<(), AppError> {
         let params = self.argon();
         let mut salt = generate_dek().to_bytes();
         salt.truncate(SALT_LEN);
@@ -501,14 +546,14 @@ impl AppController {
             format: FORMAT.into(),
             version: VERSION,
             encrypted: true,
+            secrets,
             argon2: params,
             salt,
-            payload: encrypt_record(&key, BUNDLE_RECORD_ID, BUNDLE_RECORD_TYPE, &plaintext),
+            payload: encrypt_record(&key, BUNDLE_RECORD_ID, record_type, plaintext),
         };
         let bytes = serde_json::to_vec(&file)
             .map_err(|e| AppError::Io(format!("failed to encode the export: {e}")))?;
-        write_private_file(path, &bytes)?;
-        Ok(summary)
+        write_private_file(path, &bytes)
     }
 
     /// Imports a plain or encrypted export, detected from the file. Nothing is changed unless
@@ -525,6 +570,11 @@ impl AppController {
             return Err(AppError::Invalid("this file is too large to be a config export".into()));
         }
         let data = fs::read(path).map_err(io_error)?;
+        let legacy = serde_json::from_slice::<LegacyKeyBackupProbe>(&data)
+            .is_ok_and(|p| p.magic == LEGACY_KEY_BACKUP_MAGIC);
+        if legacy {
+            return self.import_legacy_key_backup(&data, passphrase);
+        }
         let probe: Probe = serde_json::from_slice(&data).map_err(|_| not_an_export())?;
         if probe.format != FORMAT {
             return Err(not_an_export());
@@ -542,9 +592,45 @@ impl AppController {
         }
     }
 
+    /// Restores the SSH keys of a key-only backup. Keys already in the vault are skipped.
+    fn import_legacy_key_backup(
+        &self,
+        data: &[u8],
+        passphrase: Option<SecretInput>,
+    ) -> Result<ImportSummary, AppError> {
+        let passphrase = passphrase
+            .ok_or_else(|| AppError::Invalid("this backup needs its backup password".into()))?;
+        if !self.vault_read().is_unlocked() {
+            return Err(VaultError::Locked.into());
+        }
+        let mut entries = conduit_vault::import_backup(data, passphrase.as_bytes())?;
+        let restored = self.restore_entries(&entries);
+        for entry in &mut entries {
+            entry.private_key_openssh.zeroize();
+        }
+        let (added, skipped) = restored?;
+        Ok(ImportSummary {
+            encrypted: true,
+            with_secrets: true,
+            key_only_backup: true,
+            keys_added: added,
+            keys_skipped: skipped,
+            ..ImportSummary::default()
+        })
+    }
+
     fn import_plain(&self, data: &[u8], replace: bool) -> Result<ImportSummary, AppError> {
         let file: PlainExport = serde_json::from_slice(data).map_err(|_| not_an_export())?;
-        let mut incoming = file.config;
+        self.import_without_secrets(file.config, replace)
+    }
+
+    /// Merges a config that came without secrets, from a plain file or an encrypted one: its
+    /// credential links and paths are trusted only where this install already has them.
+    fn import_without_secrets(
+        &self,
+        mut incoming: AppConfig,
+        replace: bool,
+    ) -> Result<ImportSummary, AppError> {
         prepare(&mut incoming)?;
         // Key or CA metadata without its vault record would list one that cannot be used.
         incoming.keys.clear();
@@ -567,14 +653,24 @@ impl AppController {
         replace: bool,
     ) -> Result<ImportSummary, AppError> {
         let passphrase = passphrase
-            .ok_or_else(|| AppError::Invalid("this export is encrypted and needs its passphrase".into()))?;
-        passphrase.require_non_empty("export passphrase")?;
-        if !self.vault_read().is_unlocked() {
+            .ok_or_else(|| AppError::Invalid("this backup is encrypted and needs its backup password".into()))?;
+        passphrase.require_non_empty("backup password")?;
+        let file: EncryptedExport = serde_json::from_slice(data).map_err(|_| not_an_export())?;
+        // Secrets are restored into the vault, so it must be open; a config alone needs nothing.
+        if file.secrets && !self.vault_read().is_unlocked() {
             return Err(VaultError::Locked.into());
         }
-        let file: EncryptedExport = serde_json::from_slice(data).map_err(|_| not_an_export())?;
         check_bundle_params(&file)?;
         let key = bundle_key(passphrase.as_bytes(), &file.argon2, &file.salt)?;
+        if !file.secrets {
+            let plaintext =
+                decrypt_record(&key, BUNDLE_RECORD_ID, CONFIG_ONLY_RECORD_TYPE, &file.payload)?;
+            let incoming: AppConfig =
+                serde_json::from_slice(&plaintext).map_err(|_| not_an_export())?;
+            let mut summary = self.import_without_secrets(incoming, replace)?;
+            summary.encrypted = true;
+            return Ok(summary);
+        }
         let plaintext = decrypt_record(&key, BUNDLE_RECORD_ID, BUNDLE_RECORD_TYPE, &file.payload)?;
         let BundlePayload { config: mut incoming, known_hosts, secrets } =
             serde_json::from_slice(&plaintext).map_err(|_| not_an_export())?;
@@ -626,6 +722,7 @@ impl AppController {
         self.sync_profiles(changed);
 
         summary.encrypted = true;
+        summary.with_secrets = true;
         summary.sessions_skipped += sessions_skipped;
         summary.hosts_skipped += hosts_skipped;
         summary.keys_added = restored.new_metas.len();
@@ -787,7 +884,7 @@ mod tests {
     use serde_json::{json, Value};
 
     const PASSWORD: &str = "export-canary-password-71fe";
-    const BUNDLE_PASS: &str = "export-canary-bundle-pass-a4d1";
+    const BUNDLE_PASS: &str = "Export-Canary-Bundle-Pass-a4d1";
 
     struct Seed {
         key: VaultKeyMeta,
@@ -913,17 +1010,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_encrypted_backup_without_secrets_restores_like_a_plain_one() {
+        let dir = TempDir::new();
+        let c = unlocked(&dir).await;
+        let seeded = seed(&c);
+        let path = dir.path().join("config-only.json");
+        let summary = c.export_config(&path, false, pass()).unwrap();
+        assert!(summary.encrypted && !summary.with_secrets);
+        assert_eq!(summary.secret_count, 0);
+
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("seed-key"), "the config is encrypted too");
+        assert!(!text.contains(PASSWORD));
+        let material = c.vault_read().get_secret(&seeded.key.id.to_string()).unwrap();
+        let pem = String::from_utf8(material.to_vec()).unwrap();
+        for line in pem.lines().filter(|l| !l.starts_with("-----") && l.len() >= 16) {
+            assert!(!text.contains(line));
+        }
+
+        // A config alone needs no unlocked vault, and keeps this install's credential links.
+        c.lock_vault();
+        assert!(matches!(c.import_config(&path, None, true), Err(AppError::Invalid(_))));
+        assert!(c.import_config(&path, Some(SecretInput::new("Wrong-Pass-1")), true).is_err());
+        let restored = c.import_config(&path, pass(), true).unwrap();
+        assert!(restored.encrypted && !restored.with_secrets);
+        assert_eq!(restored.credentials_removed, 0);
+        assert_eq!(restored.sessions_updated, 1);
+
+        // Claiming secrets in the unencrypted header makes the payload fail to decrypt.
+        let mut file: serde_json::Value = serde_json::from_str(&text).unwrap();
+        file["secrets"] = serde_json::Value::Bool(true);
+        fs::write(&path, file.to_string()).unwrap();
+        c.unlock_vault_with_password(SecretInput::new(TEST_MASTER)).await.unwrap();
+        assert!(c.import_config(&path, pass(), true).is_err());
+    }
+
+    #[tokio::test]
     async fn export_passphrase_rules() {
         let dir = TempDir::new();
         let c = unlocked(&dir).await;
         let path = dir.path().join("x.json");
-        for bad in [None, Some(SecretInput::new(""))] {
+        let weak = || Some(SecretInput::new("lowercase-only-1"));
+        for bad in [None, Some(SecretInput::new("")), weak()] {
             assert!(matches!(c.export_config(&path, true, bad), Err(AppError::Invalid(_))));
         }
-        assert!(matches!(
-            c.export_config(&path, false, pass()),
-            Err(AppError::Invalid(_))
-        ));
+        // Without secrets the password is optional, but one that is given must be strong.
+        assert!(matches!(c.export_config(&path, false, weak()), Err(AppError::Invalid(_))));
         assert!(!path.exists());
         c.lock_vault();
         assert!(matches!(

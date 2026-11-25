@@ -32,6 +32,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tauri = { version = "2", features = [] }
 tauri-plugin-autostart = "2"
+tauri-plugin-dialog = "2"
 tauri-plugin-single-instance = "2"
 thiserror = { workspace = true }
 time = { version = "0.3", features = ["formatting"] }

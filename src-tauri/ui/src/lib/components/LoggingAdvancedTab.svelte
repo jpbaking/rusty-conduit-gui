@@ -4,6 +4,7 @@
   import { store } from "../stores.svelte";
   import type { LoggingConfig, OpenSshOptions, SessionProfile } from "../types";
   import { configLineArgs, denylistedFlag, isIpAddress, isLoopback, LOG_FORMATS, LOG_LEVELS, redactArgs } from "../validate";
+  import BrowseButton from "./BrowseButton.svelte";
   import PortField from "./PortField.svelte";
 
   /** Long enough that a path being typed is not run one partial value at a time. */
@@ -79,6 +80,8 @@
     return () => clearTimeout(timer);
   });
 
+  const LOG_FILES = [{ name: "Log files", extensions: ["log", "txt", "jsonl"] }];
+
   function setLogging(patch: Partial<LoggingConfig>) {
     store.updateDraft((p) => ({ ...p, logging: { ...p.logging, ...patch } }));
   }
@@ -111,22 +114,42 @@
     </div>
   </div>
   <div class="field-row">
-    <label class="field grow">
-      <span>HTTP access log file <small class="muted">optional</small></span>
-      <input
-        value={logging.http_access_log ?? ""}
-        spellcheck="false"
-        oninput={(e) => setLogging({ http_access_log: e.currentTarget.value || null })}
-      />
-    </label>
-    <label class="field grow">
-      <span>SOCKS log file <small class="muted">optional</small></span>
-      <input
-        value={logging.socks_log ?? ""}
-        spellcheck="false"
-        oninput={(e) => setLogging({ socks_log: e.currentTarget.value || null })}
-      />
-    </label>
+    <div class="field grow">
+      <label for={`${uid}-http-log`}>HTTP access log file <small class="muted">optional</small></label>
+      <div class="inline-form">
+        <input
+          id={`${uid}-http-log`}
+          value={logging.http_access_log ?? ""}
+          spellcheck="false"
+          oninput={(e) => setLogging({ http_access_log: e.currentTarget.value || null })}
+        />
+        <BrowseButton
+          mode="save"
+          title="HTTP access log file"
+          defaultPath={logging.http_access_log || "http-access.log"}
+          filters={LOG_FILES}
+          onPick={(path) => setLogging({ http_access_log: path })}
+        />
+      </div>
+    </div>
+    <div class="field grow">
+      <label for={`${uid}-socks-log`}>SOCKS log file <small class="muted">optional</small></label>
+      <div class="inline-form">
+        <input
+          id={`${uid}-socks-log`}
+          value={logging.socks_log ?? ""}
+          spellcheck="false"
+          oninput={(e) => setLogging({ socks_log: e.currentTarget.value || null })}
+        />
+        <BrowseButton
+          mode="save"
+          title="SOCKS log file"
+          defaultPath={logging.socks_log || "socks.log"}
+          filters={LOG_FILES}
+          onPick={(path) => setLogging({ socks_log: path })}
+        />
+      </div>
+    </div>
   </div>
 </section>
 
@@ -152,6 +175,7 @@
           aria-invalid={!!errors["openssh.ssh_bin"]}
           oninput={(e) => setOpenssh({ ssh_bin: e.currentTarget.value })}
         />
+        <BrowseButton mode="open" title="Choose the ssh program" onPick={(path) => setOpenssh({ ssh_bin: path })} />
         <button type="button" disabled={checkingBin} onclick={checkBinary}>
           {checkingBin ? "Checking…" : "Check binary"}
         </button>

@@ -3,7 +3,9 @@
   import { api, errorMessage } from "../api";
   import { store } from "../stores.svelte";
   import type { VaultStatus } from "../types";
+  import { isStrongPassword } from "../password";
   import ModalDialog from "./ModalDialog.svelte";
+  import PasswordRules from "./PasswordRules.svelte";
 
   const uid = $props.id();
   const formId = `${uid}-form`;
@@ -22,7 +24,9 @@
   const locked = $derived(busy || done);
 
   const creating = $derived(!store.vault.initialized);
-  const ready = $derived(!!password && (!creating || !!confirmation));
+  const ready = $derived(
+    !!password && (!creating || (!!confirmation && isStrongPassword(password))),
+  );
 
   async function run(action: () => Promise<VaultStatus>) {
     busy = true;
@@ -86,9 +90,11 @@
         bind:value={password}
         disabled={locked}
         autocomplete={creating ? "new-password" : "current-password"}
+        aria-describedby={creating ? `${uid}-rules` : undefined}
       />
     </label>
     {#if creating}
+      <PasswordRules {password} id={`${uid}-rules`} />
       <label class="field">
         Confirm master password
         <input type="password" bind:value={confirmation} disabled={locked} autocomplete="new-password" />

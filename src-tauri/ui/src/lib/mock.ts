@@ -550,6 +550,10 @@ function dispatch(command: string, args?: Record<string, unknown>): unknown {
     case "lock_vault":
       vault.unlocked = false;
       return { ...vault };
+    case "change_master_password":
+      if (!vault.initialized) throw new ApiError("vault_not_initialized", "vault has not been created");
+      vault.unlocked = true;
+      return { ...vault };
     case "generate_key":
     case "import_key_pem": {
       const generated = command === "generate_key";
@@ -586,10 +590,6 @@ function dispatch(command: string, args?: Record<string, unknown>): unknown {
     case "set_autostart":
       autostart = Boolean(args?.enabled);
       return { enabled: autostart, executable: "/opt/preview/app", args: ["--tray"] };
-    case "export_backup":
-      return { path: String(args?.path), key_count: keys.length };
-    case "import_backup":
-      return { imported: [], skipped: keys.length };
     case "check_port_conflicts":
       return mockPortConflicts(args);
     case "test_filter_rules":
@@ -597,21 +597,23 @@ function dispatch(command: string, args?: Record<string, unknown>): unknown {
     case "check_openssh_binary":
       return mockOpensshCheck(args);
     case "export_config": {
-      const encrypted = Boolean(args?.includeSecrets);
+      const withSecrets = Boolean(args?.includeSecrets);
       return {
         path: String(args?.path),
-        encrypted,
+        encrypted: args?.passphrase != null,
+        with_secrets: withSecrets,
         session_count: sessions.length,
         host_count: hosts.length,
         key_count: keys.length,
         ca_count: cas.length,
-        secret_count: encrypted ? keys.length + cas.length : 0,
+        secret_count: withSecrets ? keys.length + cas.length : 0,
         missing_secrets: 0,
       } satisfies ExportSummary;
     }
     case "import_config":
       return {
         encrypted: args?.passphrase != null,
+        with_secrets: false,
         sessions_added: 0,
         sessions_updated: 0,
         sessions_skipped: sessions.length,
@@ -622,6 +624,8 @@ function dispatch(command: string, args?: Record<string, unknown>): unknown {
         hosts_updated: 0,
         hosts_skipped: hosts.length,
         keys_added: 0,
+        keys_skipped: 0,
+        key_only_backup: false,
         cas_added: 0,
         secrets_added: 0,
         known_hosts_added: 0,

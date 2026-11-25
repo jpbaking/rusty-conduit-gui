@@ -1,7 +1,7 @@
 //! Key-vault and write-only secret operations.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use conduit_core::{
     AppConfig, AuthMethod, KeyId, KeySource, SecretRef, SessionProfile, Timestamp, VaultKeyMeta,
@@ -11,7 +11,6 @@ use russh::keys::ssh_key::LineEnding;
 use russh::keys::PrivateKey;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use zeroize::Zeroize;
 
 use super::{
     key_id_from_record, secret_ref_from_record, usage_is_empty, AppController, AppError,
@@ -65,21 +64,6 @@ pub enum GenerateAlgorithm {
     EcdsaP256,
 }
 
-/// Result of writing a backup bundle.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct BackupSummary {
-    pub path: PathBuf,
-    pub key_count: usize,
-}
-
-/// Result of restoring a backup bundle.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ImportBackupResult {
-    pub imported: Vec<VaultKeyMeta>,
-    /// Keys already present, matched by fingerprint.
-    pub skipped: usize,
-}
-
 fn usage_of(config: &AppConfig, uses: impl Fn(&AuthMethod) -> bool) -> Usage {
     let hosts = config
         .hosts
@@ -130,14 +114,7 @@ pub(super) fn require_name(name: &str) -> Result<String, AppError> {
     Ok(name.to_owned())
 }
 
-fn source_label(source: KeySource) -> &'static str {
-    match source {
-        KeySource::Uploaded => "Uploaded",
-        KeySource::Pasted => "Pasted",
-        KeySource::Generated => "Generated",
-    }
-}
-
+/// Reads the source label a key-only backup recorded.
 fn parse_source(label: &str) -> KeySource {
     match label {
         "Pasted" => KeySource::Pasted,
@@ -394,62 +371,8 @@ impl AppController {
         Ok(DeleteResult { deleted: true, used_by, usage })
     }
 
-    /// Writes every vault key to a passphrase-encrypted bundle at `path` (owner-only).
-    pub fn export_backup(
-        &self,
-        path: &Path,
-        passphrase: SecretInput,
-    ) -> Result<BackupSummary, AppError> {
-        passphrase.require_non_empty("backup passphrase")?;
-        let metas = self.config_snapshot().keys;
-        let mut entries = Vec::with_capacity(metas.len());
-        {
-            let vault = self.vault_read();
-            if !vault.is_unlocked() {
-                return Err(VaultError::Locked.into());
-            }
-            for meta in &metas {
-                let material = vault.get_secret(&meta.id.to_string())?;
-                let text = std::str::from_utf8(&material)
-                    .map_err(|_| AppError::Invalid(format!("key {} is not valid text", meta.id)))?;
-                let (key, info) = conduit_vault::import_key(text, None)?;
-                entries.push(BackupKey::from_key(
-                    &meta.name,
-                    &key,
-                    &info,
-                    source_label(meta.source),
-                    meta.created_at.0,
-                ));
-            }
-        }
-        let bundle = conduit_vault::export_backup(&entries, passphrase.as_bytes(), self.argon());
-        for entry in &mut entries {
-            entry.private_key_openssh.zeroize();
-        }
-        write_private_file(path, &bundle?)?;
-        Ok(BackupSummary { path: path.to_path_buf(), key_count: metas.len() })
-    }
-
-    /// Restores keys from a bundle. Keys already present are skipped.
-    pub fn import_backup(
-        &self,
-        path: &Path,
-        passphrase: SecretInput,
-    ) -> Result<ImportBackupResult, AppError> {
-        if !self.vault_read().is_unlocked() {
-            return Err(VaultError::Locked.into());
-        }
-        let data = fs::read(path)
-            .map_err(|e| AppError::Io(format!("failed to read {}: {e}", path.display())))?;
-        let mut entries = conduit_vault::import_backup(&data, passphrase.as_bytes())?;
-        let result = self.restore_entries(&entries);
-        for entry in &mut entries {
-            entry.private_key_openssh.zeroize();
-        }
-        result
-    }
-
-    fn restore_entries(&self, entries: &[BackupKey]) -> Result<ImportBackupResult, AppError> {
+    /// Stores the keys of a key-only backup, returning how many were added and skipped.
+    pub(super) fn restore_entries(&self, entries: &[BackupKey]) -> Result<(usize, usize), AppError> {
         let mut imported = Vec::new();
         let mut skipped = 0;
         for entry in entries {
@@ -466,7 +389,7 @@ impl AppController {
                 Err(error) => return Err(error),
             }
         }
-        Ok(ImportBackupResult { imported, skipped })
+        Ok((imported.len(), skipped))
     }
 }
 
@@ -587,12 +510,6 @@ mod tests {
         ));
         assert!(locked(c.set_password_secret(None, SecretInput::new("p")).unwrap_err()));
         assert!(locked(c.delete_key(&meta.id, false).unwrap_err()));
-        assert!(locked(
-            c.export_backup(&dir.path().join("b"), SecretInput::new("p")).unwrap_err()
-        ));
-        assert!(locked(
-            c.import_backup(&dir.path().join("b"), SecretInput::new("p")).unwrap_err()
-        ));
     }
 
     #[tokio::test]
@@ -729,29 +646,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn keys_backup_round_trip_skips_duplicates() {
+    async fn an_old_key_only_backup_still_imports_and_skips_duplicates() {
         let source_dir = TempDir::new();
         let c = unlocked(&source_dir).await;
         let meta = c.generate_key("k", GenerateAlgorithm::Ed25519).unwrap();
+        // Written the way the removed "Encrypted key backup" flow wrote it.
+        let pem = c.vault_read().get_secret(&meta.id.to_string()).unwrap();
+        let (key, info) = conduit_vault::import_key(std::str::from_utf8(&pem).unwrap(), None).unwrap();
+        let entry = BackupKey::from_key("k", &key, &info, "Generated", meta.created_at.0);
+        let bundle =
+            conduit_vault::export_backup(&[entry], b"backup-pass", FAST_ARGON)
+                .unwrap();
         let path = source_dir.path().join("backup.bin");
-        let summary = c.export_backup(&path, SecretInput::new("backup-pass")).unwrap();
-        assert_eq!(summary.key_count, 1);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
-        }
+        fs::write(&path, bundle).unwrap();
 
         let target_dir = TempDir::new();
         let t = unlocked(&target_dir).await;
-        assert!(t.import_backup(&path, SecretInput::new("wrong")).is_err());
-        let restored = t.import_backup(&path, SecretInput::new("backup-pass")).unwrap();
-        assert_eq!(restored.imported.len(), 1);
-        assert_eq!(restored.imported[0].fingerprint_sha256, meta.fingerprint_sha256);
-        assert_eq!(restored.imported[0].source, KeySource::Generated);
+        assert!(matches!(t.import_config(&path, None, false), Err(AppError::Invalid(_))));
+        assert!(t.import_config(&path, Some(SecretInput::new("wrong")), false).is_err());
+        let restored = t.import_config(&path, Some(SecretInput::new("backup-pass")), false).unwrap();
+        assert!(restored.key_only_backup);
+        assert_eq!((restored.keys_added, restored.keys_skipped), (1, 0));
+        let keys = t.list_keys();
+        assert_eq!(keys[0].meta.fingerprint_sha256, meta.fingerprint_sha256);
+        assert_eq!(keys[0].meta.source, KeySource::Generated);
 
-        let again = t.import_backup(&path, SecretInput::new("backup-pass")).unwrap();
-        assert!(again.imported.is_empty());
-        assert_eq!(again.skipped, 1);
+        let again = t.import_config(&path, Some(SecretInput::new("backup-pass")), false).unwrap();
+        assert_eq!((again.keys_added, again.keys_skipped), (0, 1));
     }
 }

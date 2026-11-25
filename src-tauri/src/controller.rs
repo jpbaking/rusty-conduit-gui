@@ -8,6 +8,7 @@ pub mod export;
 pub mod keys;
 pub mod mitm_ca;
 pub mod parity;
+pub mod password;
 pub mod presets;
 pub mod sessions;
 #[cfg(test)]
@@ -25,7 +26,9 @@ use conduit_core::{
     KnownHostsStore, SecretRef, SessionProfile, StorageError, ValidateError,
 };
 use conduit_runtime::{HostKeyPrompt, ManagerConfig, RuntimeError, RuntimeEvent, SessionManager};
-use conduit_vault::{Argon2Params, KeyringBackend, OsKeyringBackend, Vault, VaultError};
+use conduit_vault::{
+    generate_dek, Argon2Params, KeyringBackend, OsKeyringBackend, Vault, VaultError, VaultHeader,
+};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
@@ -455,7 +458,7 @@ impl AppController {
         password: SecretInput,
         use_keyring: bool,
     ) -> Result<VaultStatus, AppError> {
-        password.require_non_empty("master password")?;
+        password::check_new_password(&password, "master password")?;
         let controller = self.clone();
         run_blocking(move || {
             let inner = &controller.inner;
@@ -479,6 +482,61 @@ impl AppController {
                 })?;
             }
             *controller.vault_write() = vault;
+            Ok(())
+        })
+        .await?;
+        self.inner.manager.on_vault_unlocked().await;
+        Ok(self.vault_status())
+    }
+
+    /// Changes the master password. The vault also gets a new data key, with every record
+    /// re-encrypted under it, so an old copy of `vault.bin` and the old password cannot open
+    /// anything saved afterwards. The keyring holds the data key, so it is updated too.
+    ///
+    /// The current password is checked against the vault file, so the vault need not be
+    /// unlocked first; it is unlocked afterwards.
+    pub async fn change_master_password(
+        &self,
+        current: SecretInput,
+        new: SecretInput,
+    ) -> Result<VaultStatus, AppError> {
+        password::check_new_password(&new, "new master password")?;
+        if current.as_bytes() == new.as_bytes() {
+            return Err(AppError::Invalid(
+                "the new master password is the same as the current one".into(),
+            ));
+        }
+        let controller = self.clone();
+        run_blocking(move || {
+            let inner = &controller.inner;
+            let _lifecycle = lock(&inner.vault_lifecycle);
+            if !inner.paths.vault.exists() {
+                return Err(AppError::VaultNotInitialized);
+            }
+            let header = controller
+                .vault_read()
+                .header()
+                .cloned()
+                .ok_or(AppError::VaultNotInitialized)?;
+            // Both key derivations are slow, so neither holds the vault lock sessions read.
+            let old = header.unwrap_dek(current.as_bytes())?;
+            let dek = generate_dek();
+            let header = VaultHeader::new(&dek, &inner.argon, new.as_bytes());
+            controller.vault_write().rekey(&old, dek, header)?;
+            controller.purge_retired_records();
+
+            if inner.paths.vault_keyring.exists() {
+                let stored = controller.vault_read().store_in_keyring(inner.keyring.as_ref());
+                if let Err(error) = stored {
+                    // The keyring still holds the old key, which opens nothing now.
+                    let _ = controller.vault_read().remove_from_keyring(inner.keyring.as_ref());
+                    let _ = fs::remove_file(&inner.paths.vault_keyring);
+                    return Err(AppError::Io(format!(
+                        "the master password was changed, but the OS keyring could not be \
+                         updated ({error}), so unlocking with the keyring was turned off"
+                    )));
+                }
+            }
             Ok(())
         })
         .await?;
@@ -604,7 +662,7 @@ mod tests {
     async fn create_lock_and_unlock_with_password() {
         let dir = TempDir::new();
         let c = controller(&dir);
-        let status = c.create_vault(SecretInput::new("master"), false).await.unwrap();
+        let status = c.create_vault(SecretInput::new(TEST_MASTER), false).await.unwrap();
         assert_eq!(status, VaultStatus { initialized: true, unlocked: true, keyring: false });
 
         assert!(!c.lock_vault().unlocked);
@@ -614,7 +672,7 @@ mod tests {
         ));
         assert!(!c.vault_status().unlocked);
         assert!(c
-            .unlock_vault_with_password(SecretInput::new("master"))
+            .unlock_vault_with_password(SecretInput::new(TEST_MASTER))
             .await
             .unwrap()
             .unlocked);
@@ -625,7 +683,7 @@ mod tests {
         let dir = TempDir::new();
         let keyring = Arc::new(conduit_vault::MemoryKeyringBackend::new());
         let c = controller_with_keyring(&dir, keyring.clone());
-        c.create_vault(SecretInput::new("master"), true).await.unwrap();
+        c.create_vault(SecretInput::new(TEST_MASTER), true).await.unwrap();
         drop(c);
 
         let c = controller_with_keyring(&dir, keyring);
@@ -638,7 +696,7 @@ mod tests {
         let dir = TempDir::new();
         let keyring = Arc::new(conduit_vault::MemoryKeyringBackend::new());
         let c = controller_with_keyring(&dir, keyring.clone());
-        c.create_vault(SecretInput::new("master"), false).await.unwrap();
+        c.create_vault(SecretInput::new(TEST_MASTER), false).await.unwrap();
         assert!(!c.vault_status().keyring);
 
         assert!(c.set_vault_keyring(true).await.unwrap().keyring);
@@ -653,18 +711,96 @@ mod tests {
             c.unlock_vault_with_keyring().await,
             Err(AppError::Vault(VaultError::KeyringEntryMissing { .. }))
         ));
-        assert!(c.unlock_vault_with_password(SecretInput::new("master")).await.unwrap().unlocked);
+        assert!(c.unlock_vault_with_password(SecretInput::new(TEST_MASTER)).await.unwrap().unlocked);
+    }
+
+    const NEW_MASTER: &str = "New-Master-Pass-2";
+
+    #[tokio::test]
+    async fn changing_the_master_password_rekeys_the_vault_and_the_keyring() {
+        let dir = TempDir::new();
+        let keyring = Arc::new(conduit_vault::MemoryKeyringBackend::new());
+        let c = controller_with_keyring(&dir, keyring.clone());
+        c.create_vault(SecretInput::new(TEST_MASTER), true).await.unwrap();
+        let secret = c.set_password_secret(None, SecretInput::new("hop-secret")).unwrap();
+        let old_file = fs::read(dir.path().join("vault.bin")).unwrap();
+        c.lock_vault();
+
+        let change = |current: &str, new: &str| {
+            c.change_master_password(SecretInput::new(current), SecretInput::new(new))
+        };
+        assert!(matches!(change("Wrong-Pass-9", NEW_MASTER).await, Err(AppError::Vault(VaultError::UnlockFailed))));
+        assert!(matches!(change(TEST_MASTER, "weak").await, Err(AppError::Invalid(_))));
+        assert!(matches!(change(TEST_MASTER, TEST_MASTER).await, Err(AppError::Invalid(_))));
+        assert_eq!(fs::read(dir.path().join("vault.bin")).unwrap(), old_file, "a refused change writes nothing");
+
+        // The vault need not be unlocked first, and is unlocked afterwards.
+        assert!(change(TEST_MASTER, NEW_MASTER).await.unwrap().unlocked);
+        assert_eq!(&*c.vault_read().get_secret(&secret.secret_ref.to_string()).unwrap(), b"hop-secret");
+        drop(c);
+
+        let c = controller_with_keyring(&dir, keyring);
+        assert!(matches!(
+            c.unlock_vault_with_password(SecretInput::new(TEST_MASTER)).await,
+            Err(AppError::Vault(VaultError::UnlockFailed))
+        ));
+        // The keyring was given the new data key.
+        assert!(c.unlock_vault_with_keyring().await.unwrap().unlocked);
+        assert_eq!(&*c.vault_read().get_secret(&secret.secret_ref.to_string()).unwrap(), b"hop-secret");
+        c.lock_vault();
+        assert!(c.unlock_vault_with_password(SecretInput::new(NEW_MASTER)).await.unwrap().unlocked);
+    }
+
+    /// A keyring that stops accepting writes once `broken` is set.
+    #[derive(Default)]
+    struct BreakableKeyring {
+        inner: conduit_vault::MemoryKeyringBackend,
+        broken: std::sync::atomic::AtomicBool,
+    }
+
+    impl KeyringBackend for BreakableKeyring {
+        fn get_dek(&self, id: &str) -> Result<conduit_vault::Dek, VaultError> {
+            self.inner.get_dek(id)
+        }
+        fn set_dek(&self, id: &str, dek: &conduit_vault::Dek) -> Result<(), VaultError> {
+            if self.broken.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(VaultError::KeyringUnavailable { reason: "test".into() });
+            }
+            self.inner.set_dek(id, dek)
+        }
+        fn delete_dek(&self, id: &str) -> Result<(), VaultError> {
+            self.inner.delete_dek(id)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_keyring_that_cannot_be_updated_is_turned_off() {
+        let dir = TempDir::new();
+        let keyring = Arc::new(BreakableKeyring::default());
+        let c = controller_with_keyring(&dir, keyring.clone());
+        c.create_vault(SecretInput::new(TEST_MASTER), true).await.unwrap();
+        keyring.broken.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let result = c
+            .change_master_password(SecretInput::new(TEST_MASTER), SecretInput::new(NEW_MASTER))
+            .await;
+        assert!(matches!(result, Err(AppError::Io(ref m)) if m.contains("keyring was turned off")));
+        // The new password works, and no stale key is left to unlock with.
+        assert!(!c.vault_status().keyring);
+        c.lock_vault();
+        assert!(c.unlock_vault_with_keyring().await.is_err());
+        assert!(c.unlock_vault_with_password(SecretInput::new(NEW_MASTER)).await.unwrap().unlocked);
     }
 
     #[tokio::test]
     async fn unlock_deletes_retired_mitm_passphrase_records() {
         let dir = TempDir::new();
         let c = controller(&dir);
-        c.create_vault(SecretInput::new("master"), false).await.unwrap();
+        c.create_vault(SecretInput::new(TEST_MASTER), false).await.unwrap();
         let retired = c.vault_write().put_secret(keys::RETIRED_PASSPHRASE_RECORD, b"old").unwrap();
         let kept = c.set_password_secret(None, SecretInput::new("pw")).unwrap().secret_ref;
         c.lock_vault();
-        c.unlock_vault_with_password(SecretInput::new("master")).await.unwrap();
+        c.unlock_vault_with_password(SecretInput::new(TEST_MASTER)).await.unwrap();
         assert!(c.record_type(&retired).is_none());
         assert_eq!(c.record_type(&kept.to_string()).as_deref(), Some(keys::PASSWORD_RECORD));
     }
@@ -673,7 +809,7 @@ mod tests {
     async fn missing_keyring_entry_keeps_vault_intact() {
         let dir = TempDir::new();
         let c = controller(&dir);
-        c.create_vault(SecretInput::new("master"), false).await.unwrap();
+        c.create_vault(SecretInput::new(TEST_MASTER), false).await.unwrap();
         let before = fs::read(dir.path().join("vault.bin")).unwrap();
         c.lock_vault();
         assert!(matches!(
@@ -687,10 +823,10 @@ mod tests {
     async fn create_refuses_to_overwrite_existing_vault() {
         let dir = TempDir::new();
         let c = controller(&dir);
-        c.create_vault(SecretInput::new("master"), false).await.unwrap();
+        c.create_vault(SecretInput::new(TEST_MASTER), false).await.unwrap();
         let before = fs::read(dir.path().join("vault.bin")).unwrap();
         assert!(matches!(
-            c.create_vault(SecretInput::new("other"), false).await,
+            c.create_vault(SecretInput::new("Other-Pass-2!"), false).await,
             Err(AppError::VaultExists)
         ));
         assert_eq!(before, fs::read(dir.path().join("vault.bin")).unwrap());
@@ -753,7 +889,7 @@ mod tests {
         let dir = TempDir::new();
         let data = dir.path().join("nested");
         let c = AppController::open(&data, test_options()).unwrap();
-        c.create_vault(SecretInput::new("master"), false).await.unwrap();
+        c.create_vault(SecretInput::new(TEST_MASTER), false).await.unwrap();
         c.mutate_config(|_| Ok(())).unwrap();
         let mode = |p: PathBuf| fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(data.clone()), 0o700);

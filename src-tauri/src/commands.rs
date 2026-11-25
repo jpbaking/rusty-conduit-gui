@@ -18,9 +18,7 @@ use tauri::{AppHandle, Manager, Runtime, State};
 use uuid::Uuid;
 
 use crate::controller::export::{ExportSummary, ImportSummary};
-use crate::controller::keys::{
-    BackupSummary, DeleteResult, GenerateAlgorithm, ImportBackupResult, KeyView,
-};
+use crate::controller::keys::{DeleteResult, GenerateAlgorithm, KeyView};
 use crate::controller::mitm_ca::{CaView, MitmCaUpload};
 use crate::controller::parity::{self, FilterMode, FilterTestResult, PortConflictReport};
 use crate::controller::sessions::{ChainTestResult, SessionView, StateSummary};
@@ -51,6 +49,15 @@ pub async fn vault_status(c: Ctl<'_>) -> CmdResult<VaultStatus> {
 #[tauri::command]
 pub async fn create_vault(c: Ctl<'_>, password: SecretInput, use_keyring: bool) -> CmdResult<VaultStatus> {
     c.create_vault(password, use_keyring).await
+}
+
+#[tauri::command]
+pub async fn change_master_password(
+    c: Ctl<'_>,
+    current: SecretInput,
+    new: SecretInput,
+) -> CmdResult<VaultStatus> {
+    c.change_master_password(current, new).await
 }
 
 #[tauri::command]
@@ -149,20 +156,6 @@ pub async fn list_mitm_cas(c: Ctl<'_>) -> CmdResult<Vec<CaView>> {
 #[tauri::command]
 pub async fn delete_secret(c: Ctl<'_>, secret: SecretRef, force: Option<bool>) -> CmdResult<DeleteResult> {
     blocking(&c, move |c| c.delete_secret(&secret, force.unwrap_or(false))).await
-}
-
-#[tauri::command]
-pub async fn export_backup(c: Ctl<'_>, path: PathBuf, passphrase: SecretInput) -> CmdResult<BackupSummary> {
-    blocking(&c, move |c| c.export_backup(&path, passphrase)).await
-}
-
-#[tauri::command]
-pub async fn import_backup(
-    c: Ctl<'_>,
-    path: PathBuf,
-    passphrase: SecretInput,
-) -> CmdResult<ImportBackupResult> {
-    blocking(&c, move |c| c.import_backup(&path, passphrase)).await
 }
 
 // Sessions and hosts.
@@ -472,6 +465,7 @@ macro_rules! ipc_handler {
             $crate::commands::unlock_vault_keyring,
             $crate::commands::set_vault_keyring,
             $crate::commands::lock_vault,
+            $crate::commands::change_master_password,
             $crate::commands::import_key_pem,
             $crate::commands::generate_key,
             $crate::commands::rename_key,
@@ -483,8 +477,6 @@ macro_rules! ipc_handler {
             $crate::commands::delete_mitm_ca,
             $crate::commands::list_mitm_cas,
             $crate::commands::delete_secret,
-            $crate::commands::export_backup,
-            $crate::commands::import_backup,
             $crate::commands::get_state_summary,
             $crate::commands::list_sessions,
             $crate::commands::upsert_session,
@@ -543,20 +535,21 @@ mod tests {
     use super::*;
     use crate::controller::test_support::{profile, test_options, TempDir};
 
-    const MASTER: &str = "canary-master-password-91c2";
+    const MASTER: &str = "Canary-Master-Password-91c2";
+    const NEW_MASTER: &str = "Canary-New-Master-Password-5b3e";
     const PASSWORD: &str = "canary-hop-password-44ab";
     /// Protects the uploaded PKCS#12 CA.
     const MITM: &str = "canary-mitm-passphrase-0d7e";
     const KEY_PASS: &str = "canary-key-passphrase-b18f";
-    const BACKUP_PASS: &str = "canary-backup-passphrase-6e30";
+    const BACKUP_PASS: &str = "Canary-Backup-Passphrase-6e30";
 
     /// Every registered command. The test fails if one is added without being exercised.
     const ALL_COMMANDS: &[&str] = &[
         "vault_status", "create_vault", "unlock_vault", "unlock_vault_keyring", "set_vault_keyring", "lock_vault",
+        "change_master_password",
         "import_key_pem", "generate_key", "rename_key", "delete_key", "list_keys",
         "set_password_secret", "import_mitm_ca", "rename_mitm_ca", "delete_mitm_ca", "list_mitm_cas",
-        "delete_secret", "export_backup",
-        "import_backup", "get_state_summary", "list_sessions", "upsert_session", "delete_session", "duplicate_session",
+        "delete_secret", "get_state_summary", "list_sessions", "upsert_session", "delete_session", "duplicate_session",
         "list_hosts", "upsert_host", "delete_host", "promote_hop_to_host", "start_session",
         "list_forward_presets", "upsert_forward_preset", "delete_forward_preset",
         "restore_forward_presets",
@@ -650,7 +643,7 @@ mod tests {
     /// Fragments that must never leave Rust: whole secrets and each base64 line of the keys.
     fn forbidden(pems: &[&str]) -> Vec<String> {
         let mut all: Vec<String> =
-            [MASTER, PASSWORD, MITM, KEY_PASS, BACKUP_PASS].map(String::from).to_vec();
+            [MASTER, NEW_MASTER, PASSWORD, MITM, KEY_PASS, BACKUP_PASS].map(String::from).to_vec();
         all.push("PRIVATE KEY".into());
         for pem in pems {
             all.extend(
@@ -865,12 +858,16 @@ mod tests {
         ipc.err("resolve_close", json!({ "choice": "unknown" }));
         assert!(ipc.window.get_webview_window("main").is_some(), "cancel keeps the window");
 
-        // Backup round trip.
-        let backup = dir.path().join("backup.bundle");
-        let path = backup.to_str().unwrap();
-        assert_eq!(ipc.ok("export_backup", json!({ "path": path, "passphrase": BACKUP_PASS }))["key_count"], 3);
-        ipc.err("import_backup", json!({ "path": path, "passphrase": PASSWORD }));
-        assert_eq!(ipc.ok("import_backup", json!({ "path": path, "passphrase": BACKUP_PASS }))["skipped"], 3);
+        // Master password change: the current password is checked, the new one must be strong,
+        // and the keyring is given the new data key.
+        let change = |current: &str, new: &str| json!({ "current": current, "new": new });
+        assert_eq!(ipc.err("change_master_password", change(PASSWORD, NEW_MASTER))["code"], "unlock_failed");
+        assert_eq!(ipc.err("change_master_password", change(MASTER, "weak"))["code"], "invalid");
+        assert_eq!(ipc.ok("change_master_password", change(MASTER, NEW_MASTER))["unlocked"], true);
+        ipc.ok("lock_vault", json!({}));
+        assert_eq!(ipc.err("unlock_vault", json!({ "password": MASTER }))["code"], "unlock_failed");
+        assert_eq!(ipc.ok("unlock_vault_keyring", json!({}))["unlocked"], true);
+        assert_eq!(ipc.ok("list_keys", json!({})).as_array().unwrap().len(), 3);
 
         // Session-editor helpers.
         let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -950,7 +947,7 @@ mod tests {
         assert_eq!(ipc.ok("list_mitm_cas", json!({})), json!([]));
 
         // Read the files before the session is deleted, while they hold the most references.
-        let on_disk: Vec<(String, Vec<u8>)> = ["config.json", "vault.bin", "backup.bundle", "config-plain.json", "config-bundle.json"]
+        let on_disk: Vec<(String, Vec<u8>)> = ["config.json", "vault.bin", "config-plain.json", "config-bundle.json"]
             .iter()
             .map(|name| (name.to_string(), std::fs::read(dir.path().join(name)).unwrap()))
             .collect();

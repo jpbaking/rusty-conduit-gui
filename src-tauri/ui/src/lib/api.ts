@@ -6,7 +6,6 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AppErrorCode,
   AutostartStatus,
-  BackupSummary,
   ChainTestResult,
   ClipboardFallbackPayload,
   CloseChoice,
@@ -18,7 +17,6 @@ import type {
   HostKeyEntry,
   ForwardPreset,
   HostProfile,
-  ImportBackupResult,
   ImportSummary,
   KeyId,
   KeySource,
@@ -97,7 +95,9 @@ export const api = {
   unlockVault: (password: string) => call<VaultStatus>("unlock_vault", { password }),
   unlockVaultKeyring: () => call<VaultStatus>("unlock_vault_keyring"),
   setVaultKeyring: (enabled: boolean) => call<VaultStatus>("set_vault_keyring", { enabled }),
-  lockVault: () => call<VaultStatus>("lock_vault"),
+  /** Checks `current` against the vault file, so the vault need not be unlocked. */
+  changeMasterPassword: (current: string, next: string) =>
+    call<VaultStatus>("change_master_password", { current, new: next }),
 
   // Keys and write-only secrets.
   importKeyPem: (name: string, pem: string, passphrase: string | null, source: KeySource) =>
@@ -111,10 +111,6 @@ export const api = {
     call<SecretMeta>("set_password_secret", { existing, password }),
   deleteSecret: (secret: SecretRef, force = false) =>
     call<DeleteResult>("delete_secret", { secret, force }),
-  exportBackup: (path: string, passphrase: string) =>
-    call<BackupSummary>("export_backup", { path, passphrase }),
-  importBackup: (path: string, passphrase: string) =>
-    call<ImportBackupResult>("import_backup", { path, passphrase }),
 
   // MITM CAs.
   importMitmCa: (name: string, upload: MitmCaUpload, passphrase: string | null) =>

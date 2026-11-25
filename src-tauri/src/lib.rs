@@ -106,6 +106,9 @@ pub fn run() {
                 .arg(platform::FLAG_TRAY)
                 .build(),
         )
+        // Native open and save dialogs for file paths. Only those two are allowed, in
+        // `capabilities/default.json`; the plugin's file-system access is not granted.
+        .plugin(tauri_plugin_dialog::init())
         .manage(ShellState::default())
         .on_window_event(window::on_window_event)
         .invoke_handler(commands::ipc_handler!())

@@ -18,6 +18,8 @@ use uuid::Uuid;
 use super::{AppController, ControllerOptions};
 
 pub const SERVER_PASSWORD: &str = "server-password-canary-7f3a";
+/// Meets the password policy, so it can create a vault.
+pub const TEST_MASTER: &str = "Test-Master-Pass-1";
 
 pub const FAST_ARGON: Argon2Params = Argon2Params {
     memory_kib: 8 * 1024,
@@ -70,7 +72,7 @@ pub fn controller_with_keyring(
 /// An unlocked controller.
 pub async fn unlocked(dir: &TempDir) -> AppController {
     let c = controller(dir);
-    c.create_vault(super::SecretInput::new("master"), false).await.unwrap();
+    c.create_vault(super::SecretInput::new(TEST_MASTER), false).await.unwrap();
     c
 }
 

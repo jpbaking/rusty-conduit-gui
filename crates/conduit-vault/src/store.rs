@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 use uuid::Uuid;
 
-use crate::crypto::{decrypt_record, encrypt_record, generate_dek, VaultHeader};
+use crate::crypto::{decrypt_record, encrypt_record, generate_dek, Dek, VaultHeader};
 use crate::keyring::KeyringBackend;
 use crate::VaultError;
 
@@ -248,6 +248,38 @@ impl Vault {
             Ok(()) | Err(VaultError::KeyringEntryMissing { .. }) => Ok(()),
             Err(error) => Err(error),
         }
+    }
+
+    /// The header holding the wrapped DEK, or `None` for a vault body that has none.
+    pub fn header(&self) -> Option<&VaultHeader> {
+        self.header.as_ref()
+    }
+
+    /// Replaces the DEK: every record is re-encrypted from `old` to `new`, and `header`, which
+    /// must wrap `new`, replaces the current one, and the result is saved. The vault is unlocked with
+    /// `new` afterwards. On failure nothing changes, in memory or on disk.
+    ///
+    /// The slow part, deriving keys from passwords, is the caller's, so it can run without
+    /// holding a lock on this vault.
+    pub fn rekey(&mut self, old: &Dek, new: Dek, header: VaultHeader) -> Result<(), VaultError> {
+        header.validate()?;
+        let mut records = Vec::with_capacity(self.records.len());
+        for record in &self.records {
+            let plaintext = record.decrypt(old)?;
+            records.push(Record::encrypt(&new, &record.id, &record.r#type, &plaintext));
+        }
+        let previous_header = self.header.replace(header);
+        let previous_records = std::mem::replace(&mut self.records, records);
+        if let Err(error) = self.save() {
+            self.header = previous_header;
+            self.records = previous_records;
+            return Err(error);
+        }
+        if let Some(dek) = self.dek.as_mut() {
+            dek.zeroize();
+        }
+        self.dek = Some(new);
+        Ok(())
     }
 
     /// Zeroize the in-memory DEK and lock the vault.
@@ -555,6 +587,47 @@ mod tests {
         vault.unlock_with_password(b"pw").unwrap();
         let err = vault.get_secret(&id).unwrap_err();
         assert!(matches!(err, VaultError::UnlockFailed));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rekey_replaces_the_key_and_password_and_keeps_every_record() {
+        let path = tmp_vault("rekey");
+        let mut vault = Vault::create_with_password(&path, b"old-pw", Argon2Params::FAST).unwrap();
+        let a = vault.put_secret("password", b"alpha").unwrap();
+        let b = vault.put_secret("key", b"bravo").unwrap();
+
+        let old = vault.header().unwrap().unwrap_dek(b"old-pw").unwrap();
+        let new = generate_dek();
+        let header = VaultHeader::new(&new, &Argon2Params::FAST, b"new-pw");
+        vault.rekey(&old, new, header).unwrap();
+        assert!(vault.is_unlocked());
+        assert_eq!(&*vault.get_secret(&a).unwrap(), b"alpha");
+
+        let mut reopened = Vault::open_locked(&path).unwrap();
+        assert!(matches!(reopened.unlock_with_password(b"old-pw"), Err(VaultError::UnlockFailed)));
+        reopened.unlock_with_password(b"new-pw").unwrap();
+        assert_eq!(&*reopened.get_secret(&a).unwrap(), b"alpha");
+        assert_eq!(&*reopened.get_secret(&b).unwrap(), b"bravo");
+        // The old key no longer opens the records.
+        let ct = BASE64.decode(reopened.records[0].ciphertext.as_bytes()).unwrap();
+        let record = &reopened.records[0];
+        assert!(decrypt_record(&old, record.id.as_bytes(), record.r#type.as_bytes(), &ct).is_err());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rekey_with_the_wrong_old_key_changes_nothing() {
+        let path = tmp_vault("rekey-wrong");
+        let mut vault = Vault::create_with_password(&path, b"pw", Argon2Params::FAST).unwrap();
+        let id = vault.put_secret("password", b"alpha").unwrap();
+        let before = fs::read(&path).unwrap();
+        let wrong = generate_dek();
+        let new = generate_dek();
+        let header = VaultHeader::new(&new, &Argon2Params::FAST, b"new");
+        assert!(vault.rekey(&wrong, new, header).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(&*vault.get_secret(&id).unwrap(), b"alpha");
         let _ = fs::remove_file(&path);
     }
 }

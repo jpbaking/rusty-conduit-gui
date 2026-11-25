@@ -1,5 +1,6 @@
 <script lang="ts">
   import { tooltip } from "../tooltip";
+  import BrowseButton from "./BrowseButton.svelte";
   import { api, errorMessage } from "../api";
   import { moved } from "../chain";
   import { store } from "../stores.svelte";
@@ -313,19 +314,23 @@
     {/if}
     {#if importing}
       <form class="modal-form" onsubmit={importPin}>
-        <label class="field">
-          OpenSSH known_hosts file
-          <input
-            bind:value={importPath}
-            placeholder="/path/to/known_hosts"
-            autocomplete="off"
-            spellcheck="false"
-            aria-describedby="{uid}-import-help"
-          />
-        </label>
+        <div class="field">
+          <label for="{uid}-import-path">OpenSSH known_hosts file</label>
+          <div class="inline-form">
+            <input
+              id="{uid}-import-path"
+              bind:value={importPath}
+              placeholder="/path/to/known_hosts"
+              autocomplete="off"
+              spellcheck="false"
+              aria-describedby="{uid}-import-help"
+            />
+            <BrowseButton mode="open" title="Choose a known_hosts file" onPick={(path) => (importPath = path)} />
+          </div>
+        </div>
         <p id="{uid}-import-help" class="muted">
           Imports the key listed for {host.host || "this host"}:{host.port} and pins it for this hop,
-          replacing any current pin. Only the file you enter is read; <code>~/.ssh/known_hosts</code>
+          replacing any current pin. Only the file you choose is read; <code>~/.ssh/known_hosts</code>
           is never read automatically.
         </p>
         {#if importError}<p class="reason" role="alert">{importError}</p>{/if}

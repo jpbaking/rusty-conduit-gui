@@ -21,11 +21,11 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-const MASTER: &str = "leakscan-master-password-5b1e";
+const MASTER: &str = "Leakscan-Master-Password-5b1e";
 const PASSWORD: &str = "leakscan-hop-password-c7d2";
 const MITM: &str = "leakscan-mitm-passphrase-19fa";
 const KEY_PASS: &str = "leakscan-key-passphrase-e04c";
-const EXPORT_PASS: &str = "leakscan-export-passphrase-a83b";
+const EXPORT_PASS: &str = "Leakscan-Export-Passphrase-a83b";
 
 const FAST_ARGON: Argon2Params = Argon2Params {
     memory_kib: 8 * 1024,

@@ -102,16 +102,6 @@ export interface DeleteResult {
   usage: Usage;
 }
 
-export interface BackupSummary {
-  path: string;
-  key_count: number;
-}
-
-export interface ImportBackupResult {
-  imported: VaultKeyMeta[];
-  skipped: number;
-}
-
 // Hosts.
 
 export interface HostKeyPin {
@@ -433,6 +423,8 @@ export interface OpenSshBinaryInfo {
 export interface ExportSummary {
   path: string;
   encrypted: boolean;
+  /** Vault secrets were included. Always encrypted when so. */
+  with_secrets: boolean;
   session_count: number;
   host_count: number;
   key_count: number;
@@ -445,6 +437,10 @@ export interface ExportSummary {
 
 export interface ImportSummary {
   encrypted: boolean;
+  /** The file carried vault secrets, which were restored into the vault. */
+  with_secrets: boolean;
+  /** The file was an older key-only backup: only `keys_added` and `keys_skipped` apply. */
+  key_only_backup: boolean;
   sessions_added: number;
   sessions_updated: number;
   sessions_skipped: number;
@@ -455,6 +451,8 @@ export interface ImportSummary {
   presets_updated: number;
   presets_skipped: number;
   keys_added: number;
+  /** Keys from a key-only backup that the vault already holds. */
+  keys_skipped: number;
   cas_added: number;
   secrets_added: number;
   known_hosts_added: number;

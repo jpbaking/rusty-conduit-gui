@@ -964,7 +964,7 @@ mod tests {
         c.start_session(session.id).await.unwrap();
         wait_for_state(&c, session.id, SessionState::Locked).await;
 
-        c.unlock_vault_with_password(SecretInput::new("master")).await.unwrap();
+        c.unlock_vault_with_password(SecretInput::new(TEST_MASTER)).await.unwrap();
         wait_for_state(&c, session.id, SessionState::Connected).await;
         c.stop_all().await;
     }

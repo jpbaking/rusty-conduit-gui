@@ -132,6 +132,8 @@ class AppStore {
   clipboardUrl = $state<string | null>(null);
   closePrompt = $state<ClosePrompt | null>(null);
   unlockRequested = $state(false);
+  /** Waits for the vault to open; see `runUnlocked`. */
+  #afterUnlock: (() => void) | null = null;
   logsOpen = $state(false);
   notice = $state<string | null>(null);
 
@@ -269,7 +271,12 @@ class AppStore {
   setVault(status: VaultStatus): void {
     this.vault = status;
     this.vaultKnown = true;
-    if (status.unlocked) this.unlockRequested = false;
+    if (status.unlocked) {
+      this.unlockRequested = false;
+      const pending = this.#afterUnlock;
+      this.#afterUnlock = null;
+      if (pending) queueMicrotask(pending);
+    }
   }
 
   requestUnlock(): void {
@@ -278,17 +285,20 @@ class AppStore {
 
   dismissUnlock(): void {
     this.unlockRequested = false;
+    this.#afterUnlock = null;
   }
 
-  /** Locking is deliberate, so it does not immediately reopen the unlock prompt. */
-  async lockVault(): Promise<void> {
-    this.unlockRequested = false;
-    try {
-      this.setVault(await api.lockVault());
-      await this.refresh();
-    } catch (error) {
-      this.notice = errorMessage(error);
+  /**
+   * Runs `action` now if the vault is unlocked. Otherwise asks to unlock, then runs it once the
+   * vault opens; dismissing the prompt drops it.
+   */
+  runUnlocked(action: () => void): void {
+    if (this.vault.unlocked) {
+      action();
+      return;
     }
+    this.#afterUnlock = action;
+    this.requestUnlock();
   }
 
   /** Names of unsaved edits that would lose this key if it is deleted. */

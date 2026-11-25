@@ -1,6 +1,7 @@
 <script lang="ts">
   import { untrack } from "svelte";
   import { opensshCheck, type Fallback } from "../opensshCheck.svelte";
+  import BrowseButton from "./BrowseButton.svelte";
   import ModalDialog from "./ModalDialog.svelte";
 
   interface Props {
@@ -62,6 +63,7 @@
     <label for={`${uid}-program`}>Try another ssh program <small class="muted">a name on PATH or a full path</small></label>
     <div class="inline-form">
       <input id={`${uid}-program`} bind:value={program} spellcheck="false" placeholder="ssh" />
+      <BrowseButton mode="open" title="Choose the ssh program" onPick={(path) => (program = path)} />
       <button type="submit" disabled={checking}>{checking ? "Checking…" : "Check and use"}</button>
     </div>
   </form>
