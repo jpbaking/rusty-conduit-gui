@@ -1,23 +1,44 @@
-# Rusty Conduit SSH GUI — Master Plan
+# Rusty Conduit GUI — Master Plan
 
-> **Status:** Draft v1 (Architecture & Delivery Plan)  
-> **Target Core:** `../rusty-conduit-ssh` (`v1.1.0`, BSD-3-Clause, Rust library + CLI)  
-> **Platforms:** Windows (x64/arm64), macOS (Universal Apple Silicon + Intel), Linux (x64/arm64 — XFCE/X11 & Wayland)
+> **Status:** Draft v2 (Unification Plan). Supersedes the v1 "Rusty Conduit SSH GUI" plan, whose phases 0–6 shipped as `v0.1.0-beta.1`…`beta.5`, and the unimplemented `rusty-conduit-switch-gui` draft.
+> **App:** **Rusty Conduit GUI**, repository `rusty-conduit-gui` (renamed from `rusty-conduit-ssh-gui`; see §3).
+> **Engine:** [`rusty-conduit-engine`](../rusty-conduit-engine/docs/MASTER-PLAN.md) (shared by `rusty-conduit`, `rusty-conduit-ssh`, `rusty-conduit-switch`), replacing the direct dependency on `rusty-conduit-ssh`.
+> **Work branch:** `feat/one-gui`. Engine work happens on `feat/one-engine` in the three CLI repositories.
+> **Platforms:** Windows (x64/arm64), macOS (Universal Apple Silicon + Intel), Linux (x64/arm64 — XFCE/X11 & Wayland, KDE, GNOME, wlroots).
 
 ---
 
 ## 1. Vision & Core Requirements
 
-Build a lightweight, cross-platform desktop **system tray application** and **Manage Window** that lets users save, run, autostart, and auto-reconnect multiple concurrent sessions of `../rusty-conduit-ssh/`.
+One lightweight, cross-platform **system tray app** and **Manage Window** for the whole Rusty Conduit family. Users no longer pick between a plain proxy, an SSH proxy, and an Auto Switch proxy, or run several tray apps chained over loopback: they build **Proxies** whose traffic goes direct, through **SSH Tunnels**, through other upstream proxies, or wherever **Auto Switch rules** send it.
 
-### Non-Negotiable Requirements
+### 1.1 Concepts
 
-1. **Full Option Coverage:** Configure **every** `rusty-conduit-ssh` option per session from the Manage Window — forward HTTP/HTTPS & SOCKS4/4a/5 listeners, single-port multiplexing, reverse proxy (`-R`), forward/reverse allow/block filters, opt-in HTTPS MITM (PEM & PKCS#12), keepalive & reconnect backoff, logging, and advanced SSH options.
-2. **First-Class Multi-Hop Jumphosts:** Convenient visual chain builder (`Local → Jump 1 → Jump 2 → … → Target`) with reusable Host Profiles, per-hop port/user/auth/host-key settings, and step-by-step connection testing.
-3. **Saved Password Auth (Targets & Jumphosts):** Support unattended password and keyboard-interactive authentication for both targets and intermediate jumphosts — including at login autostart and during auto-reconnect without any TTY — while preventing server account lockouts on bad credentials.
-4. **Zero `~/.ssh/config` (and `~/.ssh/known_hosts`) Dependence:** Never read, write, or implicitly reference `~/.ssh/config`, `/etc/ssh/ssh_config`, `~/.ssh/id_*`, or `~/.ssh/known_hosts`. All connection metadata, keys, and host-key pins are strictly app-managed.
-5. **Embedded Isolated `ssh-agent`:** In-app isolated key store and per-hop/per-session scoped agent so key-based authentication works across targets and jumphosts without reading or leaking the user's ambient `SSH_AUTH_SOCK`. No agent is ever forwarded to a remote host (see §3.5).
-6. **True Cross-Platform Support:** First-class support for Windows, macOS, and Linux — explicitly covering **XFCE (X11 & Wayland)**, KDE Plasma, GNOME (with/without AppIndicator), and wlroots compositors (Sway/Hyprland/Waybar).
+| Concept | What it is | Covers |
+| :--- | :--- | :--- |
+| **Proxy** | Local HTTP/HTTPS + SOCKS4/4a/5 listeners (optionally one multiplexed port) with a routing table, global filter, optional MITM, and logging. | `rusty-conduit`, `rusty-conduit-switch` |
+| **Tunnel** | A saved SSH connection (multi-hop jump chain, auth, host-key pins, keepalive/reconnect, `russh` or OpenSSH engine) plus its reverse proxy (`-R`) and fixed `-L`/`-R` port forwards. | `rusty-conduit-ssh` |
+| **Upstream Profile** | A named target a Proxy routes to: built-in `direct` / `block`, `http`, `https`, `socks5`, `socks4a`, `composite`, or **`tunnel`** (one of the user's Tunnels). | `rusty-conduit-switch` profiles + SSH |
+| **Vault** | `vault.bin`: SSH keys, hop passwords, upstream proxy passwords, MITM CAs. | All |
+
+The three CLIs become three presets of the same thing:
+
+```text
+rusty-conduit         = Proxy  → default: direct
+rusty-conduit-ssh     = Proxy  → default: tunnel "Prod Bastion"     (+ the Tunnel's reverse proxy)
+rusty-conduit-switch  = Proxy  → rules → [corp, tunnel "Bastion", direct]
+```
+
+### 1.2 Non-Negotiable Requirements
+
+1. **Full option parity with all three CLIs.** Every `rusty-conduit`, `rusty-conduit-ssh`, and `rusty-conduit-switch` option is configurable from the Manage Window. Because the GUI and the CLIs run the same engine, parity is structural, not re-implemented.
+2. **No regression for existing users.** Sessions, keys, CAs, host-key pins, presets, and settings from `v0.1.0` betas load unchanged after the upgrade and rename (§3.3, §6.4); each old session keeps its ports and behavior.
+3. **Everything from v1 stays:** first-class multi-hop jump chains, saved password and keyboard-interactive auth with lockout protection, zero `~/.ssh` dependence (config, keys, `known_hosts`, `SSH_AUTH_SOCK`), no agent forwarding, dual SSH engine, encrypted vault, sleep/wake reconnect.
+4. **Auto Switch routing** with a visual rule builder, failover chains, split HTTP/SOCKS tables, all condition matchers, and a live **Route Tester**.
+5. **Zero-downtime hot-reload:** saving profile, rule, filter, timeout, or keepalive changes on a running Proxy swaps its `ArcSwap<RoutingState>` without dropping connections; non-reloadable changes (bind, ports, `max_connections`, MITM CA, log sinks) show a **Restart to Apply** banner.
+6. **Import & interop:** AirSwitch / ZeroOmega / SwitchyOmega `.bak` import, and `config.toml` import/export for all three CLIs, with secrets moved into the vault and never written out in plaintext.
+7. **Zero caching and remote DNS preserved:** no HTTP response or DNS caching; hostnames routed to a Tunnel or proxy upstream are sent unresolved; MITM strictly opt-in and never auto-generates a CA.
+8. **True cross-platform desktop and tray,** low idle RAM with the Manage Window closed (v1 §4 rules unchanged).
 
 ---
 
@@ -25,345 +46,304 @@ Build a lightweight, cross-platform desktop **system tray application** and **Ma
 
 | Area | Decision | Rationale |
 | :--- | :--- | :--- |
-| **SSH Engine** | **Dual-Engine (Architecture C): Pure-Rust `russh` (Default) + Opt-in Isolated OpenSSH Compatibility Engine (Phase 4)** | `russh` natively solves multi-hop per-hop passwords, zero `~/.ssh` isolation, in-memory scoped keys, remote DNS, and Windows/macOS/Linux parity with zero external `ssh` binary. Opt-in OpenSSH covers raw `extra_args`, custom `ProxyCommand`, GSSAPI, and hardware/FIDO2 keys. |
-| **Core Integration** | **Embed `rusty_conduit_ssh` as a Rust library crate** (zero upstream changes required for v1) | All required modules (`config`, `net::UpstreamDialer`, `build_engines`, `Server`, `ReverseProxy`, `MitmState`, `FilteredDialer`, `Logger::with_writer`, `AccessLogger::start_with_stdout`) are already public. Bridge `russh` `ChannelStream` into `UpstreamDialer`'s `TcpStream` via a verified per-dial loopback TCP pair. |
-| **Process Isolation** | **UI-agnostic Rust Supervisor + Worker isolation** (in-process runtime for `russh` or dedicated `conduit-worker` process; mandatory per-session worker process for OpenSSH engine) | Keeps tunnels and tray completely independent of the webview lifecycle; prevents WebKitGTK/UI crashes from dropping active proxies; isolates child `stdio` and environment variables per session. |
-| **Desktop GUI** | **Tauri v2 + Svelte 5 + TypeScript** (destroy webview on close; recreate on demand) | Best fit for form-heavy UX (multi-hop chain builder, CIDR/domain rule editors, cert pickers, virtualized live logs) while keeping idle tray RAM low when the Manage Window is closed. UI-agnostic backend keeps a Slint fallback feasible if Spike 1 hits Linux WebKitGTK blockers. |
-| **System Tray** | **`TrayBackend` trait: Tauri tray on Windows/macOS, direct `ksni` (D-Bus SNI) on Linux** | Pure-Rust D-Bus StatusNotifierItem on Linux avoids GTK3/`libappindicator` fragility, works across XFCE 4.15+ Status Tray, KDE, Waybar, and GNOME+AppIndicator, and exposes watcher offline/online state for graceful no-tray fallback. |
-| **Secret Vault** | **Hybrid Envelope Encryption (`vault.bin`)** | Random 256-bit vault key; per-record `XChaCha20-Poly1305` (with AAD). Vault key wrapped by OS keyring (`keyring-core` 1.1.0) and/or Master Password (`Argon2id`). Works seamlessly on Windows/macOS/Secret-Service Linux *and* minimal XFCE/Wayland setups without ever falling back to plaintext. |
-| **Host Keys** | **App-owned `known_hosts` pinned by `hop_id + host + port`** | Strict TOFU via GUI fingerprint approval dialog; unattended sessions never auto-trust unknown keys; changed host keys are a hard failure with tray alert. |
-| **Autostart & Single Instance** | **`tauri-plugin-autostart` (`--tray`) + `tauri-plugin-single-instance` + OS sleep/wake hooks** | Clean per-user login launch (including AppImage `$APPIMAGE` path handling), second launch opens Manage Window, and wake-from-sleep triggers debounced reconnect instead of waiting ~45s for keepalives. |
+| **Engine** | **Embed `rusty-conduit-engine`**, not the CLI crates. Path dependency during development; pinned git tag at release (engine plan §5). | Embedding all three CLIs would ship three diverged copies of the HTTP/SOCKS/MITM front end. The engine has the router, upstream dialers, and hot-reload `-switch` built, plus the extension points this app needs (engine plan §4). |
+| **Tunnels as dialers** | Each running Tunnel registers an **external dialer** (`ProfileRegistry::with_external`) that Proxies reference as a `tunnel` profile. `russh` channels are returned as `UpstreamStream::Boxed`. The OpenSSH engine's dialer speaks SOCKS5 to its worker's `ssh -D` port, gated on tunnel state. | One routing model for every upstream. Removes the per-dial loopback TCP pair. Failover works naturally: a down Tunnel returns `NotConnected`, so `["bastion", "direct"]` falls through. |
+| **SSH engines** | Unchanged from v1: **`russh` default** (pure Rust, `ring`) + **opt-in isolated OpenSSH** worker. | Proven in v0.1.0 betas (§4). |
+| **Process & UI isolation** | UI-agnostic Rust workspace; proxies, tunnels, vault, and tray live outside the webview; destroy webview on close. | Unchanged from v1. |
+| **Desktop GUI** | Tauri v2 + Svelte 5 + TypeScript. | Unchanged. |
+| **System tray** | `TrayBackend` trait: Tauri tray on Windows/macOS, `ksni` on Linux. | Unchanged. |
+| **Secret vault** | Hybrid envelope encryption (`vault.bin`), adding one record type: upstream proxy passwords. | Unchanged design; one vault for the family instead of one per app. |
+| **Hot-reload** | In-process `ArcSwap<RoutingState>` swap per Proxy; tray overrides swap a temporary rule-less `RoutingState`. | From the switch-gui draft. |
+| **Identity** | Rename to **Rusty Conduit GUI** with a one-time data migration (§3). | The app is no longer SSH-only. |
 
 ---
 
-## 3. Core SSH Engine & `rusty-conduit-ssh` Integration
+## 3. Rebrand: `rusty-conduit-ssh-gui` → `rusty-conduit-gui`
 
-### 3.1 Why Dual-Engine (`russh` Default + Opt-in OpenSSH)
+### 3.1 Names
 
-Empirical loopback spikes against `rusty-conduit-ssh` v1.1.0, `russh` 0.65.4, and OpenSSH 10.2p1 established:
+| Item | Before | After |
+| :--- | :--- | :--- |
+| GitHub repository | `jpbaking/rusty-conduit-ssh-gui` | `jpbaking/rusty-conduit-gui` (GitHub redirects old URLs and remotes) |
+| Local folder | `rusty-conduit-ssh-gui/` | `rusty-conduit-gui/` (renamed by hand, after the GitHub rename) |
+| Product name / window & tray title | `Rusty Conduit (SSH)` (`tauri.conf.json`, `conduit-tray::model::APP_TITLE`) | `Rusty Conduit GUI` |
+| Cargo package & binary | `rusty-conduit-ssh-gui` (`src-tauri/Cargo.toml`) | `rusty-conduit-gui` |
+| Bundle identifier | `io.github.rusty-conduit-ssh-gui` | `io.github.rusty-conduit-gui` |
+| Autostart entry | `rusty-conduit-ssh-gui` (`AUTOSTART_NAME`) | `rusty-conduit-gui` |
+| Crate descriptions, README, `docs/RELEASING.md`, `--help` text | "Rusty Conduit SSH GUI" | "Rusty Conduit GUI" |
+| CI / release workflows, `scripts/validate-release-config.py`, `scripts/smoke-test-bundle.py` | `rusty-conduit-ssh-gui` paths and binary names; `UPSTREAM_REPO = rusty-conduit-ssh` | new names; upstream checkout of `rusty-conduit-engine` |
+| Keyring service | `conduit-vault` | **unchanged** (already generic; keeps existing DEKs reachable) |
+| Crate names | `conduit-*` | **unchanged** (already generic) |
 
-- **`russh` Default Engine (Verified on Linux loopback):**
-  - Built cleanly with `ring` only (matching `rusty-conduit-ssh`'s pure-Rust `ring` TLS stack; no `aws-lc` or OpenSSL needed).
-  - Ran a 3-hop chain (`sshd` encrypted Ed25519 → `russh` password → `sshd` key) driving the real `rusty_conduit_ssh` HTTP and SOCKS5h engines: 20 MiB SHA-256 roundtrip matched in both forward and reverse (`tcpip-forward`) directions.
-  - Preserved remote-only DNS (`direct-tcpip` passes hostnames unresolved to the final hop).
-  - Detected intermediate hop-1 drop in ~20 ms.
-  - Enforced strict host-key pinning and scoped agent forwarding (remote saw exactly 1 assigned key).
-- **Why OpenSSH-Only Is Fragile Across Platforms (Empirically Verified Hazards):**
-  - OpenSSH `ProxyJump` (`-J`) fails with multi-hop password auth when user/host repeat (identical `SSH_ASKPASS` prompt strings; keyboard-interactive prompts can be arbitrary/localized), inserts `-F` unquoted (breaking paths with spaces such as macOS `Application Support` or `C:\Users\First Last`), and invokes bare `ssh` from `PATH` ignoring `--ssh-bin`.
-  - `ssh -N` opens no session channel, so OpenSSH `ForwardAgent` sends **0 `auth-agent-req`** requests in conduit's default tunnel shape.
-  - `-F none` still consults `~/.ssh/id_*` and `~/.ssh/known_hosts`; full isolation requires generating a hardened `-F` config per session.
-  - Windows OpenSSH requires ≥ 8.4 for `SSH_ASKPASS_REQUIRE=force`, eats single backslashes in `IdentityAgent \\.\pipe\...` config lines, and lacks Unix `SIGTERM` grace.
-- **Why Keep Opt-in OpenSSH (Phase 4):**
-  - Requirement 1 includes *all* `rusty-conduit-ssh` options; raw `extra_args`, custom `ProxyCommand`, GSSAPI, and hardware/FIDO2 keys cannot be mapped to `russh`. Exposing OpenSSH as an explicit per-session engine option gives 100% option parity without burdening standard users.
+### 3.2 Order of operations
 
-### 3.2 Bridging `russh` into `rusty_conduit_ssh` (Zero Upstream Changes)
+1. On `feat/one-gui`: change every name in §3.1 in code, configs, scripts, and docs; implement the migration in §3.3; CI green.
+2. Rename the GitHub repository (`gh repo rename rusty-conduit-gui`), then update repository variables (`UPSTREAM_REPO`, `UPSTREAM_REF`) if set.
+3. Rename the local folder by hand, then `git remote set-url origin git@github.com:jpbaking/rusty-conduit-gui.git` (optional; the redirect works) and `cargo clean` (the old `target/` embeds absolute paths).
+4. Update sibling docs that link to `../rusty-conduit-ssh-gui` (engine plan, CLI READMEs if any).
+5. Archive or delete `rusty-conduit-switch-gui/` (its draft plan is folded into this document).
 
-`rusty_conduit_ssh::net::UpstreamDialer::connect` returns `Pin<Box<dyn Future<Output = io::Result<tokio::net::TcpStream>> + Send + 'a>>`. Because `russh`'s `ChannelStream` is not a `TcpStream`:
+### 3.3 One-time upgrade migration (changing the bundle identifier moves the app data directory)
 
-- **v1 Bridge (Verified):** `RusshDialer` opens a `direct-tcpip` channel on the final hop, creates a per-dial loopback TCP pair (`127.0.0.1:0` bind → connect → accept → verify peer address == client socket → drop listener), and spawns `tokio::io::copy_bidirectional` between the accepted socket and the SSH channel.
-- **Error Mapping:** Map `russh::ChannelOpenFailure` to exact `io::ErrorKind` values (`ConnectFailed` → `ConnectionRefused`, `AdministrativelyProhibited` → `PermissionDenied`, timeout → `TimedOut`) so `rusty_conduit_ssh` emits accurate HTTP `502`/`504` and SOCKS5 reply codes.
-- **Optional Future Upstream PRs (Non-Blocking):**
-  1. Generalize `UpstreamDialer` to return a boxed `AsyncRead + AsyncWrite + Unpin + Send` stream (eliminates the loopback socket pair per connection).
-  2. Add `run_with_events(...)` and typed failure classification (auth vs. host-key vs. network vs. port-bind) to `rusty_conduit_ssh` for cleaner OpenSSH-engine integration.
+Tauri's `app_data_dir()` is derived from the identifier, so `v0.1.0` data (`vault.bin`, sessions, host profiles, `known_hosts.json`, presets, settings) would be invisible after the rename without this step. On startup, before opening any store:
 
-### 3.3 Session Startup, Reconnect & Shutdown Lifecycle
+1. If the new data directory does not exist and the old one does, **move** it (atomic rename on the same volume; copy-then-verify-then-remove across volumes), keeping owner-only permissions. Never merge into a non-empty new directory; show a notice instead.
+2. If login autostart was enabled under the old name, register the new entry and remove the old one (Windows Run key, macOS LaunchAgent, Linux `~/.config/autostart/rusty-conduit-ssh-gui.desktop`).
+3. Leave the old keyring entries in place (service `conduit-vault`, keyed by vault id, which does not change).
+4. Record the migration in the diagnostic log and show a one-time "Rusty Conduit (SSH) is now Rusty Conduit GUI" banner.
+5. **Single-instance across names:** during the transition, the new app refuses to start (with a clear message) if the old `Rusty Conduit (SSH)` is still running, so two apps never bind the same ports or write the same vault.
 
-For each `russh` session:
-1. Unlock required secrets from `conduit-vault` into zeroized memory; validate and build `rusty_conduit_ssh::Config`.
-2. Start `AccessLogger::start_with_stdout` with an injected writer feeding the session's bounded log ring buffer (and optional file sinks).
-3. Start `ReverseProxy::start` (if reverse ports are configured) so local ephemeral `-R` targets are bound once and survive reconnects.
-4. Connect hops sequentially (`Hop 0 → Hop 1 → … → Target`):
-   - Before sending any credentials on hop `i`, verify its host key in `check_server_key` against app-owned `known_hosts` (keyed by `hop_id + host + port`).
-   - Authenticate hop `i` using its configured ordered auth methods (in-memory Key / Password / Keyboard-Interactive / explicit SystemAgent opt-in).
-   - Tunnel hop `i+1` over hop `i`'s `direct-tcpip` stream via `russh::client::connect_stream`.
-5. Request `tcpip-forward` on the final hop for each `reverse.forwards()` entry; reject any unexpected inbound `forwarded-tcpip` address/port.
-6. Wrap `RusshDialer` in `StatsDialer` (for live active connections & bytes in/out), then `FilteredDialer` (if forward allow/block rules exist).
-7. Build HTTP/SOCKS/MITM engines via `rusty_conduit_ssh::build_engines` and start `Server`.
-8. **Reconnect Behavior:** Keep forward listeners bound while reconnecting (dialer returns `NotConnected`). Reset exponential backoff only after stable uptime (matching `rusty-conduit-ssh`'s 5s `REVERSE_STABLE_UPTIME` when `-R` is active).
-9. **Account Lockout Protection:** Immediately halt reconnects and transition to **`NeedsAttention`** on authentication failure (`Permission denied`, rejected password/key) or host-key mismatch. Never blindly retry saved passwords!
-10. **Graceful Shutdown:** Drain forward `Server` → tear down SSH chain (and `-R` forwards) → drain `ReverseProxy` → flush `AccessLogger`.
-
-### 3.4 Mandatory `russh` Security Hardening
-
-Override these permissive `russh` defaults in every client handler:
-- **`server_channel_open_agent_forward`:** Always reject. The app never forwards an agent.
-- **`server_channel_open_forwarded_tcpip`:** Reject any remote address/port not explicitly requested in `reverse.forwards()`.
-- **Embedded Agent Server:** Allow only `RequestKeys` and `Sign` after initial session key loading; deny `AddIdentity`, `RemoveIdentity`, `RemoveAll`, and `Lock`.
-- **Known Hosts:** Never call `russh`'s default `~/.ssh/known_hosts` helpers; always use app-managed pin storage.
-
-### 3.5 Embedded Isolated `ssh-agent` Design
-
-Clarify and cleanly separate the two distinct key-auth workflows:
-
-1. **Per-Hop Authentication (Default — No Forwarding Needed):**
-   - Because the app connects each hop directly through nested `direct-tcpip` channels, private keys **never leave the local machine** and are never exposed to jump hosts.
-   - Keys stored in `conduit-vault` (OpenSSH, PEM, PKCS#1/5/8, PuTTY) are decoded in zeroized memory and used directly by the per-hop signer. No socket or external agent is involved.
-2. **No Agent Forwarding (removed 2026-11-25):**
-   - The app is a forward/reverse proxy. Neither direction needs a remote process to authenticate onward with the user's keys, and per-hop authentication already reaches every jump host and the target.
-   - Agent forwarding (an earlier opt-in that ran a remote command on a session channel with a scoped agent) only added risk: root on that host could use the forwarded keys while connected. It was removed. Hops refuse `auth-agent@openssh.com` channels, the OpenSSH engine always writes `ForwardAgent no`, and `-A` / `ForwardAgent` stay in the `extra_args` denylist.
-   - Profiles saved with the old `agent_forward*` hop fields still load; the fields are ignored and dropped on the next save.
-   - Reading the system `SSH_AUTH_SOCK` is never done.
-
-### 3.6 OpenSSH Compatibility Engine Hardening (Phase 4)
-
-When a session explicitly selects `engine = OpenSsh`:
-- Run one dedicated `conduit-worker` subprocess per session (orphan-guarded via Windows Job Object, Linux `PR_SET_PDEATHSIG`, macOS PID sweep).
-- Generate a hardened per-session `-F` file in a **short path without spaces** (under `$XDG_RUNTIME_DIR` on Linux, short temp/app-runtime dir on macOS/Windows) specifying `HostKeyAlias`, `UserKnownHostsFile <app>/known_hosts`, `GlobalKnownHostsFile none`, `StrictHostKeyChecking yes`, `IdentitiesOnly yes`, `IdentityAgent <isolated-socket|none>`, `ControlMaster no`, `UpdateHostKeys no`, `NumberOfPasswordPrompts 1`.
-- Chain multi-hop targets via a per-hop `ProxyCommand` wrapper (`conduit-worker hop-proxy --session <id> --hop <n> -- %h %p`) with an authenticated local IPC askpass helper — never `ProxyJump` and never prompt-text parsing.
-- Enforce an `extra_args` denylist rejecting flags that break isolation (`-F`, `-J`, `-i`, `ProxyCommand`, `ProxyJump`, `IdentityAgent`, `IdentityFile`, `UserKnownHostsFile`, `GlobalKnownHostsFile`, `StrictHostKeyChecking`, `ControlPath`, `ControlMaster`, `ForwardAgent`, `Include`).
-- Require OpenSSH ≥ 8.4 on Windows (runtime version check with clear guidance).
+Platform packaging (Phase U5): Windows installs under a new product name, so the NSIS installer detects and offers to uninstall `Rusty Conduit (SSH)`; Linux `.deb`/`.rpm` declare `Replaces`/`Conflicts` (`Obsoletes`) on the old package; macOS users delete the old `.app`. On macOS, the Keychain may ask once to allow the renamed app to read the vault key (unsigned/ad-hoc builds change identity on every update anyway).
 
 ---
 
-## 4. Desktop GUI, System Tray & Platform Architecture
+## 4. Tunnels (SSH) — carried forward from v1
 
-### 4.1 GUI Stack: Tauri v2 + Svelte 5 + TypeScript
+The v1 design is implemented and stays authoritative; the only change is the integration point (§4.2).
 
-- **Window Lifecycle (Low Idle Footprint):** When the user closes the Manage Window, **destroy the webview completely** (not merely hide it) so WebKitGTK / WebView2 / WKWebView helper processes exit and idle tray memory stays minimal. Recreate the window on demand from the tray or `--show`.
-- **UI-Agnostic Backend:** All state, vault, SSH, and session orchestration live in pure-Rust workspace crates (`conduit-core`, `conduit-vault`, `conduit-ssh`, `conduit-runtime`). Tauri commands and events are a thin adapter layer; if Spike 1 reveals an unresolvable Linux WebKitGTK issue, the frontend can be swapped to Slint without touching core logic.
-- **macOS Dock Policy:** Use `ActivationPolicy::Accessory` while running tray-only (no Dock icon), switching to `ActivationPolicy::Regular` while the Manage Window is open so standard menus and window focus work naturally. Use a monochrome template icon for the menu bar.
+### 4.1 Dual engine
+- **`russh` (default):** pure Rust with `ring`; per-hop auth over nested `direct-tcpip`; remote-only DNS; strict host-key pinning. Verified with a 3-hop chain (encrypted Ed25519 → password → key) and 20 MiB round-trips both directions.
+- **OpenSSH (opt-in):** for raw `extra_args`, custom `ProxyCommand`, GSSAPI, and FIDO2/hardware keys. One `conduit-worker` subprocess per tunnel (orphan-guarded: Job Object / `PR_SET_PDEATHSIG` / PID sweep), hardened per-tunnel `-F` in a short space-free path, per-hop `ProxyCommand` wrapper with authenticated IPC askpass (never `ProxyJump`, never prompt parsing), `extra_args` isolation denylist, Windows OpenSSH ≥ 8.4.
+- **Why not OpenSSH-only:** `ProxyJump` breaks multi-hop passwords and paths with spaces; `-F none` still reads `~/.ssh/id_*` and `known_hosts`; Windows quirks (see v1 history in git).
 
-### 4.2 System Tray: Windows, macOS, and Linux (XFCE + Wayland)
+### 4.2 Integration with the engine (changed)
+- `RusshDialer` returns the SSH channel as `UpstreamStream::Boxed` — the loopback TCP pair is removed.
+- `russh::ChannelOpenFailure` maps to typed dial errors (`ConnectFailed` → refused, `AdministrativelyProhibited` → permission denied, timeout → timed out) so HTTP `502`/`504` and SOCKS reply codes stay accurate.
+- A running Tunnel registers its dialer with every Proxy that references it; while reconnecting, it returns `NotConnected` (failover chains move on; single-target routes fail fast as today).
+- **Reverse proxy (`-R`)** is a Tunnel feature: a local engine `Server` with direct egress and the reverse allow/block filter, bound once on ephemeral loopback ports that survive reconnects, exposed via `tcpip-forward`. Unexpected `forwarded-tcpip` addresses are rejected.
+- **Port forwards (`-L`/`-R`)** and presets: unchanged.
 
-Abstract tray operations behind a `TrayBackend` trait:
-- **Windows & macOS:** Tauri v2 built-in tray (`tray-icon`).
-- **Linux (XFCE X11/Wayland, KDE Plasma, GNOME, Sway/Hyprland):** Direct **`ksni`** (pure-Rust D-Bus `StatusNotifierItem`).
-  - Zero GTK3 / `libappindicator` / `libayatana-appindicator` runtime dependency.
-  - Native support in XFCE 4.15+ (`xfce4-panel` Status Tray Plugin), KDE Plasma, Waybar (Sway/Hyprland), and GNOME with the AppIndicator extension.
-  - Exposes D-Bus watcher online/offline status so the app handles late-starting panels and missing tray hosts cleanly.
-
-#### Linux & Wayland Platform Rules
-1. **Menu-First Tray:** Never hide a required action behind left-click (inconsistent across Linux SNI hosts); every action is in the tray menu.
-2. **No Tray-Anchored Popups:** Wayland clients cannot position windows globally; always open the standard Manage Window.
-3. **No-Tray-Host Fallback (e.g., Vanilla GNOME):**
-   - Wait up to 10s at login for panels/Waybar to register `StatusNotifierWatcher`.
-   - Keep autostart tunnels running regardless of tray availability.
-   - If no tray host appears, open the Manage Window with a dismissible info banner; closing it asks **Keep running in background** vs. **Quit**. Re-launching with `--show` reopens the window.
-   - Automatically register the tray icon if a watcher appears later.
-4. **Wayland Clipboard Fallback:** Copy-to-clipboard from a windowless Wayland tray menu can fail due to compositor focus rules; fall back to a tiny focusable dialog with the URL pre-selected.
-5. **NVIDIA + WebKitGTK Mitigation:** Apply targeted env fixes before GTK init *only* when NVIDIA is detected (`WEBKIT_DISABLE_DMABUF_RENDERER=1` on X11; test `__NV_DISABLE_EXPLICIT_SYNC=1` / DMABUF on Wayland), strip those vars from child/worker processes, and provide a `--safe-rendering` CLI flag (`WEBKIT_DISABLE_COMPOSITING_MODE=1`).
-
----
-
-## 5. Secret Vault & Security Model
-
-### 5.1 Hybrid Envelope-Encrypted Vault (`vault.bin`)
-
-All sensitive values — hop/target passwords, SSH private keys, and MITM CAs (certificate chain and private key) — live exclusively in a single encrypted file (`vault.bin`), referenced from profiles by opaque `SecretRef` / `KeyId` / `MitmCaId` UUIDs. Uploaded keys and CAs are decrypted once with their passphrase and stored normalized, so neither the source files nor their passphrases are needed afterwards.
-
-- **Encryption:** Random 256-bit Data Encryption Key (DEK); each record encrypted with `XChaCha20-Poly1305` and a fresh random nonce, binding `(record_id, record_type, vault_version)` as Associated Data (AAD).
-- **Key Wrapping (Hybrid Unlock):**
-  - **Primary (Seamless):** DEK wrapped/stored in the OS native keyring via `keyring-core` 1.1.0 (Windows Credential Manager, macOS Keychain, Linux `zbus` Secret Service — serialized on a single worker thread). Avoids Windows' 2,560-byte `CREDENTIALW` blob limit because only the 32-byte DEK lives in the keyring.
-  - **Fallback / Portable (Minimal Linux/XFCE without Secret Service, or user opt-in):** DEK wrapped by a user Master Password derived with `Argon2id` (baseline 128 MiB, `t=3`, `p=1`, calibrated parameters stored in vault header).
-  - **Never Fall Back to Plaintext:** If neither keyring nor unlocked master password is available at login, sessions requiring secrets enter **`Locked`** state (tray shows *Unlock Vault…*) while sessions not needing secrets still start. If the keyring entry disappears, never silently recreate/overwrite `vault.bin` — prompt for recovery/master password.
-- **Atomic Storage:** Write temp file → `fsync` → atomic rename, with `0600` permissions (Unix) or owner-only ACL (Windows).
-
-### 5.2 Memory & Leak Controls
-
-- Hold decrypted secrets in `secrecy::SecretBox` / `zeroize` wrappers.
-- **Write-Only WebView Secret Fields:** The Rust backend never sends raw passwords, private keys, or passphrases to the frontend — only metadata (`has_secret: true`, key fingerprint/type). JS strings cannot be zeroized.
-- Never pass secrets via CLI `argv`, environment variables, TOML files, or unencrypted temp files.
-- Disable core dumps (`PR_SET_DUMPABLE=0` on Linux, `setrlimit(RLIMIT_CORE, 0)`), use best-effort `mlock`, and install a panic hook that never prints secret payloads.
-- Redact sensitive fields by type in all logs; config exports strip secrets by default (full backup requires explicit passphrase encryption).
-
-### 5.3 Key Management (Upload, Paste, Generate & Per-Hop Picking)
-
-Private keys are managed as first-class records inside `vault.bin` with **zero reference to `~/.ssh/id_*`**:
-
-- **Add Key Methods (Write-Only in UI):**
-  1. **Upload / Import File:** Pick any OpenSSH, PEM, PKCS#1/5/8, or PuTTY (`.ppk`) private key file. The app validates the key in Rust, extracts its public key & SHA-256 fingerprint, and encrypts the private key material directly into `vault.bin` (no ongoing dependency on the original file path).
-  2. **Paste Private Key:** Paste raw private key text directly into a dedicated write-only modal in the Manage Window (cleared from UI state immediately after submit).
-  3. **Generate New Key:** Optionally generate a fresh `ed25519` (default) or `ecdsa-p256` keypair in-app with one-click **Copy Public Key** (`ssh-ed25519 AAAA...`) for pasting into remote `authorized_keys`.
-- **Encrypted Key Passphrases:** If an imported/pasted key is passphrase-protected, the user enters the passphrase once at import time to verify the key; the passphrase (or decrypted key material) is stored strictly encrypted inside `vault.bin` so autostart and auto-reconnect work unattended without re-prompting.
-- **Key Vault View & Lifecycle:**
-  - Lists every saved key by friendly name, algorithm/size, SHA-256 fingerprint, created/imported date, and a **"Used by N hosts/sessions"** indicator.
-  - Supports **Copy Public Key**, **Rename**, and **Delete** (warns and lists affected hosts/sessions before removing a referenced key).
-  - Private key material is **never** returned to the frontend WebView after ingestion (write-only).
-- **Per-Target & Per-Jumphost Picking:**
-  - Every Host Profile and every hop in a session's Jump Chain (`Jump 1 → Jump 2 → … → Target`) gets a clean **Key Vault picker** allowing the user to select one or more vaulted keys (ordered) and/or password auth.
-  - At connect time, the embedded isolated `ssh-agent` / signer loads *only* the vaulted keys selected for that specific hop.
-- **MITM CAs (same write-only model):**
-  - **Upload** a PKCS#12 bundle (`.p12`/`.pfx`) or a PEM certificate (or chain) plus PEM private key, from the Key Vault's **MITM CAs** section or from a session's HTTPS MITM tab. The WebView sends file contents, never paths. The backend decrypts the files once with the passphrase, checks them with the engine's own CA loader (key matches certificate, currently valid), and stores the chain and an unencrypted PKCS#8 key as one normalized PEM record inside `vault.bin`. Neither the original files nor the passphrase are needed afterwards, and duplicates are refused by certificate fingerprint.
-  - The list shows name, subject, SHA-256 fingerprint, expiry (flagged within 30 days and once expired), created date, and **"Used by N sessions"**, with **Rename** and **Delete**.
-  - Sessions refer to a CA by `MitmCaId`; sessions saved by earlier betas with CA file paths load with no CA, and the CA passphrases those betas stored are deleted from the vault on unlock.
-  - **Delete** of a CA in use lists the sessions and which of them are running. Forcing it leaves those sessions with MITM on and no CA, and **stops** the running ones, because a running session holds the CA in memory and would otherwise keep signing with it.
-- **Sessions that cannot run are refused at start:** `SessionManager::start` validates the saved profile before anything is launched (Start, Restart, Start All, autostart, tray). A refused session shows `NeedsAttention` with the reason and is not retried. In particular, a session with MITM on but no CA will not start until a CA is chosen; turning MITM off makes it startable again.
-
-### 5.4 Host-Key Verification (Zero `~/.ssh/known_hosts`)
-
-- Stored in `<app-data>/known_hosts.json` (or app-owned OpenSSH-format file for Phase 4), keyed by **`hop_id + host + port`**.
-- **First Contact:** Session pauses in `AwaitingHostKey` and opens a verification modal showing hop name, host:port, key algorithm, and SHA-256 fingerprint.
-- **Unattended Autostart:** Unknown host keys wait in `NeedsAttention` — never silently trusted on first use.
-- **Key Changed:** Hard failure; session stops immediately with a high-priority tray alert. Requires explicit user review and re-approval.
-- Optional one-time manual import from a user-selected `known_hosts` file (never automatic).
-
----
-
-## 6. Autostart, Single-Instance & Session Lifecycle
-
-### 6.1 OS Login Autostart & Single Instance
-
-- **App Autostart:** `tauri-plugin-autostart` launching with `--tray` (Windows per-user Run key; macOS `LaunchAgent` initially, evaluating `SMAppService` later; Linux `~/.config/autostart/rusty-conduit-ssh-gui.desktop`, writing stable `$APPIMAGE` path when running as an AppImage).
-- **Single Instance:** `tauri-plugin-single-instance`; launching the app a second time (or running `rusty-conduit-ssh-gui --show`) signals the running instance to open/focus the Manage Window.
-
-### 6.2 Session State Machine & Sleep/Wake Handling
+### 4.3 Lifecycle & security (unchanged)
+- Sequential hop connect with host-key verification **before** credentials; ordered per-hop auth (vault key / password / keyboard-interactive / explicit system-agent opt-in).
+- **Lockout protection:** auth failure or host-key mismatch → `NeedsAttention`, no auto-retry.
+- Backoff reset only after stable uptime (5 s when `-R` is active).
+- Hardening: reject agent-forward channels; reject unrequested `forwarded-tcpip`; never use `russh`'s `~/.ssh/known_hosts` helpers; no agent forwarding at all (removed 2026-11-25; `-A`/`ForwardAgent` in the OpenSSH denylist).
+- Host keys: app-owned `known_hosts.json` keyed by `hop_id + host + port`; TOFU via approval modal; unattended starts never trust unknown keys; changed key is a hard stop with tray alert; optional one-time manual import from a `known_hosts` file.
+- Sleep/wake: debounced (2–5 s) recycle of `Connected`/`Reconnecting` tunnels on OS wake events.
 
 ```text
-Stopped ──► Starting ──► Connected ◄──► Reconnecting (exponential backoff)
-               │              ▲
-               ├──► WaitingForNetwork
-               ├──► Locked (vault locked at login)
-               ├──► AwaitingHostKey ──► NeedsAttention (auth / host-key error; NO auto-retry)
-               └──► Failed
+Tunnel:  Stopped ─► Starting ─► Connected ◄─► Reconnecting (backoff)
+                       ├─► WaitingForNetwork
+                       ├─► Locked (vault locked)
+                       ├─► AwaitingHostKey ─► NeedsAttention (auth / host key; no auto-retry)
+                       └─► Failed
 ```
 
-- **Boot / Login Stagger:** Start autostart sessions with a 250–500 ms stagger after vault unlock and network availability.
-- **Sleep / Wake & Network Change:** Subscribe to OS wake events (`logind` `PrepareForSleep(false)`, Windows `PBT_APMRESUMEAUTOMATIC`, macOS `NSWorkspace.didWakeNotification`). Debounce 2–5 seconds, then proactively recycle sessions that were `Connected` or `Reconnecting` instead of waiting ~45s for keepalive expiry. Never auto-start user-stopped sessions or `NeedsAttention` sessions.
+---
+
+## 5. Proxies & Routing — new (from the switch-gui draft)
+
+### 5.1 Runtime
+For each Proxy start:
+1. Resolve vaulted upstream passwords into zeroized memory; build the engine config; validate (`Config::validate()` equivalents + engine notices).
+2. Build `AccessLogger` feeding the Proxy's bounded ring buffer (and optional file sinks), plus the structured `AccessRecord` sink for the log drawer.
+3. Build `RoutingState` (`SharedRouting`, `Arc<ArcSwap<…>>`), registering an external dialer for each referenced Tunnel.
+4. If MITM is on, build `MitmState::from_pem_bytes` from the vaulted CA — no temporary file.
+5. Build `EngineHandlers` + `Server`, spawn `run()` and the MITM leaf-cert reaper.
+6. **Save on a running Proxy:** compile the next `RoutingState` (including the self-loop check against all running listeners, across Proxies and Tunnels' reverse listeners); on success `store()` it and bump `config_generation`; on failure keep the current state and show the error.
+7. **Tray override:** *Auto Switch* / *Force Direct* / *Force &lt;profile&gt;* swaps a temporary rule-less `RoutingState`; returning to *Auto Switch* restores the saved compiled state.
+8. **Shutdown:** cancel → drain `Server` → stop reaper → flush loggers.
+
+```text
+Proxy:   Stopped ─► Starting ─► Running (Auto | Override: <profile>) ◄─► Reloading
+                       ├─► Locked (needs vaulted secrets or CA)
+                       ├─► NeedsAttention (invalid config, port conflict, self-loop, missing CA/tunnel)
+                       └─► Stopping ─► Stopped
+```
+
+### 5.2 Proxy ↔ Tunnel dependencies
+- A Tunnel's **start mode** is **Linked** (runs while any running Proxy references it; the default for migrated sessions) or **Manual** (started and stopped by the user; useful for tunnels used only for port forwards or the reverse proxy).
+- Starting a Proxy starts its Linked Tunnels first (staggered); a Proxy is `Running` as soon as its listeners are bound, and routes to a still-connecting Tunnel fail or fail over like any other down upstream.
+- Deleting a Tunnel referenced by Proxies lists them and requires confirmation; references become an error that keeps those Proxies from starting until fixed.
+- The tray and header show both states (e.g. `Running · tunnel "Bastion" reconnecting`).
+
+### 5.3 Route Tester & Test Upstream
+- **Route Tester:** evaluate a `host[:port]` or URL against the draft config with `Router` + `ParsedTarget` + `RouteRequest` on each keystroke; show the table used, matched rule, bypass result, failover chain, and redacted upstreams; highlight the rule in the list.
+- **Test Upstream:** dial through the profile's dialer (including Tunnels) to a user-chosen target with timing and redacted errors.
+- **Test Chain** (Tunnels): prefix-by-prefix connect, showing the exact failing hop (unchanged).
 
 ---
 
-## 7. Data Model & Workspace Layout
+## 6. Secret Vault & Security Model
 
-### 7.1 Cargo Workspace Structure
+Unchanged from v1 (`conduit-vault`), with one new record type.
+
+### 6.1 Contents
+1. SSH private keys (`KeyId`): uploaded (OpenSSH, PEM, PKCS#1/5/8, PuTTY), pasted, or generated (`ed25519` default, `ecdsa-p256`); passphrases verified once and never needed again.
+2. Hop / target passwords and keyboard-interactive answers (`SecretRef`).
+3. **New:** upstream proxy passwords for `http`, `https`, `socks5` profiles (`SecretRef`).
+4. MITM CAs (`MitmCaId`): uploaded PKCS#12 or PEM chain + key, validated by the engine's CA loader, stored normalized; duplicates refused by fingerprint; expiry flagged within 30 days and once expired.
+
+### 6.2 Encryption & controls
+- Random 256-bit DEK; per-record `XChaCha20-Poly1305` with fresh nonce and AAD `(record_id, record_type, vault_version)`.
+- DEK wrapped by the OS keyring (`keyring-core` 1.1; serialized D-Bus calls on Linux) and/or a Master Password (`Argon2id`, 128 MiB / `t=3` / `p=1`, calibrated params in header; memory returned to the OS after derivation).
+- Never plaintext: locked vault → Tunnels and Proxies that need secrets enter `Locked`; others start normally. A vanished keyring entry never silently recreates the vault.
+- Write-only WebView fields; `secrecy`/`zeroize`; atomic `0600` / owner-ACL writes; core dumps disabled; panic hook never prints secrets; logs redact by type (`upstream=` never carries credentials).
+- **Safe deletion:** deleting a key, CA, or password in use lists the affected Tunnels/Proxies (and which are running); forcing it clears the reference and stops running holders.
+- **Refused at start:** `start` validates before binding or connecting (Start, Restart, Start All, autostart, tray); refusals show `NeedsAttention` and are not retried.
+
+### 6.3 Exports & backups
+- CLI TOML exports use `password_env` placeholders, never secrets.
+- App backup: secrets omitted by default; optional passphrase-encrypted full backup. The backup format version is bumped for Tunnels/Proxies; older backups import through the §6.4 migration.
+
+### 6.4 Data migration from v0.1.0 sessions
+Each saved `SessionProfile` becomes:
+- a **Tunnel** (`engine`, `hops`, `reverse`, `port_forwards`, `tunnel` keepalive/reconnect, `openssh` options, Linked start mode), and
+- a **Proxy** with the same name, `autostart`, `enabled`, listeners (`forward.bind/http_port/socks_port/max_connections`), global filter (`forward` allow/block), `mitm`, and `logging`, whose routing default is the `tunnel` profile for that Tunnel and which has no rules.
+
+Ports, filters, logging, and MITM behave exactly as before. The migration is one-way, runs once, and keeps a backup copy of the old `config.json` in the data directory.
+
+---
+
+## 7. Desktop GUI, Tray & Platform — carried forward from v1
+
+- **Destroy webview on close;** recreate from tray or `--show`. macOS `Accessory` while tray-only, `Regular` with the window open; monochrome template icon.
+- **Linux tray via `ksni`:** menu-first; no tray-anchored popups; wait up to 10 s for a `StatusNotifierWatcher`, keep autostart items running without a tray host, open the Manage Window with a banner if none appears, register later if one does; Wayland clipboard fallback dialog.
+- **NVIDIA + WebKitGTK:** targeted env fixes only when NVIDIA is detected, stripped from child/worker processes; `--safe-rendering`.
+- **Autostart & single instance:** `tauri-plugin-autostart` with `--tray` (stable `$APPIMAGE` path), `tauri-plugin-single-instance`; second launch opens the window unless `--tray` is passed alone. Stagger autostart Tunnels/Proxies 250–500 ms after vault unlock and network availability; items without secrets don't wait for the vault.
+- **CLI flags:** `--tray`, `--show`, `--safe-rendering`, `-h/--help`, `-V/--version` (binary `rusty-conduit-gui`).
+
+---
+
+## 8. Data Model & Workspace Layout
+
+### 8.1 Workspace
 
 ```text
-rusty-conduit-ssh-gui/
-├── docs/
-│   └── MASTER-PLAN.md
+rusty-conduit-gui/
+├── Cargo.toml              # depends on ../rusty-conduit-engine (path in dev, git tag at release)
+├── docs/                   # MASTER-PLAN.md, RELEASING.md, TODO.md
+├── scripts/                # check-pure-rust-crypto.py, validate-release-config.py, smoke-test-bundle.py
 ├── crates/
-│   ├── conduit-core/       # SessionProfile, HostProfile, Hop, validation, mapping to rusty_conduit_ssh::Config
-│   ├── conduit-vault/      # vault.bin (XChaCha20-Poly1305 + Argon2id), keyring-core wrapper, zeroized secrets
-│   ├── conduit-ssh/        # russh multi-hop chain, HostKeyPolicy, RusshDialer + loopback bridge, reverse, scoped agent
-│   ├── conduit-runtime/    # SessionManager, state machine, backoff, wake hooks, bounded log ring buffers, event bus, stats
-│   ├── conduit-openssh/    # (Phase 4) hardened -F generator, ProxyCommand/askpass IPC helper, isolated worker
-│   └── conduit-tray/       # TrayBackend trait (ksni on Linux, Tauri/tray-icon adapter on Win/macOS)
-└── src-tauri/              # Tauri v2 shell, IPC commands, window lifecycle, autostart, single-instance
-    └── ui/                 # Svelte 5 + TypeScript frontend
+│   ├── conduit-core/       # Tunnel, Proxy, UpstreamProfile, rules, HostProfile, validation, engine mapping,
+│   │                       # TOML & AirSwitch import/export, v0.1.0 migration, atomic persistence
+│   ├── conduit-vault/      # vault.bin (+ upstream password records)
+│   ├── conduit-ssh/        # russh chain, host-key policy, RusshDialer (boxed streams), reverse, port forwards
+│   ├── conduit-openssh/    # isolated OpenSSH worker engine (conduit-worker)
+│   ├── conduit-runtime/    # TunnelManager (was SessionManager), ProxyManager (hot-reload, overrides,
+│   │                       # route tester, upstream probe), dependency wiring, logs, events, stats, wake
+│   └── conduit-tray/       # TrayBackend (ksni on Linux, Tauri tray on Windows/macOS)
+└── src-tauri/              # Tauri shell (rusty-conduit-gui binary), IPC, lifecycle, migration
+    └── ui/                 # Svelte 5 + TypeScript
 ```
 
-### 7.2 Core Data Model
+### 8.2 Core model (sketch)
 
 ```rust
-struct VaultKeyMeta {
-    id: KeyId,                       // UUID; private key bytes live only in vault.bin
-    name: String,                    // e.g. "Prod Bastion Ed25519"
-    algorithm: String,               // ed25519 | ecdsa-p256 | rsa-4096 | ...
-    fingerprint_sha256: String,
-    public_key_openssh: String,      // safe to display & copy to authorized_keys
-    source: KeySource,               // Uploaded | Pasted | Generated
-    created_at: Timestamp,
+struct Tunnel {                 // was SessionProfile (SSH half)
+    id: Uuid, name: String, enabled: bool,
+    start_mode: TunnelStartMode,  // Linked (default) | Manual { autostart: bool }
+    engine: SshEngine,            // Russh | OpenSsh
+    hops: Vec<HopEntry>,          // [Jump 1, …, Target]; HostProfile refs or inline
+    reverse: ReverseConfig,       // -R reverse proxy: bind, ports, allow/block
+    port_forwards: Vec<PortForward>,
+    keepalive: TunnelConfig,      // ip_version, server_alive_*, reconnect, delays, startup_timeout
+    logging: LoggingConfig,
+    openssh: OpenSshOptions,
 }
 
-struct HostProfile {
-    id: Uuid,
-    name: String,
-    host: String,
-    port: u16,                       // default 22
-    user: String,
-    auth: Vec<AuthMethod>,           // Ordered: Key(KeyId) | Password(SecretRef) | KeyboardInteractive(rules) | SystemAgentOptIn
-    host_key_pin: Option<HostKeyPin>,// algorithm, sha256, first_seen, approved_at
+struct Proxy {                  // was SessionProfile (proxy half) + switch-gui SwitchInstance
+    id: Uuid, name: String, enabled: bool, autostart: bool,
+    source: SourceMode,           // Managed | ExternalToml { path, debounce }
+    listeners: ListenerConfig,    // bind, http_port, socks_port (equal = mux, 0 = off), max_connections
+    network: NetworkConfig,       // connect_timeout, tcp_keepalive
+    profiles: Vec<UpstreamProfile>,
+    routing: RoutingTablesConfig, // [routing] + optional [routing.http] / [routing.socks]
+    filter: GlobalFilterConfig,   // Off | Allow | Block
+    mitm: Option<MitmConfig>,     // MitmCaId, cert_ttl, cache_max, socks_block_web
+    logging: LoggingConfig,
 }
 
-struct SessionProfile {
-    id: Uuid,
-    name: String,
-    autostart: bool,
-    engine: SshEngine,               // Russh (default) | OpenSsh (Phase 4)
-    hops: Vec<HopEntry>,             // Ordered chain: [Jump 1, Jump 2, ..., Target] (HostProfileRef or Inline)
-    forward: ForwardConfig,          // bind, http_port, socks_port, max_connections, allow/block rules
-    reverse: ReverseConfig,          // reverse_bind, reverse_http_port, reverse_socks_port, reverse_allow/block rules
-    mitm: Option<MitmConfig>,        // MitmCaId of a vault CA, cert_ttl, cache_max, socks_block_web
-    tunnel: TunnelConfig,            // ip_version, server_alive_interval/count_max, no_reconnect, initial/max delay, startup_timeout
-    logging: LoggingConfig,          // level, format (text|json), http_access_log, socks_log
-    openssh_only: OpenSshOptions,    // ssh_bin, ssh_socks_bind/port, extra_args (validated against isolation denylist)
+enum UpstreamKind {
+    Http, Https { tls_insecure_skip_verify: bool }, Socks5, Socks4a,
+    Composite { http: String, https: String, fallback: String },
+    Tunnel(TunnelId),             // new: an SSH Tunnel as the upstream
 }
 ```
 
+Profiles can also live in a shared **Profile Library** and be referenced from several Proxies.
+
 ---
 
-## 8. UX & Information Architecture
+## 9. UX & Information Architecture
 
-### 8.1 System Tray Menu
+### 9.1 Tray menu
 
 ```text
-Rusty Conduit SSH                2 connected · 1 needs attention
+Rusty Conduit GUI                2 proxies running · 1 tunnel needs attention
 ────────────────────────────────────────────────────────────────
-● Prod Bastion                   Connected  (HTTP :3128 · SOCKS :1080)
-    ├── Stop
-    ├── Restart
+PROXIES
+● Work                           Auto Switch · HTTP :3128 · SOCKS :1080
+    ├── Mode ▸  ✓ Auto Switch (14 rules) | Force Direct | Force corp | Force tunnel Bastion
+    ├── Stop / Restart
     ├── Copy HTTP Proxy URL      (http://127.0.0.1:3128)
     ├── Copy SOCKS Proxy URL     (socks5h://127.0.0.1:1080)
     └── View Logs
-◐ Staging                        Reconnecting (8s)…
-! Client VPN                     Auth rejected → Open Manage Window
 ○ Lab                            Stopped → Start
+TUNNELS
+● Bastion                        Connected (linked to Work)
+! Client VPN                     Auth rejected → Open Manage Window
 ────────────────────────────────────────────────────────────────
 Start All  |  Stop All
-Unlock Vault…                    (shown only when locked)
+Unlock Vault…                    (only when locked)
 Open Manage Window…
-Quit                             (confirms when sessions are active)
+Quit                             (confirms when anything is running)
 ```
 
-> Always copy `socks5h://` (never `socks5://`) so client tools keep DNS resolution remote.
+Always copy `socks5h://`, never `socks5://`, so clients keep DNS remote.
 
-### 8.2 Manage Window Layout
+### 9.2 Manage Window
+- **Sidebar:** **Proxies** and **Tunnels** lists (search, live status, mode pill), `+ New Proxy`, `+ New Tunnel`, `Import…` (AirSwitch `.bak`, CLI `config.toml`), then **Host Profiles**, **Profile Library**, **Vault** (keys, passwords, MITM CAs), **Settings**.
+- **New Proxy wizard:** *Direct* (plain `rusty-conduit`), *Through a tunnel* (`rusty-conduit-ssh`), *Auto Switch* (`rusty-conduit-switch`). Each is a starting point in the same editor; rules stay hidden until used.
+- **Proxy editor tabs:** 1 Routing Rules (table selector, default target/chain, `resolve_dns` with leak notice, drag-and-drop/keyboard-reorderable rules with enable toggles, condition chips, failover badges, URL-rule-without-MITM badge, rule drawer with every matcher, inline Route Tester) · 2 Upstream Profiles (built-ins, all kinds incl. `tunnel`, colors, write-only vaulted passwords or `password_env`, self-loop warnings, bypass lists, Test Upstream) · 3 Listeners & Network (non-loopback warning, ports, mux, `max_connections`, port-conflict check across Proxies/Tunnels/OS, timeouts, keepalive) · 4 Global Filter (mode, editor, bulk paste, host checker) · 5 HTTPS MITM · 6 Import / Export & TOML (AirSwitch wizard, CLI TOML import/export, External TOML link mode) · 7 Logging & General.
+- **Tunnel editor tabs:** 1 Connection & Jump Chain (chain builder, Host Profiles, per-hop auth, host-key status, IP version, engine) · 2 Reverse Proxy (`-R`) · 3 Port Forwards (+ presets) · 4 Keepalive & Reconnect, start mode · 5 Logging & Advanced (OpenSSH options with isolation validation) · "Used by" list of Proxies.
+- **Header:** title, state pill, `gen #N · hot-reloaded` (Proxies), live counters, Test Route / Test Chain, Save (Hot-Reload vs Restart Required), Start/Stop.
+- **Log drawer:** virtualized live stream from bounded Rust ring buffers (only while the window is open), filter by kind/level/profile/rule/text, pause/copy/clear; on access rows: **Test route** and **Create rule for this host…**.
 
-- **Left Sidebar:** Searchable session list with live status indicators (`●`, `◐`, `!`, `○`), `+ New Session`, and navigation links to **Host Profiles**, **Key Vault (Embedded Agent)**, and **Settings**.
-- **Header Bar:** Session title, live state pill, active connection & byte counters, **`[Test Chain]`**, **`[Save]`**, **`[Start / Stop]`**.
-- **7-Tab Session Editor (100% `rusty-conduit-ssh` coverage):**
-  1. **Connection & Jump Chain:** Visual chain `[Local] → [Jump 1 ✓] → [Jump 2 !] → [Target]` with drag-and-drop + keyboard reorder, reusable Host Profile picker (with *Save as Profile* promotion), per-hop auth/secret status, host-key fingerprint/reset, IP version, engine selector (`Built-in Rust SSH` vs. `OpenSSH`).
-  2. **Forward Proxy:** Bind IP (with non-loopback warning), HTTP port, SOCKS port, single-port mux toggle, `max_connections`, live port-conflict check across saved sessions and OS sockets.
-  3. **Reverse Proxy (`-R`):** Remote bind IP (with exposure/GatewayPorts warning), remote HTTP/SOCKS ports, mux indicator.
-  4. **Destination Filters:** Forward and reverse Allowlist/Blocklist mode toggle (enforcing mutual exclusivity), IP/CIDR/FQDN/`*.domain` rule editor, bulk paste import, and interactive "Test host against rules" checker.
-  5. **HTTPS MITM:** Off / On, a picker of vault CAs (uploaded from PEM or PKCS#12 files in the Key Vault or from this tab), cert TTL (`≥ 10s`), cache cap, `socks_block_web_in_mitm` toggle, CA subject & expiry display. At session start the CA is staged from the vault into an owner-only temporary file for the engine and removed as soon as it is loaded.
-  6. **Keepalive & Reconnect:** `ServerAliveInterval`, `ServerAliveCountMax`, auto-reconnect toggle, initial/max backoff delays, startup timeout, session autostart toggle.
-  7. **Logging & Advanced:** Log level (`QUIET`..`VERBOSE`), format (`text`/`json`), file log paths, OpenSSH-only `ssh_bin` / `ssh_socks_bind` / `extra_args` (with isolation validation and redacted preview).
-- **Bottom Collapsible Drawer:** Live virtualized diagnostic + access log viewer per session (level filter, text search, pause/autoscroll, copy, clear), backed by a bounded ring buffer in Rust streamed only while the window is open.
+### 9.3 Import / export matrix
 
----
-
-## 9. Phased Roadmap & Milestones
-
-### Phase 0 — Validation Spikes (Gate Before Full Build)
-*Goal: De-risk every platform-specific unknown before committing UI/engine code.*
-1. **Spike 0.1 (Cross-Platform `russh` + `ring` CI):** Verify `russh` 0.65.4 + `ring` + `rusty_conduit_ssh` builds and passes the 3-hop forward/reverse loopback test on **Windows, macOS, and Linux** in CI, plus keyboard-interactive auth, encrypted PEM/PKCS8/PuTTY keys, and hung-peer keepalive timeout.
-2. **Spike 0.2 (Tauri v2 + Destroy-on-Close + NVIDIA WebKitGTK):** Measure RSS on window open → close → reopen on Windows, macOS, XFCE X11, KDE Wayland, GNOME Wayland, and Sway; confirm WebKit helper processes terminate on window close.
-3. **Spike 0.3 (`ksni` Linux Tray Matrix):** Validate `ksni` menu updates, late panel startup, host loss/recovery, and no-tray fallback on XFCE 4.18/4.20 (X11 & Wayland), KDE Plasma, GNOME (with & without AppIndicator), and Sway/Waybar, plus Wayland clipboard fallback.
-
-### Phase 1 — Core Engine, Vault & Multi-Hop Runtime (Headless / CLI-Testable)
-- Initialize Cargo workspace (`conduit-core`, `conduit-vault`, `conduit-ssh`, `conduit-runtime`).
-- Implement `vault.bin` envelope encryption (`XChaCha20-Poly1305` + `Argon2id` + `keyring-core`).
-- Implement `russh` multi-hop chain builder, strict `HostKeyPolicy` (TOFU + changed-key hard stop), `RusshDialer` + loopback bridge, `ReverseProxy` `tcpip-forward` wiring, and lockout-safe auth failure classification.
-- Implement `SessionManager` (concurrent sessions, backoff, bounded log ring buffers, live stats dialer, event bus, OS sleep/wake hooks).
-- Full integration tests against loopback SSH servers (single-hop, 3-hop mixed password+key, MITM, reverse proxy, filters, reconnect, zero `~/.ssh` access).
-
-### Phase 2 — Tauri v2 Shell, Systray & Core Manage Window
-- Wire `conduit-tray` (`ksni` on Linux, Tauri tray on Windows/macOS) + no-tray fallback + macOS `Accessory`/`Regular` policy.
-- Implement `tauri-plugin-single-instance`, `tauri-plugin-autostart` (`--tray`), and destroy-webview-on-close lifecycle.
-- Build Svelte 5 Manage Window: Session Sidebar, Connection & Multi-Hop Jump Chain Builder, Host Profiles, Key Vault (import/generate/delete keys, upload/rename/delete MITM CAs, write-only secrets), Host-Key Approval modal, Vault Unlock modal, and Live Log Drawer.
-- Implement prefix-by-prefix **Test Connection** showing exact failing hop.
-
-### Phase 3 — Full `rusty-conduit-ssh` Option Parity & Embedded Scoped Agent Forwarding
-- Complete remaining Session Editor tabs: Forward Proxy (with port conflict detection), Reverse Proxy, Filters (with rule tester), HTTPS MITM (with CA expiry/validation), Keepalive & Reconnect, Logging & Advanced.
-- Implement opt-in per-hop **Scoped Agent Forwarding** (in-process read-only agent + signature audit logging + remote-command session channel). *Later removed as out of scope for a proxy; see §3.5.*
-- Add encrypted config export/import (secrets omitted by default; optional passphrase-encrypted full backup).
-
-### Phase 4 — Opt-In OpenSSH Compatibility Engine
-- Implement `conduit-openssh` worker subprocess (`conduit-worker`) with hardened `-F` generation in short space-free paths, per-hop `ProxyCommand` wrapper + authenticated local IPC askpass, isolated agent socket/named pipe, `extra_args` isolation denylist, and Windows OpenSSH ≥ 8.4 check.
-- Run Windows named-pipe & `ProxyCommand` askpass verification suite.
-
-### Phase 5 — Packaging, Signing & Release Automation
-- **Windows (x64/arm64):** Signed NSIS `.exe` (per-user, stops workers cleanly before upgrade) + `.msi`.
-- **macOS (Universal):** Signed & notarized `.app` / `.dmg` (`lipo` universal binaries).
-- **Linux (x64/arm64):** `.deb`, `.rpm`, and `.AppImage` built on oldest supported glibc base (Ubuntu 22.04 / Debian 12). Defer Flatpak/Snap due to sandbox conflicts with host networking/sockets/tray/autostart.
-- **CI Gates:** Rust unit/integration tests, frontend typecheck/lint, multi-hop fake-`sshd` E2E on all 3 OSes, automated secret-leak scan of logs & exports, and installer smoke tests.
+| Source / target | Import | Export |
+| :--- | :--- | :--- |
+| AirSwitch / ZeroOmega / SwitchyOmega `.bak` | Proxy (profiles + rules; browser-only items listed as warnings; passwords → vault) | — |
+| `rusty-conduit` `config.toml` | Proxy (direct) | Proxies with no rules and only `direct` |
+| `rusty-conduit-ssh` `config.toml` | Tunnel + Proxy. The CLI's destination may be a `~/.ssh/config` alias, which the app never reads, so hops and auth are completed by hand. | Proxies routing only to one Tunnel: the target becomes the CLI destination; vault keys, passwords, and jump hosts cannot be exported and are listed as `~/.ssh/config` setup notes |
+| `rusty-conduit-switch` `config.toml` | Proxy (inline passwords → vault) | Any Proxy; `tunnel` profiles exported as commented `socks5` placeholders |
 
 ---
 
-## 10. Open Decisions for User Confirmation
+## 10. Roadmap
 
-Before starting Phase 0/1 implementation, please confirm your preference on these three product calls:
+Phases 0–6 of v1 (validation spikes; core, vault, multi-hop runtime; Tauri shell and tray; full `rusty-conduit-ssh` parity; OpenSSH engine; packaging; audit polish) are **done** (`v0.1.0-beta.5`). The unification phases follow.
 
-1. **Default SSH Engine:** Confirm **Pure-Rust `russh` as default** (zero external `ssh` binary, native multi-hop passwords & isolated agent) with **OpenSSH as an opt-in Phase 4 engine** for raw `extra_args` / `ProxyCommand` / FIDO2.
-2. **Minimal Linux (No Secret Service) Autostart Policy:** When a Linux desktop (e.g., minimal XFCE/Wayland) has no unlocked OS Secret Service, confirm our default security posture: **require a Master Password unlock** (vault stays `Locked` at login until entered; never fall back to plaintext).
-3. **Code Signing Targets:** Confirm whether Apple Developer ID / Windows Authenticode signing certificates will be configured for Phase 5 releases, or if unsigned/ad-hoc builds are fine for initial releases.
+### U0 — Rebrand (no engine change; can ship alone as `v0.2.0-beta.1`)
+- §3 renames in code, configs, scripts, CI, docs; §3.3 data-dir and autostart migration with tests (fresh install, upgrade, non-empty new dir, cross-volume, old app running).
+- GitHub repository rename, then the manual folder rename (§3.2).
+- **Done when:** full CI passes (`cargo test --workspace`, clippy `-D warnings`, `npm run check && npm test && npm run build`, `check-pure-rust-crypto.py`, `validate-release-config.py`, secret-leak scan) and an upgraded `beta.5` profile starts with the same sessions and vault.
+
+### U1 — Move to `rusty-conduit-engine` (gated on engine milestone E2 / tag `v0.1.0`)
+- Replace `rusty-conduit-ssh` with `rusty-conduit-engine`; `RusshDialer` returns boxed streams (drop loopback bridge); reverse proxy via an engine `Server`; MITM CA from bytes (drop temp-file staging); OpenSSH engine dialer via the engine's SOCKS5 dialer.
+- Still the v1 data model: each session = one engine Proxy routed to its tunnel.
+- **Done when:** all existing tests pass (444 Rust + 55 frontend at the time of writing), including multi-hop E2E, reverse, MITM, reconnect, and the secret-leak scan.
+
+### U2 — Tunnels + Proxies model
+- `conduit-core` split (`Tunnel`, `Proxy`, `UpstreamProfile` incl. `tunnel`, rules), validation, §6.4 migration; vault upstream-password records.
+- `conduit-runtime`: `TunnelManager` + `ProxyManager`, Linked/Manual start modes, hot-reload, tray overrides, route tester, upstream probe, per-rule/profile counters.
+- Headless tests: multi-Proxy routing, Tunnel failover, hot-reload under active `CONNECT` and SOCKS5 tunnels, override swap/restore, self-loop detection across Proxies and reverse listeners, migration round-trip.
+
+### U3 — Manage Window & tray
+- Sidebar, New Proxy wizard, Proxy editor (7 tabs), Tunnel editor re-homed, Vault additions, log drawer quick actions, tray Proxies/Tunnels sections with Mode submenu.
+
+### U4 — Import / export
+- AirSwitch `.bak` wizard; CLI TOML import/export per §9.3; External TOML link mode; backup format bump.
+
+### U5 — Packaging & release
+- Renamed installers and the upgrade path from `Rusty Conduit (SSH)` (§3.3); release-config validation and bundle smoke tests updated; release `v0.2.0`.
+
+---
+
+## 11. Open Decisions
+
+1. **Tunnel start mode default for new Tunnels:** Linked (proposed; migrated sessions use Linked so behavior is unchanged) or Manual.
+2. **Ship U0 alone** as `v0.2.0-beta.1` before the engine is ready (proposed), or ship the rename together with U1.
+3. **Bundle identifier:** change it with the §3.3 migration (proposed), or keep `io.github.rusty-conduit-ssh-gui` forever to avoid any migration.
+4. **Code signing** for U5: still unsigned/ad-hoc, or Apple Developer ID / Windows Authenticode.
