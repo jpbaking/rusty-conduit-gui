@@ -16,7 +16,8 @@ use std::path::{Path, PathBuf};
 use std::sync::PoisonError;
 
 use conduit_core::{
-    validate, AppConfig, AuthMethod, HopEntry, HostProfile, KeyId, KnownHostsStore, MitmCaId,
+    validate, validate_forward_preset, AppConfig, AuthMethod, HopEntry, HostProfile, KeyId,
+    KnownHostsStore, MitmCaId,
     SecretRef, SessionProfile, VaultCaMeta, VaultKeyMeta,
 };
 use conduit_vault::{
@@ -119,6 +120,9 @@ pub struct ImportSummary {
     pub hosts_added: usize,
     pub hosts_updated: usize,
     pub hosts_skipped: usize,
+    pub presets_added: usize,
+    pub presets_updated: usize,
+    pub presets_skipped: usize,
     pub keys_added: usize,
     pub cas_added: usize,
     pub secrets_added: usize,
@@ -166,6 +170,17 @@ fn prepare(config: &mut AppConfig) -> Result<(), AppError> {
             "this export uses config schema {}, newer than this app supports",
             config.schema_version
         )));
+    }
+    let mut preset_ids = HashSet::new();
+    for preset in &mut config.forward_presets {
+        if preset.id.is_nil() {
+            preset.id = Uuid::new_v4();
+        }
+        if !preset_ids.insert(preset.id) {
+            return Err(AppError::Invalid(format!("duplicate forward preset id {}", preset.id)));
+        }
+        validate_forward_preset(preset)
+            .map_err(|e| AppError::Invalid(format!("forward preset {:?}: {e}", preset.name)))?;
     }
     let mut session_ids = HashSet::new();
     for session in &mut config.sessions {
@@ -267,7 +282,7 @@ fn neutralize_untrusted_paths(incoming: &mut AppConfig, current: &AppConfig) {
     }
 }
 
-/// Merges hosts and sessions into `config`, returning the counts and the sessions it changed.
+/// Merges hosts, forward presets, and sessions into `config`, returning the counts and the sessions it changed.
 fn merge(
     config: &mut AppConfig,
     incoming: AppConfig,
@@ -293,6 +308,19 @@ fn merge(
         }
         config.hosts[index] = host;
         summary.hosts_updated += 1;
+    }
+    for preset in incoming.forward_presets {
+        match config.forward_presets.iter().position(|p| p.id == preset.id) {
+            None => {
+                config.forward_presets.push(preset);
+                summary.presets_added += 1;
+            }
+            Some(_) if !replace => summary.presets_skipped += 1,
+            Some(index) => {
+                config.forward_presets[index] = preset;
+                summary.presets_updated += 1;
+            }
+        }
     }
     for session in incoming.sessions {
         match config.sessions.iter().position(|s| s.id == session.id) {
@@ -861,6 +889,27 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         }
+    }
+
+    #[tokio::test]
+    async fn forward_presets_travel_with_a_plain_export() {
+        let source_dir = TempDir::new();
+        let source = controller(&source_dir);
+        let mut mine = source.list_forward_presets().remove(0);
+        mine.id = Uuid::nil();
+        mine.name = "Shared DB".into();
+        mine.dest_host = "db.internal".into();
+        let mine = source.upsert_forward_preset(mine).unwrap();
+        let path = source_dir.path().join("presets.json");
+        source.export_config(&path, false, None).unwrap();
+
+        let target_dir = TempDir::new();
+        let target = controller(&target_dir);
+        let summary = target.import_config(&path, None, false).unwrap();
+        // The built-ins share fixed ids, so only the new one is added.
+        assert_eq!((summary.presets_added, summary.presets_updated), (1, 0));
+        assert!(summary.presets_skipped > 0);
+        assert!(target.list_forward_presets().iter().any(|p| p.id == mine.id && p.name == "Shared DB"));
     }
 
     #[tokio::test]

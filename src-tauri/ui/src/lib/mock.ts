@@ -9,6 +9,7 @@ import type {
   FilterTestResult,
   HostKeyEntry,
   HostKeyPrompt,
+  ForwardPreset,
   HostProfile,
   ImportSummary,
   KeyView,
@@ -193,6 +194,15 @@ let cas: CaView[] = [
 ];
 let autostart = false;
 let hosts: HostProfile[] = [];
+const BUILTIN_PRESETS: ForwardPreset[] = [
+  { id: "5f0d0000-0000-4000-8000-000000000001", name: "PostgreSQL", direction: "local", bind: null, port: 15432, dest_host: "", dest_port: 5432 },
+  { id: "5f0d0000-0000-4000-8000-000000000002", name: "MySQL", direction: "local", bind: null, port: 13306, dest_host: "", dest_port: 3306 },
+  { id: "5f0d0000-0000-4000-8000-000000000003", name: "Redis", direction: "local", bind: null, port: 16379, dest_host: "", dest_port: 6379 },
+  { id: "5f0d0000-0000-4000-8000-000000000004", name: "Remote Desktop", direction: "local", bind: null, port: 13389, dest_host: "", dest_port: 3389 },
+  { id: "5f0d0000-0000-4000-8000-000000000005", name: "Web UI (HTTPS)", direction: "local", bind: null, port: 18443, dest_host: "", dest_port: 443 },
+  { id: "5f0d0000-0000-4000-8000-000000000006", name: "Share a local dev server", direction: "remote", bind: null, port: 8000, dest_host: "localhost", dest_port: 3000 },
+];
+let presets: ForwardPreset[] = structuredClone(BUILTIN_PRESETS);
 const testedKeys = new Map<string, HostKeyPrompt>();
 
 let pins: HostKeyEntry[] = [
@@ -304,6 +314,22 @@ function dispatch(command: string, args?: Record<string, unknown>): unknown {
       return structuredClone(sessions);
     case "list_hosts":
       return [...hosts];
+    case "list_forward_presets":
+      return structuredClone(presets);
+    case "upsert_forward_preset": {
+      const saved = structuredClone(args?.preset) as ForwardPreset;
+      if (!saved.id || saved.id === NIL) saved.id = crypto.randomUUID();
+      presets = presets.some((p) => p.id === saved.id)
+        ? presets.map((p) => (p.id === saved.id ? saved : p))
+        : [...presets, saved];
+      return saved;
+    }
+    case "delete_forward_preset":
+      presets = presets.filter((p) => p.id !== args?.id);
+      return null;
+    case "restore_forward_presets":
+      presets = [...presets, ...BUILTIN_PRESETS.filter((b) => !presets.some((p) => p.id === b.id))];
+      return structuredClone(presets);
     case "list_keys":
       return [...keys];
     case "get_state_summary":
@@ -590,6 +616,9 @@ function dispatch(command: string, args?: Record<string, unknown>): unknown {
         sessions_updated: 0,
         sessions_skipped: sessions.length,
         hosts_added: 0,
+        presets_added: 0,
+        presets_updated: 0,
+        presets_skipped: 0,
         hosts_updated: 0,
         hosts_skipped: hosts.length,
         keys_added: 0,

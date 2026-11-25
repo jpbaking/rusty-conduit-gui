@@ -3,6 +3,7 @@
 import type {
   HostProfile,
   LoggingConfig,
+  ForwardPreset,
   MitmConfig,
   PortForward,
   SessionProfile,
@@ -355,6 +356,18 @@ function portForwardErrors(errors: FieldErrors, profile: SessionProfile): void {
       .some((o) => o.enabled && o.direction === f.direction && o.port === f.port && bindsOverlap(o.bind, f.bind));
     if (earlier) errors[key("port")] = `Another forward already listens on port ${f.port}.`;
   });
+}
+
+/** Mirrors `validate_forward_preset`. The destination host may be empty. */
+export function presetErrors(preset: ForwardPreset): FieldErrors {
+  const errors: FieldErrors = {};
+  if (!preset.name.trim()) errors.name = "Enter a preset name.";
+  if (preset.bind !== null && !isIpAddress(preset.bind)) errors.bind = "Use an IP address, or leave it empty.";
+  if (!isPort(preset.port)) errors.port = "Use a port from 1 to 65535.";
+  if (!isPort(preset.dest_port)) errors.dest_port = "Use a port from 1 to 65535.";
+  const hostError = preset.dest_host.trim() ? forwardHostError(preset.dest_host) : null;
+  if (hostError) errors.dest_host = hostError;
+  return errors;
 }
 
 export function sessionErrors(profile: SessionProfile): FieldErrors {

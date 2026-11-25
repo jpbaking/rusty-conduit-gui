@@ -8,6 +8,7 @@ pub mod export;
 pub mod keys;
 pub mod mitm_ca;
 pub mod parity;
+pub mod presets;
 pub mod sessions;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -259,7 +260,7 @@ impl AppController {
             vault_keyring: dir.join("vault.keyring"),
         };
 
-        let config = if paths.config.exists() {
+        let mut config = if paths.config.exists() {
             load_app_config(&paths.config)?
         } else {
             AppConfig {
@@ -267,6 +268,9 @@ impl AppController {
                 ..AppConfig::default()
             }
         };
+        // In memory only: the file is written on the next change, as every other change is.
+        // The built-in ids are fixed, so seeding again before then adds nothing new.
+        config.seed_forward_presets();
         let known_hosts = if paths.known_hosts.exists() {
             load_known_hosts(&paths.known_hosts)?
         } else {

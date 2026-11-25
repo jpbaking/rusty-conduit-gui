@@ -12,6 +12,7 @@ import type {
   HopEntry,
   HostKeyEntry,
   HostKeyPrompt,
+  ForwardPreset,
   HostProfile,
   KeyId,
   KeyView,
@@ -105,6 +106,7 @@ class AppStore {
   // Backend data. Replaced whole, so `$state.raw` avoids deep proxies and IPC clone problems.
   sessions = $state.raw<SessionView[]>([]);
   hosts = $state.raw<HostProfile[]>([]);
+  presets = $state.raw<ForwardPreset[]>([]);
   keys = $state.raw<KeyView[]>([]);
   cas = $state.raw<CaView[]>([]);
   pins = $state.raw<HostKeyEntry[]>([]);
@@ -238,9 +240,10 @@ class AppStore {
   async refresh(): Promise<boolean> {
     this.#snapshotsInFlight += 1;
     try {
-      const [sessions, hosts, keys, cas, vault, pins] = await Promise.all([
+      const [sessions, hosts, presets, keys, cas, vault, pins] = await Promise.all([
         api.listSessions(),
         api.listHosts(),
+        api.listForwardPresets(),
         api.listKeys(),
         api.listMitmCas(),
         api.vaultStatus(),
@@ -248,6 +251,7 @@ class AppStore {
       ]);
       this.sessions = sessions;
       this.hosts = hosts;
+      this.presets = presets;
       this.keys = keys;
       this.cas = cas;
       this.setVault(vault);
@@ -417,6 +421,13 @@ class AppStore {
     this.view = view;
   }
 
+  /** Opens Settings at the port forward presets. */
+  openForwardPresets(): void {
+    this.view = "settings";
+    // After Settings has rendered.
+    setTimeout(() => document.getElementById("settings-presets")?.scrollIntoView({ block: "start" }));
+  }
+
   selectSession(id: Uuid): void {
     this.selectedId = id;
     this.view = "sessions";
@@ -565,6 +576,35 @@ class AppStore {
   }
 
   /** Saves a hop of the saved session as a reusable host and links the hop to it. */
+  /** Saves a forward preset. Returns the saved preset, or `null` after showing the error. */
+  async saveForwardPreset(preset: ForwardPreset): Promise<ForwardPreset | null> {
+    try {
+      const saved = await api.upsertForwardPreset(preset);
+      this.presets = await api.listForwardPresets();
+      return saved;
+    } catch (error) {
+      this.notice = errorMessage(error);
+      return null;
+    }
+  }
+
+  async deleteForwardPreset(id: string): Promise<void> {
+    try {
+      await api.deleteForwardPreset(id);
+      this.presets = await api.listForwardPresets();
+    } catch (error) {
+      this.notice = errorMessage(error);
+    }
+  }
+
+  async restoreForwardPresets(): Promise<void> {
+    try {
+      this.presets = await api.restoreForwardPresets();
+    } catch (error) {
+      this.notice = errorMessage(error);
+    }
+  }
+
   async promoteHop(hopId: string, name: string): Promise<boolean> {
     const session = this.selected;
     if (!session || this.dirty) return false;

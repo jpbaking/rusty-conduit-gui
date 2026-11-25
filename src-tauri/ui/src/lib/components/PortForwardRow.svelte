@@ -22,9 +22,11 @@
     lockedReason?: string;
     onChange: (patch: Partial<PortForward>) => void;
     onRemove: () => void;
+    onSavePreset: () => void;
   }
 
-  let { forward, target, status, running, applied, lockedReason, onChange, onRemove }: Props = $props();
+  let { forward, target, status, running, applied, lockedReason, onChange, onRemove, onSavePreset }: Props =
+    $props();
 
   const uid = $props.id();
   const errors = $derived(store.draftErrors);
@@ -165,6 +167,7 @@
           <code>{forward.dest_host.trim()}:{forward.dest_port}</code> as seen from {connectSide}.
         </span>
         <span class="forward-flag">
+          <button type="button" class="link-button" onclick={onSavePreset}>Save as preset</button>
           <code>{flag}</code>
           <button type="button" class="icon" title="Copy the ssh flag" aria-label="Copy the ssh flag" onclick={copyFlag}>
             {copied ? "✓" : "⧉"}

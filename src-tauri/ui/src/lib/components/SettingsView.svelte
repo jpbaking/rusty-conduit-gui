@@ -1,4 +1,5 @@
 <script lang="ts">
+  import ForwardPresetsSection from "./ForwardPresetsSection.svelte";
   import { onMount } from "svelte";
   import { api, errorMessage } from "../api";
   import { store } from "../stores.svelte";
@@ -205,6 +206,7 @@
         summary.encrypted ? "Imported an encrypted backup." : "Imported config.",
         `Sessions: ${summary.sessions_added} added, ${summary.sessions_updated} updated, ${summary.sessions_skipped} skipped.`,
         `Hosts: ${summary.hosts_added} added, ${summary.hosts_updated} updated, ${summary.hosts_skipped} skipped.`,
+        `Port forward presets: ${summary.presets_added} added, ${summary.presets_updated} updated, ${summary.presets_skipped} skipped.`,
         ...(summary.encrypted
           ? [
               `Vault: ${plural(summary.keys_added, "key")} and ${plural(summary.secrets_added, "secret")} added.`,
@@ -236,6 +238,8 @@
       </label>
       {#if autostartError}<p class="reason" role="alert">{autostartError}</p>{/if}
     </section>
+
+    <ForwardPresetsSection />
 
     <section aria-labelledby="settings-vault">
       <h2 id="settings-vault">Vault</h2>

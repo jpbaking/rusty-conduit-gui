@@ -16,7 +16,7 @@ use rusty_conduit_ssh::filter::FilterRule;
 use rusty_conduit_ssh::logging::{LogFormat, LogLevel};
 use thiserror::Error;
 
-use crate::{ForwardDirection, PortForward, SessionProfile};
+use crate::{ForwardDirection, ForwardPreset, PortForward, SessionProfile};
 
 /// Errors raised when a [`SessionProfile`] fails validation. Every variant is `FATAL`.
 #[derive(Debug, Error)]
@@ -108,6 +108,24 @@ fn forward_host_problem(host: &str) -> Option<&'static str> {
                 && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
         });
     if valid { None } else { Some("the destination host must be a host name or an IP address") }
+}
+
+/// Checks a [`ForwardPreset`]. Its destination host may be empty, to be filled in per session.
+pub fn validate_forward_preset(preset: &ForwardPreset) -> Result<(), String> {
+    if preset.name.trim().is_empty() {
+        return Err("enter a preset name".into());
+    }
+    if preset.port == 0 {
+        return Err("choose a listen port from 1 to 65535".into());
+    }
+    if preset.dest_port == 0 {
+        return Err("choose a destination port from 1 to 65535".into());
+    }
+    let host = preset.dest_host.trim();
+    match forward_host_problem(host) {
+        Some(problem) if !host.is_empty() => Err(problem.into()),
+        _ => Ok(()),
+    }
 }
 
 /// Two binds collide on the same IP, or when either listens on all interfaces.
@@ -750,4 +768,28 @@ mod tests {
         assert_eq!(local_forward(15432, "db", 5432).spec(), "127.0.0.1:15432:db:5432");
     }
 
+    #[test]
+    fn forward_presets_allow_an_empty_host_but_check_the_rest() {
+        let mut preset = crate::builtin_forward_presets().remove(0);
+        assert!(validate_forward_preset(&preset).is_ok());
+        preset.dest_host = "db:1".into();
+        assert!(validate_forward_preset(&preset).is_err());
+        preset.dest_host = String::new();
+        preset.name = " ".into();
+        assert!(validate_forward_preset(&preset).is_err());
+    }
+
+    #[test]
+    fn built_in_presets_seed_once_and_restore_only_what_is_missing() {
+        let mut config = crate::AppConfig::default();
+        assert!(config.seed_forward_presets());
+        let count = config.forward_presets.len();
+        assert!(count > 0);
+        let removed = config.forward_presets.remove(0);
+        assert!(!config.seed_forward_presets(), "seeding happens once");
+        assert_eq!(config.forward_presets.len(), count - 1);
+        assert_eq!(config.restore_forward_presets(), 1);
+        assert!(config.forward_presets.iter().any(|p| p.id == removed.id));
+        assert_eq!(config.restore_forward_presets(), 0);
+    }
 }

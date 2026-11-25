@@ -18,4 +18,4 @@ pub use model::*;
 pub use storage::{
     load_app_config, load_known_hosts, save_app_config, save_known_hosts, StorageError,
 };
-pub use validate::{validate, ValidateError};
+pub use validate::{validate, validate_forward_preset, ValidateError};

@@ -462,6 +462,50 @@ impl PortForward {
     }
 }
 
+/// A reusable template for a [`PortForward`], kept app-wide in [`AppConfig`].
+///
+/// Adding one to a session copies its values, so later edits to the preset do not change
+/// forwards already added. An empty `dest_host` is filled in by the user after adding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardPreset {
+    #[serde(default)]
+    pub id: Uuid,
+    pub name: String,
+    pub direction: ForwardDirection,
+    /// Listen address. `None` uses 127.0.0.1.
+    #[serde(default)]
+    pub bind: Option<IpAddr>,
+    pub port: u16,
+    #[serde(default)]
+    pub dest_host: String,
+    pub dest_port: u16,
+}
+
+/// The presets a new install starts with. Their ids are fixed, so restoring them is idempotent.
+pub fn builtin_forward_presets() -> Vec<ForwardPreset> {
+    let local = |n: u128, name: &str, port: u16, dest_port: u16| ForwardPreset {
+        id: Uuid::from_u128(0x5f0d_0000_0000_4000_8000_0000_0000_0000 | n),
+        name: name.into(),
+        direction: ForwardDirection::Local,
+        bind: None,
+        port,
+        dest_host: String::new(),
+        dest_port,
+    };
+    vec![
+        local(1, "PostgreSQL", 15432, 5432),
+        local(2, "MySQL", 13306, 3306),
+        local(3, "Redis", 16379, 6379),
+        local(4, "Remote Desktop", 13389, 3389),
+        local(5, "Web UI (HTTPS)", 18443, 443),
+        ForwardPreset {
+            direction: ForwardDirection::Remote,
+            dest_host: "localhost".into(),
+            ..local(6, "Share a local dev server", 8000, 3000)
+        },
+    ]
+}
+
 /// On-disk shapes. Profiles saved before the on/off switch have no `enabled`, so it is inferred
 /// from the ports: a proxy with any non-zero port was running.
 mod wire {
@@ -809,6 +853,36 @@ pub struct AppConfig {
     pub keys: Vec<VaultKeyMeta>,
     #[serde(default)]
     pub mitm_cas: Vec<VaultCaMeta>,
+    /// Port forward templates, shared by every session.
+    #[serde(default)]
+    pub forward_presets: Vec<ForwardPreset>,
+    /// Set once the built-in presets were added, so deleting one is not undone on next start.
+    #[serde(default)]
+    pub forward_presets_seeded: bool,
+}
+
+impl AppConfig {
+    /// Adds the built-in presets on first use. Returns whether anything changed.
+    pub fn seed_forward_presets(&mut self) -> bool {
+        if self.forward_presets_seeded {
+            return false;
+        }
+        self.forward_presets_seeded = true;
+        self.restore_forward_presets();
+        true
+    }
+
+    /// Adds back every built-in preset whose id is missing, keeping the user's own. Returns how
+    /// many were added.
+    pub fn restore_forward_presets(&mut self) -> usize {
+        let missing: Vec<ForwardPreset> = builtin_forward_presets()
+            .into_iter()
+            .filter(|b| !self.forward_presets.iter().any(|p| p.id == b.id))
+            .collect();
+        let added = missing.len();
+        self.forward_presets.extend(missing);
+        added
+    }
 }
 
 /// Composite key for an app-owned known_hosts entry: a specific hop, host, and port.

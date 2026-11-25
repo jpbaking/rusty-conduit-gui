@@ -208,6 +208,18 @@ export interface PortForward {
   dest_port: number;
 }
 
+/** An app-wide template for a port forward. An empty `dest_host` is filled in per session. */
+export interface ForwardPreset {
+  id: Uuid;
+  name: string;
+  direction: ForwardDirection;
+  /** Listen address. `null` uses 127.0.0.1. */
+  bind: string | null;
+  port: number;
+  dest_host: string;
+  dest_port: number;
+}
+
 export interface MitmConfig {
   /** A CA in the vault. `null` until one is chosen; the session cannot start without it. */
   ca: MitmCaId | null;
@@ -439,6 +451,9 @@ export interface ImportSummary {
   hosts_added: number;
   hosts_updated: number;
   hosts_skipped: number;
+  presets_added: number;
+  presets_updated: number;
+  presets_skipped: number;
   keys_added: number;
   cas_added: number;
   secrets_added: number;

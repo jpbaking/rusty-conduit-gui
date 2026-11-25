@@ -8,7 +8,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use conduit_core::{
-    HostProfile, KeyId, KeySource, MitmCaId, SecretRef, SessionProfile, VaultCaMeta, VaultKeyMeta,
+    ForwardPreset, HostProfile, KeyId, KeySource, MitmCaId, SecretRef, SessionProfile, VaultCaMeta,
+    VaultKeyMeta,
 };
 use conduit_openssh::OpenSshBinaryInfo;
 use conduit_runtime::LogLine;
@@ -204,6 +205,26 @@ pub async fn upsert_host(c: Ctl<'_>, host: HostProfile) -> CmdResult<HostProfile
 #[tauri::command]
 pub async fn delete_host(c: Ctl<'_>, id: Uuid) -> CmdResult<()> {
     blocking(&c, move |c| c.delete_host(id)).await
+}
+
+#[tauri::command]
+pub async fn list_forward_presets(c: Ctl<'_>) -> CmdResult<Vec<ForwardPreset>> {
+    blocking(&c, |c| Ok(c.list_forward_presets())).await
+}
+
+#[tauri::command]
+pub async fn upsert_forward_preset(c: Ctl<'_>, preset: ForwardPreset) -> CmdResult<ForwardPreset> {
+    blocking(&c, move |c| c.upsert_forward_preset(preset)).await
+}
+
+#[tauri::command]
+pub async fn delete_forward_preset(c: Ctl<'_>, id: Uuid) -> CmdResult<()> {
+    blocking(&c, move |c| c.delete_forward_preset(id)).await
+}
+
+#[tauri::command]
+pub async fn restore_forward_presets(c: Ctl<'_>) -> CmdResult<Vec<ForwardPreset>> {
+    blocking(&c, |c| c.restore_forward_presets()).await
 }
 
 #[tauri::command]
@@ -470,6 +491,10 @@ macro_rules! ipc_handler {
             $crate::commands::delete_session,
             $crate::commands::duplicate_session,
             $crate::commands::list_hosts,
+            $crate::commands::list_forward_presets,
+            $crate::commands::upsert_forward_preset,
+            $crate::commands::delete_forward_preset,
+            $crate::commands::restore_forward_presets,
             $crate::commands::upsert_host,
             $crate::commands::delete_host,
             $crate::commands::promote_hop_to_host,
@@ -533,6 +558,8 @@ mod tests {
         "delete_secret", "export_backup",
         "import_backup", "get_state_summary", "list_sessions", "upsert_session", "delete_session", "duplicate_session",
         "list_hosts", "upsert_host", "delete_host", "promote_hop_to_host", "start_session",
+        "list_forward_presets", "upsert_forward_preset", "delete_forward_preset",
+        "restore_forward_presets",
         "stop_session", "restart_session", "start_all", "stop_all", "get_session_logs",
         "clear_session_logs", "approve_host_key", "reject_host_key", "trust_tested_host_key",
         "list_host_key_pins",
@@ -733,6 +760,18 @@ mod tests {
                               "auth": [{ "Key": { "key": key_id } }] } }),
         );
         assert_eq!(ipc.ok("list_hosts", json!({})).as_array().unwrap().len(), 1);
+
+        // Forward presets: the built-ins are there from the start.
+        let builtins = ipc.ok("list_forward_presets", json!({})).as_array().unwrap().len();
+        assert!(builtins > 0);
+        let preset = ipc.ok(
+            "upsert_forward_preset",
+            json!({ "preset": { "name": "p", "direction": "local", "port": 15000, "dest_port": 5000 } }),
+        );
+        ipc.ok("delete_forward_preset", json!({ "id": preset["id"] }));
+        assert_eq!(ipc.err("delete_forward_preset", json!({ "id": preset["id"] }))["code"], "not_found");
+        let restored = ipc.ok("restore_forward_presets", json!({}));
+        assert_eq!(restored.as_array().unwrap().len(), builtins);
 
         let mut session = profile("s", closed);
         session.forward.http_port = std::net::TcpListener::bind("127.0.0.1:0")

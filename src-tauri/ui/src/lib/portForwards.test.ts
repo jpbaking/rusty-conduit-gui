@@ -1,7 +1,17 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 
-import { findForwardFlags, forwardFlag, newForward, parseForwardFlags, parseForwardSpec } from "./portForwards.ts";
+import {
+  findForwardFlags,
+  forwardFlag,
+  forwardFromPreset,
+  newForward,
+  parseForwardFlags,
+  parseForwardSpec,
+  presetFromForward,
+  presetSummary,
+} from "./portForwards.ts";
+import { presetErrors } from "./validate.ts";
 
 type Parsed = ReturnType<typeof parseForwardSpec>;
 
@@ -66,5 +76,33 @@ describe("port forward specs", () => {
       found.map((f) => f.indices),
       [[1, 2], [3]],
     );
+  });
+});
+
+describe("forward presets", () => {
+  test("round-trip between a forward and a preset", () => {
+    const forward = newForward("local", { name: " DB ", port: 15432, dest_host: "db", dest_port: 5432 });
+    const preset = presetFromForward(forward);
+    assert.equal(preset.name, "DB");
+    assert.equal(preset.bind, null, "loopback is stored as the default");
+    assert.equal(presetSummary(preset), "-L 15432 → db:5432");
+
+    const added = forwardFromPreset(preset);
+    assert.notEqual(added.id, forward.id);
+    assert.equal(added.bind, "127.0.0.1");
+    assert.equal(forwardFlag(added), forwardFlag({ ...forward, name: "DB" }));
+  });
+
+  test("an unnamed forward gets a name, and an empty host shows as chosen later", () => {
+    const preset = presetFromForward(newForward("remote", { port: 9000, dest_host: "", dest_port: 3000 }));
+    assert.equal(preset.name, "Remote 9000");
+    assert.equal(presetSummary(preset), "-R 9000 → …:3000");
+  });
+
+  test("checks presets, allowing an empty host", () => {
+    const preset = presetFromForward(newForward("local", { port: 1, dest_host: "", dest_port: 2 }));
+    assert.deepEqual(presetErrors(preset), {});
+    const errors = presetErrors({ ...preset, name: " ", bind: "box", port: 0, dest_host: "a b" });
+    assert.deepEqual(Object.keys(errors).sort(), ["bind", "dest_host", "name", "port"]);
   });
 });

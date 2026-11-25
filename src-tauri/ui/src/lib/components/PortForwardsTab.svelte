@@ -1,7 +1,16 @@
 <script lang="ts">
   import { hopTitle } from "../chain";
   import { isActive } from "../format";
-  import { FLAG, PRESETS, findForwardFlags, forwardSpec, newForward, parseForwardFlags } from "../portForwards";
+  import {
+    FLAG,
+    findForwardFlags,
+    forwardFromPreset,
+    forwardSpec,
+    newForward,
+    parseForwardFlags,
+    presetFromForward,
+    presetSummary,
+  } from "../portForwards";
   import { store } from "../stores.svelte";
   import type { ForwardDirection, PortForward, SessionProfile } from "../types";
   import PortForwardRow from "./PortForwardRow.svelte";
@@ -53,12 +62,23 @@
     setForwards((list) => [...list, newForward(direction)]);
   }
 
-  function addPreset(label: string) {
-    const preset = PRESETS.find((p) => p.label === label);
+  const MANAGE = "manage";
+
+  function addPreset(value: string) {
     presetValue = "";
-    if (!preset) return;
-    const { label: _, ...fields } = preset;
-    setForwards((list) => [...list, newForward(preset.direction, fields)]);
+    if (value === MANAGE) {
+      store.openForwardPresets();
+      return;
+    }
+    const preset = store.presets.find((p) => p.id === value);
+    if (preset) setForwards((list) => [...list, forwardFromPreset(preset)]);
+  }
+
+  let savedPreset = $state<string | null>(null);
+
+  async function saveAsPreset(forward: PortForward) {
+    const saved = await store.saveForwardPreset(presetFromForward(forward));
+    if (saved) savedPreset = `Saved "${saved.name}" as a preset. Manage presets in Settings.`;
   }
 
   function addPasted() {
@@ -105,9 +125,10 @@
       <span class="sr-only">Add from a preset</span>
       <select bind:value={presetValue} onchange={(e) => addPreset(e.currentTarget.value)}>
         <option value="" disabled>Add from a preset…</option>
-        {#each PRESETS as preset (preset.label)}
-          <option value={preset.label}>{preset.label} ({FLAG[preset.direction]})</option>
+        {#each store.presets as preset (preset.id)}
+          <option value={preset.id}>{preset.name} ({presetSummary(preset)})</option>
         {/each}
+        <option value={MANAGE}>Manage presets…</option>
       </select>
     </label>
     <button type="button" aria-expanded={pasteOpen} onclick={() => (pasteOpen = !pasteOpen)}>Paste ssh flags…</button>
@@ -144,6 +165,8 @@
   {/if}
 </section>
 
+{#if savedPreset}<p class="muted" role="status">{savedPreset}</p>{/if}
+
 {#if forwards.length === 0}
   <p class="muted">No port forwards. Add one above.</p>
 {/if}
@@ -158,5 +181,6 @@
     lockedReason={forward.enabled ? lockedReason : undefined}
     onChange={(patch) => update(forward.id, patch)}
     onRemove={() => remove(forward.id)}
+    onSavePreset={() => saveAsPreset(forward)}
   />
 {/each}

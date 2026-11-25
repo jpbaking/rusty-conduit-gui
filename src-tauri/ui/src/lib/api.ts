@@ -16,6 +16,7 @@ import type {
   FilterTestResult,
   GenerateAlgorithm,
   HostKeyEntry,
+  ForwardPreset,
   HostProfile,
   ImportBackupResult,
   ImportSummary,
@@ -131,6 +132,11 @@ export const api = {
   listHosts: () => call<HostProfile[]>("list_hosts"),
   upsertHost: (host: HostProfile) => call<HostProfile>("upsert_host", { host }),
   deleteHost: (id: Uuid) => call<void>("delete_host", { id }),
+  listForwardPresets: () => call<ForwardPreset[]>("list_forward_presets"),
+  upsertForwardPreset: (preset: ForwardPreset) =>
+    call<ForwardPreset>("upsert_forward_preset", { preset }),
+  deleteForwardPreset: (id: Uuid) => call<void>("delete_forward_preset", { id }),
+  restoreForwardPresets: () => call<ForwardPreset[]>("restore_forward_presets"),
   promoteHopToHost: (sessionId: Uuid, hopId: string, name: string | null = null) =>
     call<HostProfile>("promote_hop_to_host", { sessionId, hopId, name }),
 

@@ -1,6 +1,6 @@
 // Port forwards (`ssh -L` / `ssh -R`): formatting, presets, and reading `ssh` flags.
 
-import type { ForwardDirection, PortForward } from "./types";
+import type { ForwardDirection, ForwardPreset, PortForward } from "./types";
 import { isIpAddress } from "./validate.ts";
 
 export const FLAG: Record<ForwardDirection, string> = { local: "-L", remote: "-R" };
@@ -38,31 +38,52 @@ export function newForward(direction: ForwardDirection, patch: Partial<PortForwa
   };
 }
 
-export interface ForwardPreset {
-  label: string;
-  direction: ForwardDirection;
-  name: string;
-  /** Local listen port. A high port, so no elevated rights are needed. */
-  port: number;
-  dest_host: string;
-  dest_port: number;
+const NIL = "00000000-0000-0000-0000-000000000000";
+const LOOPBACK = "127.0.0.1";
+
+/** A new forward with a preset's values. The preset is copied, not linked. */
+export function forwardFromPreset(preset: ForwardPreset): PortForward {
+  return newForward(preset.direction, {
+    name: preset.name,
+    bind: preset.bind ?? LOOPBACK,
+    port: preset.port,
+    dest_host: preset.dest_host,
+    dest_port: preset.dest_port,
+  });
 }
 
-export const PRESETS: readonly ForwardPreset[] = [
-  { label: "PostgreSQL", direction: "local", name: "PostgreSQL", port: 15432, dest_host: "", dest_port: 5432 },
-  { label: "MySQL", direction: "local", name: "MySQL", port: 13306, dest_host: "", dest_port: 3306 },
-  { label: "Redis", direction: "local", name: "Redis", port: 16379, dest_host: "", dest_port: 6379 },
-  { label: "Remote Desktop", direction: "local", name: "Remote Desktop", port: 13389, dest_host: "", dest_port: 3389 },
-  { label: "Web UI (HTTPS)", direction: "local", name: "Web UI", port: 18443, dest_host: "", dest_port: 443 },
-  {
-    label: "Share a local dev server",
-    direction: "remote",
-    name: "Dev server",
-    port: 8000,
-    dest_host: "localhost",
-    dest_port: 3000,
-  },
-];
+/** A new preset from a forward. The backend gives it an id. */
+export function presetFromForward(forward: PortForward): ForwardPreset {
+  const name = forward.name.trim() || `${forward.direction === "local" ? "Local" : "Remote"} ${forward.port}`;
+  return {
+    id: NIL,
+    name,
+    direction: forward.direction,
+    bind: forward.bind === LOOPBACK ? null : forward.bind,
+    port: forward.port,
+    dest_host: forward.dest_host.trim(),
+    dest_port: forward.dest_port,
+  };
+}
+
+export function blankPreset(direction: ForwardDirection = "local"): ForwardPreset {
+  return {
+    id: NIL,
+    name: "",
+    direction,
+    bind: null,
+    port: Number.NaN,
+    dest_host: direction === "remote" ? "localhost" : "",
+    dest_port: Number.NaN,
+  };
+}
+
+/** A short description, such as `-L 15432 → db:5432`, with `…` for a host chosen per session. */
+export function presetSummary(preset: ForwardPreset): string {
+  const listen = preset.bind ? hostPort(preset.bind, preset.port) : String(preset.port);
+  const host = preset.dest_host.trim() || "…";
+  return `${FLAG[preset.direction]} ${listen} → ${host === "…" ? `…:${preset.dest_port}` : hostPort(host, preset.dest_port)}`;
+}
 
 /** Splits `ssh` forward syntax on `:`, keeping `[IPv6]` parts whole. */
 function splitSpec(spec: string): string[] | null {
