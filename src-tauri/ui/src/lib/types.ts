@@ -476,7 +476,8 @@ export type UiEvent =
   | { event: "view-logs"; payload: ViewLogsPayload }
   | { event: "unlock-vault" }
   | { event: "close-confirm" }
-  | { event: "quit-confirm" };
+  | { event: "quit-confirm" }
+  | { event: "migration-notice"; payload: MigrationNoticePayload };
 
 export interface ShellSnapshot {
   tray_available: boolean;
@@ -484,6 +485,11 @@ export interface ShellSnapshot {
 }
 
 // Event payloads.
+
+export interface MigrationNoticePayload {
+  message: string;
+  is_warning: boolean;
+}
 
 export interface TrayStatusPayload {
   tray_available: boolean;

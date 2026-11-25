@@ -1,5 +1,5 @@
 {
-  "name": "rusty-conduit-ssh-ui",
+  "name": "rusty-conduit-gui-ui",
   "private": true,
   "version": "0.1.0",
   "type": "module",

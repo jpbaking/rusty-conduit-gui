@@ -2,7 +2,7 @@
 name = "conduit-vault"
 version = "0.1.0"
 edition = "2021"
-description = "Envelope-encrypted secret vault (vault.bin) for Rusty Conduit SSH GUI."
+description = "Envelope-encrypted secret vault (vault.bin) for Rusty Conduit GUI."
 license = "BSD-3-Clause"
 
 [dependencies]

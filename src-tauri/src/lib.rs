@@ -2,6 +2,7 @@
 
 pub mod commands;
 pub mod controller;
+pub mod migration;
 pub mod platform;
 pub mod tray_bridge;
 #[cfg(any(not(target_os = "linux"), conduit_check_tauri_tray))]
@@ -21,8 +22,8 @@ use platform::CliFlags;
 use tray_bridge::TauriShell;
 use window::{ShellState, EVENT_RUNTIME, EVENT_RUNTIME_LAGGED, MAIN_WINDOW};
 
-/// Name of the login autostart entry, such as `rusty-conduit-ssh-gui.desktop` on Linux.
-const AUTOSTART_NAME: &str = "rusty-conduit-ssh-gui";
+/// Name of the login autostart entry, such as `rusty-conduit-gui.desktop` on Linux.
+const AUTOSTART_NAME: &str = "rusty-conduit-gui";
 
 /// Keeps decrypted secrets out of crash output: panics report only their source location.
 fn install_panic_hook() {
@@ -117,6 +118,21 @@ pub fn run() {
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
             let dir = app.path().app_data_dir()?;
+            migration::ensure_old_instance_not_running().map_err(|error| {
+                eprintln!("{error}");
+                error
+            })?;
+            let migration_outcome = migration::migrate_data_dir(&dir).map_err(|error| {
+                eprintln!("{error}");
+                error
+            })?;
+            if let Some((message, is_warning)) = migration_outcome.banner() {
+                eprintln!("upgrade migration: {message}");
+                window::deliver_ui_event(
+                    app.handle(),
+                    window::UiEvent::MigrationNotice { message, is_warning },
+                );
+            }
             let controller = AppController::open(dir, ControllerOptions::default())?;
             tauri::async_runtime::spawn(controller.known_hosts_autosave());
             app.manage(controller.clone());
@@ -129,7 +145,13 @@ pub fn run() {
             })));
 
             let handle = app.handle().clone();
-            app.manage(AutostartHandle::new(PluginAutostart(handle.clone())));
+            let autostart = PluginAutostart(handle.clone());
+            match migration::migrate_os_autostart(&autostart) {
+                Ok(true) => eprintln!("upgrade migration: migrated login autostart to {AUTOSTART_NAME}"),
+                Ok(false) => {}
+                Err(error) => eprintln!("upgrade migration: could not migrate login autostart: {error}"),
+            }
+            app.manage(AutostartHandle::new(autostart));
             tauri::async_runtime::spawn(forward_runtime_events(handle.clone(), controller.clone()));
 
             let backend = tray_bridge::create_backend(&handle, tray_bridge::current_model(&controller));

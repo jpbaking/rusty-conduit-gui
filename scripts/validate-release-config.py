@@ -24,7 +24,7 @@ CI_COMMANDS = (
     "--test secret_leak_scan",
     "scripts/check-pure-rust-crypto.py",
     "scripts/validate-release-config.py",
-    '--cfg conduit_check_tauri_tray" cargo check -p rusty-conduit-ssh-gui --tests',
+    '--cfg conduit_check_tauri_tray" cargo check -p rusty-conduit-gui --tests',
 )
 RELEASE_TARGETS = {
     "linux-x64": ("ubuntu-22.04", "x86_64-unknown-linux-gnu"),
@@ -99,7 +99,7 @@ def check_nsis_hooks(errors):
     required = (
         "!macro NSIS_HOOK_PREINSTALL",
         "!macro NSIS_HOOK_PREUNINSTALL",
-        "rusty-conduit-ssh-gui.exe",
+        "rusty-conduit-gui.exe",
         "conduit-worker.exe",
         "taskkill",
     )
@@ -220,7 +220,7 @@ def check_ci(document, errors):
         errors.append("ci.yml: rust-and-e2e must check out the repository")
     steps = rust.get("steps", []) if isinstance(rust, dict) else []
     paths = {(step.get("with") or {}).get("path") for step in steps if isinstance(step, dict)}
-    if not {"rusty-conduit-ssh-gui", "rusty-conduit-ssh"} <= paths:
+    if not {"rusty-conduit-gui", "rusty-conduit-ssh"} <= paths:
         errors.append("ci.yml: rust-and-e2e must check out both sibling repositories")
 
 

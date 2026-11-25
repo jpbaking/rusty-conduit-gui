@@ -13,7 +13,7 @@ permissions:
 env:
   # Override with the repository variables UPSTREAM_REPO and UPSTREAM_REF.
   UPSTREAM_REPO: ${{ vars.UPSTREAM_REPO || 'jpbaking/rusty-conduit-ssh' }}
-  UPSTREAM_REF: ${{ vars.UPSTREAM_REF || 'main' }}
+  UPSTREAM_REF: ${{ vars.UPSTREAM_REF || 'v1.3.0' }}
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -22,12 +22,12 @@ jobs:
     runs-on: ubuntu-22.04
     defaults:
       run:
-        working-directory: rusty-conduit-ssh-gui/src-tauri/ui
+        working-directory: rusty-conduit-gui/src-tauri/ui
     steps:
       - name: Check out this repository
         uses: actions/checkout@v4
         with:
-          path: rusty-conduit-ssh-gui
+          path: rusty-conduit-gui
           persist-credentials: false
 
       - name: Set up Node
@@ -35,7 +35,7 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: rusty-conduit-ssh-gui/src-tauri/ui/package-lock.json
+          cache-dependency-path: rusty-conduit-gui/src-tauri/ui/package-lock.json
 
       - run: npm ci
       - run: npm run check
@@ -52,7 +52,7 @@ jobs:
     defaults:
       run:
         shell: bash
-        working-directory: rusty-conduit-ssh-gui
+        working-directory: rusty-conduit-gui
     steps:
       - name: Keep line endings unchanged on Windows
         if: runner.os == 'Windows'
@@ -62,7 +62,7 @@ jobs:
       - name: Check out this repository
         uses: actions/checkout@v4
         with:
-          path: rusty-conduit-ssh-gui
+          path: rusty-conduit-gui
           persist-credentials: false
 
       # Cargo.toml depends on ../rusty-conduit-ssh, so upstream must be a sibling directory.
@@ -96,7 +96,7 @@ jobs:
       - name: Cache Rust builds
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: rusty-conduit-ssh-gui -> target
+          workspaces: rusty-conduit-gui -> target
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
@@ -105,7 +105,7 @@ jobs:
         run: cargo test --workspace
 
       - name: Secret-leak scan
-        run: cargo test -p rusty-conduit-ssh-gui --test secret_leak_scan
+        run: cargo test -p rusty-conduit-gui --test secret_leak_scan
 
       - name: Pure-Rust crypto check
         run: python scripts/check-pure-rust-crypto.py
@@ -115,4 +115,4 @@ jobs:
 
       - name: Tauri tray compile check
         if: runner.os == 'Linux'
-        run: RUSTFLAGS="--cfg conduit_check_tauri_tray" cargo check -p rusty-conduit-ssh-gui --tests --features tauri/tray-icon
+        run: RUSTFLAGS="--cfg conduit_check_tauri_tray" cargo check -p rusty-conduit-gui --tests --features tauri/tray-icon

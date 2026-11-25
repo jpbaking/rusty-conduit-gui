@@ -2,7 +2,7 @@
 name = "conduit-tray"
 version = "0.1.0"
 edition = "2021"
-description = "UI-agnostic system tray model and backends for Rusty Conduit SSH GUI."
+description = "UI-agnostic system tray model and backends for Rusty Conduit GUI."
 license = "BSD-3-Clause"
 
 [dependencies]

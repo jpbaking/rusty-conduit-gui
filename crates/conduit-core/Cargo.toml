@@ -2,7 +2,7 @@
 name = "conduit-core"
 version = "0.1.0"
 edition = "2021"
-description = "UI-agnostic data model, validation, config mapping, and atomic persistence for Rusty Conduit SSH GUI sessions."
+description = "UI-agnostic data model, validation, config mapping, and atomic persistence for Rusty Conduit GUI sessions."
 license = "BSD-3-Clause"
 
 [dependencies]

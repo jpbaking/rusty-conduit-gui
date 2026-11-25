@@ -6,7 +6,7 @@ use conduit_runtime::{ListenerInfo, SessionSnapshot, SessionState};
 use uuid::Uuid;
 
 /// Name shown at the top of the tray menu.
-pub const APP_TITLE: &str = "Rusty Conduit (SSH)";
+pub const APP_TITLE: &str = "Rusty Conduit GUI";
 
 // These match the `Display` output of the engine's `ListenerRole`, which is how
 // `ListenerInfo::role` is filled in.

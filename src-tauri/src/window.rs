@@ -30,6 +30,8 @@ pub enum UiEvent {
     CloseConfirm,
     /// Sessions are active: confirm before quitting.
     QuitConfirm,
+    /// One-time upgrade banner (e.g. rebrand migration completed or skipped).
+    MigrationNotice { message: String, is_warning: bool },
 }
 
 impl UiEvent {
@@ -40,6 +42,7 @@ impl UiEvent {
             Self::UnlockVault => "unlock-vault",
             Self::CloseConfirm => "close-confirm",
             Self::QuitConfirm => "quit-confirm",
+            Self::MigrationNotice { .. } => "migration-notice",
         }
     }
 

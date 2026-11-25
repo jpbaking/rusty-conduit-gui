@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Rusty Conduit (SSH)",
+  "productName": "Rusty Conduit GUI",
   "version": "0.1.0",
-  "identifier": "io.github.rusty-conduit-ssh-gui",
+  "identifier": "io.github.rusty-conduit-gui",
   "build": {
     "frontendDist": "ui/dist"
   },
@@ -24,8 +24,8 @@
     "category": "Utility",
     "copyright": "Copyright (c) 2026, Joseph Baking",
     "license": "BSD-3-Clause",
-    "shortDescription": "Desktop shell for Rusty Conduit SSH",
-    "longDescription": "Desktop shell for Rusty Conduit SSH: Tauri v2 adapter over the conduit crates.",
+    "shortDescription": "Desktop shell for Rusty Conduit GUI",
+    "longDescription": "Desktop shell for Rusty Conduit GUI: Tauri v2 adapter over the conduit crates.",
     "linux": {
       "deb": {
         "section": "net"

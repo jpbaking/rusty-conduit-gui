@@ -15,8 +15,8 @@ use conduit_vault::{generate_key, Argon2Params, KeyGenAlgorithm, MemoryKeyringBa
 use russh::keys::ssh_key::LineEnding;
 use russh::keys::PrivateKey;
 use russh::server::{self, Auth};
-use rusty_conduit_ssh_gui_lib::controller::mitm_ca::MitmCaUpload;
-use rusty_conduit_ssh_gui_lib::controller::{AppController, ControllerOptions, SecretInput};
+use rusty_conduit_gui_lib::controller::mitm_ca::MitmCaUpload;
+use rusty_conduit_gui_lib::controller::{AppController, ControllerOptions, SecretInput};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use uuid::Uuid;

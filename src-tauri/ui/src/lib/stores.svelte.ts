@@ -16,6 +16,7 @@ import type {
   HostProfile,
   KeyId,
   KeyView,
+  MigrationNoticePayload,
   MitmCaId,
   RuntimeEvent,
   SessionProfile,
@@ -136,6 +137,7 @@ class AppStore {
   #afterUnlock: (() => void) | null = null;
   logsOpen = $state(false);
   notice = $state<string | null>(null);
+  migrationNotice = $state<MigrationNoticePayload | null>(null);
 
   // Header actions.
   saving = $state(false);
@@ -414,6 +416,9 @@ class AppStore {
         break;
       case "quit-confirm":
         this.closePrompt = "quit";
+        break;
+      case "migration-notice":
+        this.migrationNotice = event.payload;
         break;
     }
   }

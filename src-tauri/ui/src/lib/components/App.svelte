@@ -50,6 +50,15 @@
         <button onclick={() => (store.trayBannerDismissed = true)}>Dismiss</button>
       </div>
     {/if}
+    {#if store.migrationNotice}
+      <div
+        class={store.migrationNotice.is_warning ? "banner error" : "banner info"}
+        role={store.migrationNotice.is_warning ? "alert" : "status"}
+      >
+        <span>{store.migrationNotice.message}</span>
+        <button onclick={() => (store.migrationNotice = null)}>Dismiss</button>
+      </div>
+    {/if}
     {#if store.notice}
       <div class="banner error" role="alert">
         <span>{store.notice}</span>

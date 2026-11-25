@@ -10,7 +10,7 @@ import sys
 import tempfile
 from pathlib import Path, PurePosixPath
 
-MAIN = "rusty-conduit-ssh-gui"
+MAIN = "rusty-conduit-gui"
 WORKER = "conduit-worker"
 MAC_ARCHES = {"x86_64", "arm64"}
 CHECKSUMS = "SHA256SUMS.txt"

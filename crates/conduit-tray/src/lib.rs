@@ -1,4 +1,4 @@
-//! UI-agnostic system tray support for Rusty Conduit SSH.
+//! UI-agnostic system tray support for Rusty Conduit GUI.
 //!
 //! [`TrayMenuModel`] describes the menu, and a [`TrayBackend`] shows it. Linux uses the
 //! pure-Rust `ksni` backend. Windows and macOS plug in a Tauri adapter from `src-tauri`.

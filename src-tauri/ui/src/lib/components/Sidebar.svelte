@@ -90,7 +90,7 @@
 </script>
 
 <aside class="sidebar">
-  <div class="brand">Rusty Conduit (SSH)</div>
+  <div class="brand">Rusty Conduit GUI</div>
 
   <nav aria-label="Main">
     {#each NAV as item (item.view)}

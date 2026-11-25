@@ -1,4 +1,4 @@
-# Rusty Conduit SSH GUI — UI-agnostic Rust workspace.
+# Rusty Conduit GUI — UI-agnostic Rust workspace.
 #
 # All connection, vault, and session orchestration logic lives in these crates so the
 # Tauri/Svelte frontend stays a thin adapter. See docs/MASTER-PLAN.md.
@@ -16,8 +16,8 @@ members = [
 
 # Shared workspace dependencies so every crate pins identical versions.
 [workspace.dependencies]
-# Embedded upstream proxy engine. Embedded as a library crate with zero upstream changes.
-rusty-conduit-ssh = { path = "../rusty-conduit-ssh" }
+# Embedded upstream proxy engine (pinned to v1.3.0 for U0 rebrand; U1 moves to rusty-conduit-engine).
+rusty-conduit-ssh = { git = "https://github.com/jpbaking/rusty-conduit-ssh", tag = "v1.3.0" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

@@ -398,7 +398,7 @@ mod tests {
         assert_eq!(
             labels,
             [
-                "Rusty Conduit (SSH) — 1 connected · 0 needs attention",
+                "Rusty Conduit GUI — 1 connected · 0 needs attention",
                 "",
                 "● prod__eu — Connected (SOCKS :1080)",
                 "",

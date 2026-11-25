@@ -2,7 +2,7 @@
 name = "conduit-ssh"
 version = "0.1.0"
 edition = "2021"
-description = "russh multi-hop chain, host-key pinning, and scoped agent for Rusty Conduit SSH GUI."
+description = "russh multi-hop chain, host-key pinning, and scoped agent for Rusty Conduit GUI."
 license = "BSD-3-Clause"
 
 [dependencies]

@@ -2,7 +2,7 @@
 name = "conduit-runtime"
 version = "0.1.0"
 edition = "2021"
-description = "SessionManager, session state machine, backoff, logs, and events for Rusty Conduit SSH GUI."
+description = "SessionManager, session state machine, backoff, logs, and events for Rusty Conduit GUI."
 license = "BSD-3-Clause"
 
 [dependencies]

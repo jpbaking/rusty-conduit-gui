@@ -83,7 +83,7 @@ pub fn version_text() -> String {
 pub fn help_text() -> String {
     format!(
         "{version}
-Desktop tray and Manage Window for Rusty Conduit SSH.
+Desktop tray and Manage Window for Rusty Conduit GUI.
 
 Usage: {name} [OPTIONS]
 
@@ -212,14 +212,14 @@ mod tests {
     fn platform_version_text_names_package_and_version() {
         let text = version_text();
         assert_eq!(text, format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")));
-        assert!(text.starts_with("rusty-conduit-ssh-gui "));
+        assert!(text.starts_with("rusty-conduit-gui "));
     }
 
     #[test]
     fn platform_help_text_lists_every_flag() {
         let text = help_text();
         assert!(text.starts_with(&version_text()));
-        assert!(text.contains("Usage: rusty-conduit-ssh-gui [OPTIONS]"));
+        assert!(text.contains("Usage: rusty-conduit-gui [OPTIONS]"));
         for flag in [
             FLAG_TRAY,
             FLAG_SHOW,

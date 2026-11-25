@@ -16,7 +16,7 @@ permissions:
 env:
   # Override with the repository variables UPSTREAM_REPO and UPSTREAM_REF.
   UPSTREAM_REPO: ${{ vars.UPSTREAM_REPO || 'jpbaking/rusty-conduit-ssh' }}
-  UPSTREAM_REF: ${{ vars.UPSTREAM_REF || 'main' }}
+  UPSTREAM_REF: ${{ vars.UPSTREAM_REF || 'v1.3.0' }}
   TAURI_CLI_VERSION: 2.12.6
   CARGO_TERM_COLOR: always
 
@@ -73,7 +73,7 @@ jobs:
     defaults:
       run:
         shell: bash
-        working-directory: rusty-conduit-ssh-gui
+        working-directory: rusty-conduit-gui
     env:
       TARGET: ${{ matrix.target }}
       BUNDLE_DIR: target/${{ matrix.target }}/release/bundle
@@ -88,7 +88,7 @@ jobs:
       - name: Check out this repository
         uses: actions/checkout@v4
         with:
-          path: rusty-conduit-ssh-gui
+          path: rusty-conduit-gui
           persist-credentials: false
 
       # Cargo.toml depends on ../rusty-conduit-ssh, so upstream must be a sibling directory.
@@ -110,7 +110,7 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: rusty-conduit-ssh-gui/src-tauri/ui/package-lock.json
+          cache-dependency-path: rusty-conduit-gui/src-tauri/ui/package-lock.json
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
@@ -130,7 +130,7 @@ jobs:
         run: cargo install tauri-cli --version "$TAURI_CLI_VERSION" --locked
 
       - name: Build frontend
-        working-directory: rusty-conduit-ssh-gui/src-tauri/ui
+        working-directory: rusty-conduit-gui/src-tauri/ui
         run: |
           npm ci
           npm run build
@@ -216,7 +216,7 @@ jobs:
           mkdir -p release-files
           out="$PWD/release-files"
           cd "$BUNDLE_DIR"
-          # The product name "Rusty Conduit (SSH)" names the installers. Release assets get a
+          # The product name "Rusty Conduit GUI" names the installers. Release assets get a
           # name without spaces or parentheses, which GitHub would otherwise rewrite.
           asset_name() { basename "$1" | tr ' ' '-' | tr -d '()'; }
           for file in $ARTIFACTS; do
@@ -238,7 +238,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: bundle-${{ matrix.name }}
-          path: rusty-conduit-ssh-gui/release-files/*
+          path: rusty-conduit-gui/release-files/*
           if-no-files-found: error
 
   release:

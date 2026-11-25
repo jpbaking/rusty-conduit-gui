@@ -2,7 +2,7 @@
 name = "conduit-openssh"
 version = "0.1.0"
 edition = "2021"
-description = "Isolated, opt-in OpenSSH compatibility engine for Rusty Conduit SSH GUI."
+description = "Isolated, opt-in OpenSSH compatibility engine for Rusty Conduit GUI."
 license = "BSD-3-Clause"
 
 [[bin]]

@@ -1,4 +1,4 @@
-# Releasing Rusty Conduit SSH GUI
+# Releasing Rusty Conduit GUI
 
 This runbook covers how to cut a release, build installers locally, configure signing, and smoke-test the result.
 
@@ -36,8 +36,8 @@ Tags use the format `vX.Y.Z`, for example `v0.2.0`. The tag must point at the co
 
 ```text
 parent/
-├── rusty-conduit-ssh/       # upstream engine
-└── rusty-conduit-ssh-gui/   # this repository
+├── rusty-conduit-ssh/   # upstream engine
+└── rusty-conduit-gui/   # this repository
 ```
 
 CI creates the same layout. Two optional GitHub repository variables choose what it checks out:
@@ -45,7 +45,7 @@ CI creates the same layout. Two optional GitHub repository variables choose what
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `UPSTREAM_REPO` | `jpbaking/rusty-conduit-ssh` | Upstream repository |
-| `UPSTREAM_REF` | `main` | Branch, tag, or commit to build against |
+| `UPSTREAM_REF` | `v1.3.0` | Branch, tag, or commit to build against |
 
 **Pin `UPSTREAM_REF` to a tag or commit for a release.** The default follows `main`, so rebuilding the same tag later can produce different code.
 

@@ -1,6 +1,6 @@
-# Rusty Conduit SSH GUI
+# Rusty Conduit GUI
 
-A desktop system tray app and **Manage Window** for [`rusty-conduit-ssh`](../rusty-conduit-ssh). Save, run, autostart, and auto-reconnect many SSH proxy sessions at once, without touching `~/.ssh`.
+A desktop system tray app and **Manage Window** for the Rusty Conduit proxy family. Save, run, autostart, and auto-reconnect many SSH proxy sessions at once, without touching `~/.ssh`.
 
 Built with Tauri v2, Svelte 5, and TypeScript over a UI-agnostic Rust workspace.
 
@@ -24,7 +24,7 @@ Built with Tauri v2, Svelte 5, and TypeScript over a UI-agnostic Rust workspace.
 | `crates/conduit-openssh` | Isolated, opt-in OpenSSH engine and the `conduit-worker` binary |
 | `crates/conduit-runtime` | `SessionManager`, session state machine, backoff, logs, events, and wake listener |
 | `crates/conduit-tray` | UI-agnostic tray model and backends |
-| `src-tauri` | Tauri v2 desktop shell (`rusty-conduit-ssh-gui` binary) |
+| `src-tauri` | Tauri v2 desktop shell (`rusty-conduit-gui` binary) |
 | `src-tauri/ui` | Svelte 5 + TypeScript frontend |
 | `scripts` | Build, release, and policy check scripts |
 | `docs` | Master plan and release runbook |
@@ -43,8 +43,8 @@ Built with Tauri v2, Svelte 5, and TypeScript over a UI-agnostic Rust workspace.
 
 ```text
 parent/
-├── rusty-conduit-ssh/       # upstream engine
-└── rusty-conduit-ssh-gui/   # this repository
+├── rusty-conduit-ssh/   # upstream engine (pinned to v1.3.0 for U0; U1 moves to rusty-conduit-engine)
+└── rusty-conduit-gui/   # this repository
 ```
 
 ## Development
@@ -53,7 +53,7 @@ Build the frontend, then run the app from the repository root:
 
 ```sh
 (cd src-tauri/ui && npm ci && npm run build)
-cargo run -p rusty-conduit-ssh-gui
+cargo run -p rusty-conduit-gui
 ```
 
 Run the same checks as CI:

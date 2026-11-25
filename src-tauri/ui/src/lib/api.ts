@@ -200,6 +200,9 @@ export async function subscribeShellEvents(handlers: ShellEventHandlers): Promis
     listen<null>("unlock-vault", () => handlers.onUiEvent({ event: "unlock-vault" })),
     listen<null>("close-confirm", () => handlers.onUiEvent({ event: "close-confirm" })),
     listen<null>("quit-confirm", () => handlers.onUiEvent({ event: "quit-confirm" })),
+    listen<{ message: string; is_warning: boolean }>("migration-notice", (e) =>
+      handlers.onUiEvent({ event: "migration-notice", payload: e.payload }),
+    ),
   ]);
 
   const attached: UnlistenFn[] = [];

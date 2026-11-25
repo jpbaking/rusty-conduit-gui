@@ -9,6 +9,7 @@
 !macroend
 
 !macro CONDUIT_STOP_ALL
+  !insertmacro CONDUIT_STOP_PROCESS "rusty-conduit-gui.exe"
   !insertmacro CONDUIT_STOP_PROCESS "rusty-conduit-ssh-gui.exe"
   !insertmacro CONDUIT_STOP_PROCESS "conduit-worker.exe"
 !macroend

@@ -1,16 +1,16 @@
 [package]
-name = "rusty-conduit-ssh-gui"
+name = "rusty-conduit-gui"
 version = "0.1.0"
 edition = "2021"
-description = "Desktop shell for Rusty Conduit SSH: Tauri v2 adapter over the conduit crates."
+description = "Desktop shell for Rusty Conduit GUI: Tauri v2 adapter over the conduit crates."
 license = "BSD-3-Clause"
 
 [lib]
-name = "rusty_conduit_ssh_gui_lib"
+name = "rusty_conduit_gui_lib"
 path = "src/lib.rs"
 
 [[bin]]
-name = "rusty-conduit-ssh-gui"
+name = "rusty-conduit-gui"
 path = "src/main.rs"
 
 [build-dependencies]
