@@ -79,9 +79,11 @@ fn facts(ca: &CaMaterial) -> CaFacts {
     }
 }
 
-fn pem_block(label: &str, der: &[u8]) -> String {
-    let body = base64::engine::general_purpose::STANDARD.encode(der);
-    let mut out = format!("-----BEGIN {label}-----\n");
+/// One PEM block with LF line endings. Zeroized on drop, since it may hold a private key.
+fn pem_block(label: &str, der: &[u8]) -> Zeroizing<String> {
+    let body = Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(der));
+    let mut out = Zeroizing::new(String::with_capacity(body.len() + body.len() / 64 + 64));
+    out.push_str(&format!("-----BEGIN {label}-----\n"));
     for line in body.as_bytes().chunks(64) {
         out.push_str(std::str::from_utf8(line).expect("base64 is ASCII"));
         out.push('\n');
@@ -118,7 +120,10 @@ pub(crate) fn normalize(
     .map_err(unusable)?;
 
     let key = ca.key_pair().map_err(unusable)?;
-    let key_pem = Zeroizing::new(key.serialize_pem());
+    // Written here rather than by `serialize_pem`, which uses CRLF on Windows: the stored PEM
+    // has the same LF line endings on every platform.
+    let key_der = Zeroizing::new(key.serialize_der());
+    let key_pem = pem_block("PRIVATE KEY", &key_der);
     let mut pem = Zeroizing::new(String::new());
     for cert in ca.chain() {
         pem.push_str(&pem_block("CERTIFICATE", cert.as_ref()));
