@@ -94,6 +94,7 @@ export const api = {
     call<VaultStatus>("create_vault", { password, useKeyring }),
   unlockVault: (password: string) => call<VaultStatus>("unlock_vault", { password }),
   unlockVaultKeyring: () => call<VaultStatus>("unlock_vault_keyring"),
+  setVaultKeyring: (enabled: boolean) => call<VaultStatus>("set_vault_keyring", { enabled }),
   lockVault: () => call<VaultStatus>("lock_vault"),
 
   // Keys and write-only secrets.

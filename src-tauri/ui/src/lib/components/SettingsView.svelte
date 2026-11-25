@@ -4,6 +4,24 @@
   import { store } from "../stores.svelte";
   import type { AutostartStatus } from "../types";
 
+  let keyringBusy = $state(false);
+  let keyringError = $state<string | null>(null);
+
+  async function toggleKeyring(event: Event & { currentTarget: HTMLInputElement }) {
+    const enabled = event.currentTarget.checked;
+    keyringBusy = true;
+    keyringError = null;
+    try {
+      store.setVault(await api.setVaultKeyring(enabled));
+    } catch (error) {
+      keyringError = errorMessage(error);
+      // Show the setting as it really is, not as clicked.
+      event.currentTarget.checked = store.vault.keyring;
+    } finally {
+      keyringBusy = false;
+    }
+  }
+
   let autostart = $state.raw<AutostartStatus | null>(null);
   let autostartBusy = $state(false);
   let autostartError = $state<string | null>(null);
@@ -231,6 +249,22 @@
           </button>
         {/if}
       </div>
+      {#if store.vault.initialized}
+        <label class="check">
+          <input
+            type="checkbox"
+            checked={store.vault.keyring}
+            disabled={keyringBusy || (!unlocked && !store.vault.keyring)}
+            onchange={toggleKeyring}
+          />
+          Unlock with the OS keyring
+          <small class="muted">the master password keeps working</small>
+        </label>
+        {#if !unlocked && !store.vault.keyring}
+          <p class="muted">Unlock the vault to store its key in the OS keyring.</p>
+        {/if}
+        {#if keyringError}<p class="reason" role="alert">{keyringError}</p>{/if}
+      {/if}
     </section>
 
     <section aria-labelledby="settings-backup">

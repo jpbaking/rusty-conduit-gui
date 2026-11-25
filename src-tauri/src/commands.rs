@@ -62,6 +62,11 @@ pub async fn unlock_vault_keyring(c: Ctl<'_>) -> CmdResult<VaultStatus> {
 }
 
 #[tauri::command]
+pub async fn set_vault_keyring(c: Ctl<'_>, enabled: bool) -> CmdResult<VaultStatus> {
+    c.set_vault_keyring(enabled).await
+}
+
+#[tauri::command]
 pub async fn lock_vault(c: Ctl<'_>) -> CmdResult<VaultStatus> {
     blocking(&c, |c| Ok(c.lock_vault())).await
 }
@@ -439,6 +444,7 @@ macro_rules! ipc_handler {
             $crate::commands::create_vault,
             $crate::commands::unlock_vault,
             $crate::commands::unlock_vault_keyring,
+            $crate::commands::set_vault_keyring,
             $crate::commands::lock_vault,
             $crate::commands::import_key_pem,
             $crate::commands::generate_key,
@@ -512,7 +518,7 @@ mod tests {
 
     /// Every registered command. The test fails if one is added without being exercised.
     const ALL_COMMANDS: &[&str] = &[
-        "vault_status", "create_vault", "unlock_vault", "unlock_vault_keyring", "lock_vault",
+        "vault_status", "create_vault", "unlock_vault", "unlock_vault_keyring", "set_vault_keyring", "lock_vault",
         "import_key_pem", "generate_key", "rename_key", "delete_key", "list_keys",
         "set_password_secret", "set_mitm_passphrase", "delete_secret", "export_backup",
         "import_backup", "get_state_summary", "list_sessions", "upsert_session", "delete_session", "duplicate_session",
@@ -670,6 +676,8 @@ mod tests {
         assert_eq!(ipc.ok("unlock_vault", json!({ "password": MASTER }))["unlocked"], true);
         ipc.ok("lock_vault", json!({}));
         assert_eq!(ipc.ok("unlock_vault_keyring", json!({}))["unlocked"], true);
+        assert_eq!(ipc.ok("set_vault_keyring", json!({ "enabled": false }))["keyring"], false);
+        assert_eq!(ipc.ok("set_vault_keyring", json!({ "enabled": true }))["keyring"], true);
 
         // Keys: plain and passphrase-protected imports, plus a malformed one that must not echo.
         let (plain, _) = conduit_vault::generate_key(KeyGenAlgorithm::Ed25519).unwrap();

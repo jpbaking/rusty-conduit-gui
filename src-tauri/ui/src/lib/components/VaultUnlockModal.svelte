@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { tick } from "svelte";
+  import { onMount, tick } from "svelte";
   import { api, errorMessage } from "../api";
   import { store } from "../stores.svelte";
   import type { VaultStatus } from "../types";
@@ -61,6 +61,11 @@
     await run(() => (creating ? api.createVault(master, keyring) : api.unlockVault(master)));
   }
 
+  // With the key in the OS keyring, try it right away; the password field stays as a fallback.
+  onMount(() => {
+    if (!creating && store.vault.keyring) void run(api.unlockVaultKeyring);
+  });
+
   function dismiss() {
     if (!locked) store.dismissUnlock();
   }
@@ -97,7 +102,7 @@
   </form>
   {#snippet actions()}
     <button type="button" disabled={locked} onclick={dismiss}>Not now</button>
-    {#if !creating}
+    {#if !creating && store.vault.keyring}
       <button type="button" disabled={locked} onclick={() => run(api.unlockVaultKeyring)}>Use OS Keyring</button>
     {/if}
     <button type="submit" form={formId} class="primary" disabled={locked || !ready}>

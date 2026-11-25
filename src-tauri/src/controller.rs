@@ -144,6 +144,8 @@ pub struct VaultStatus {
     /// `vault.bin` exists.
     pub initialized: bool,
     pub unlocked: bool,
+    /// The vault's key is also in the OS keyring, so it can be unlocked without the password.
+    pub keyring: bool,
 }
 
 /// Opaque result of storing a secret. Never carries the secret itself.
@@ -174,6 +176,9 @@ struct Paths {
     config: PathBuf,
     known_hosts: PathBuf,
     vault: PathBuf,
+    /// Present while the vault's key is stored in the OS keyring. Kept next to the vault on this
+    /// machine, never exported, so the app knows without reading the keyring (which can prompt).
+    vault_keyring: PathBuf,
 }
 
 struct Inner {
@@ -247,6 +252,7 @@ impl AppController {
             config: dir.join("config.json"),
             known_hosts: dir.join("known_hosts.json"),
             vault: dir.join("vault.bin"),
+            vault_keyring: dir.join("vault.keyring"),
         };
 
         let config = if paths.config.exists() {
@@ -399,7 +405,39 @@ impl AppController {
         VaultStatus {
             initialized: self.inner.paths.vault.exists(),
             unlocked: self.vault_read().is_unlocked(),
+            keyring: self.inner.paths.vault_keyring.exists(),
         }
+    }
+
+    /// Stores the unlocked vault's key in the OS keyring, or removes it. Storing needs the vault
+    /// unlocked; removing does not. The master password keeps working either way.
+    pub async fn set_vault_keyring(&self, enabled: bool) -> Result<VaultStatus, AppError> {
+        let controller = self.clone();
+        run_blocking(move || {
+            let inner = &controller.inner;
+            let _lifecycle = lock(&inner.vault_lifecycle);
+            let marker = &inner.paths.vault_keyring;
+            if enabled {
+                controller.vault_read().store_in_keyring(inner.keyring.as_ref())?;
+                fs::write(marker, b"").map_err(|e| {
+                    AppError::Io(format!("failed to record the keyring setting: {e}"))
+                })?;
+            } else {
+                controller.vault_read().remove_from_keyring(inner.keyring.as_ref())?;
+                match fs::remove_file(marker) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        return Err(AppError::Io(format!(
+                            "failed to record the keyring setting: {e}"
+                        )))
+                    }
+                }
+            }
+            Ok(())
+        })
+        .await?;
+        Ok(self.vault_status())
     }
 
     /// Creates `vault.bin`, unlocked. With `use_keyring` the key is also stored in the OS
@@ -427,6 +465,11 @@ impl AppController {
             } else {
                 Vault::create_with_password(&inner.paths.vault, password.as_bytes(), inner.argon)?
             };
+            if use_keyring {
+                fs::write(&inner.paths.vault_keyring, b"").map_err(|e| {
+                    AppError::Io(format!("failed to record the keyring setting: {e}"))
+                })?;
+            }
             *controller.vault_write() = vault;
             Ok(())
         })
@@ -521,7 +564,7 @@ mod tests {
         let c = controller(&dir);
         assert_eq!(
             c.vault_status(),
-            VaultStatus { initialized: false, unlocked: false }
+            VaultStatus { initialized: false, unlocked: false, keyring: false }
         );
         let names: Vec<_> = fs::read_dir(dir.path()).unwrap().collect();
         assert!(names.is_empty(), "opening must leave no files behind");
@@ -536,7 +579,7 @@ mod tests {
         let dir = TempDir::new();
         let c = controller(&dir);
         let status = c.create_vault(SecretInput::new("master"), false).await.unwrap();
-        assert_eq!(status, VaultStatus { initialized: true, unlocked: true });
+        assert_eq!(status, VaultStatus { initialized: true, unlocked: true, keyring: false });
 
         assert!(!c.lock_vault().unlocked);
         assert!(matches!(
@@ -560,8 +603,31 @@ mod tests {
         drop(c);
 
         let c = controller_with_keyring(&dir, keyring);
-        assert_eq!(c.vault_status(), VaultStatus { initialized: true, unlocked: false });
+        assert_eq!(c.vault_status(), VaultStatus { initialized: true, unlocked: false, keyring: true });
         assert!(c.unlock_vault_with_keyring().await.unwrap().unlocked);
+    }
+
+    #[tokio::test]
+    async fn keyring_can_be_turned_on_and_off_for_a_password_vault() {
+        let dir = TempDir::new();
+        let keyring = Arc::new(conduit_vault::MemoryKeyringBackend::new());
+        let c = controller_with_keyring(&dir, keyring.clone());
+        c.create_vault(SecretInput::new("master"), false).await.unwrap();
+        assert!(!c.vault_status().keyring);
+
+        assert!(c.set_vault_keyring(true).await.unwrap().keyring);
+        assert!(dir.path().join("vault.keyring").exists());
+        c.lock_vault();
+        assert!(c.unlock_vault_with_keyring().await.unwrap().unlocked);
+
+        assert!(!c.set_vault_keyring(false).await.unwrap().keyring);
+        assert!(!dir.path().join("vault.keyring").exists());
+        c.lock_vault();
+        assert!(matches!(
+            c.unlock_vault_with_keyring().await,
+            Err(AppError::Vault(VaultError::KeyringEntryMissing { .. }))
+        ));
+        assert!(c.unlock_vault_with_password(SecretInput::new("master")).await.unwrap().unlocked);
     }
 
     #[tokio::test]

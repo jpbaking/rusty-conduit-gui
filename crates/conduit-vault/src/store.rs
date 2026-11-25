@@ -235,6 +235,21 @@ impl Vault {
         self.unlock_with_password(password)
     }
 
+    /// Stores this unlocked vault's DEK in `keyring`, so it can later be unlocked without the
+    /// master password. The password keeps working too.
+    pub fn store_in_keyring(&self, keyring: &dyn KeyringBackend) -> Result<(), VaultError> {
+        let dek = self.dek.as_ref().ok_or(VaultError::Locked)?;
+        keyring.set_dek(&self.id, dek)
+    }
+
+    /// Removes this vault's DEK from `keyring`. An entry that is already gone is not an error.
+    pub fn remove_from_keyring(&self, keyring: &dyn KeyringBackend) -> Result<(), VaultError> {
+        match keyring.delete_dek(&self.id) {
+            Ok(()) | Err(VaultError::KeyringEntryMissing { .. }) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Zeroize the in-memory DEK and lock the vault.
     pub fn lock(&mut self) {
         if let Some(dek) = self.dek.as_mut() {
@@ -416,6 +431,32 @@ mod tests {
         v2.unlock(&keyring, b"master").unwrap();
         assert!(v2.is_unlocked());
 
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn password_vault_can_be_moved_onto_the_keyring_and_off_again() {
+        let path = tmp_vault("move-to-keyring");
+        let keyring = MemoryKeyringBackend::new();
+        let vault = Vault::create_with_password(&path, b"master", Argon2Params::FAST).unwrap();
+
+        let locked = Vault::open_locked(&path).unwrap();
+        assert!(matches!(locked.store_in_keyring(&keyring), Err(VaultError::Locked)));
+
+        vault.store_in_keyring(&keyring).unwrap();
+        let mut by_keyring = Vault::open_locked(&path).unwrap();
+        by_keyring.unlock_with_keyring(&keyring).unwrap();
+        assert!(by_keyring.is_unlocked());
+
+        vault.remove_from_keyring(&keyring).unwrap();
+        // Removing twice is fine, and the password still unlocks.
+        vault.remove_from_keyring(&keyring).unwrap();
+        let mut again = Vault::open_locked(&path).unwrap();
+        assert!(matches!(
+            again.unlock_with_keyring(&keyring),
+            Err(VaultError::KeyringEntryMissing { .. })
+        ));
+        again.unlock_with_password(b"master").unwrap();
         let _ = fs::remove_file(&path);
     }
 

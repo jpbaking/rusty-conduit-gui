@@ -6,9 +6,9 @@
 //! an unconfigured or locked store maps to [`VaultError::KeyringUnavailable`].
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use keyring_core::Entry;
+use keyring_core::{CredentialStore, Entry};
 use secrecy::{ExposeSecret, SecretBox};
 use crate::crypto::Dek;
 use crate::VaultError;
@@ -89,8 +89,10 @@ impl OsKeyringBackend {
 
     /// Build the platform entry for `vault_id`.
     fn entry(vault_id: &str) -> Result<Entry, VaultError> {
-        Entry::new(OS_SERVICE, vault_id).map_err(|e| VaultError::KeyringUnavailable {
-            reason: format!("{e}"),
+        Entry::new_in_store(&platform_store()?, OS_SERVICE, vault_id).map_err(|e| {
+            VaultError::KeyringUnavailable {
+                reason: format!("{e}"),
+            }
         })
     }
 }
@@ -99,6 +101,47 @@ impl Default for OsKeyringBackend {
     fn default() -> Self {
         OsKeyringBackend
     }
+}
+
+/// The platform's credential store, built on first use and kept for the process.
+///
+/// keyring-core ships no store of its own: without one, every call fails with "no default store".
+/// A failure to build it (no Secret Service on a Linux desktop yet, say) is not kept, so a later
+/// call tries again.
+fn platform_store() -> Result<Arc<CredentialStore>, VaultError> {
+    static STORE: Mutex<Option<Arc<CredentialStore>>> = Mutex::new(None);
+    let mut store = STORE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(store) = store.as_ref() {
+        return Ok(Arc::clone(store));
+    }
+    let built = new_platform_store().map_err(|e| VaultError::KeyringUnavailable {
+        reason: format!("{e}"),
+    })?;
+    *store = Some(Arc::clone(&built));
+    Ok(built)
+}
+
+/// macOS: the login Keychain.
+#[cfg(target_os = "macos")]
+fn new_platform_store() -> keyring_core::Result<Arc<CredentialStore>> {
+    Ok(apple_native_keyring_store::keychain::Store::new()?)
+}
+
+/// Windows: Credential Manager.
+#[cfg(target_os = "windows")]
+fn new_platform_store() -> keyring_core::Result<Arc<CredentialStore>> {
+    Ok(windows_native_keyring_store::Store::new()?)
+}
+
+/// Linux: the desktop's Secret Service (GNOME Keyring, KWallet, KeePassXC, ...).
+#[cfg(target_os = "linux")]
+fn new_platform_store() -> keyring_core::Result<Arc<CredentialStore>> {
+    Ok(zbus_secret_service_keyring_store::Store::new()?)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+fn new_platform_store() -> keyring_core::Result<Arc<CredentialStore>> {
+    Err(keyring_core::Error::NoDefaultStore)
 }
 
 /// Process-wide mutex serializing OS keyring calls (required for Linux D-Bus Secret Service safety).
@@ -137,8 +180,13 @@ impl KeyringBackend for OsKeyringBackend {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let entry = Self::entry(vault_id)?;
-        entry.delete_credential().map_err(|e| VaultError::KeyringUnavailable {
-            reason: format!("{e}"),
+        entry.delete_credential().map_err(|e| match e {
+            keyring_core::Error::NoEntry => VaultError::KeyringEntryMissing {
+                vault_id: vault_id.to_string(),
+            },
+            _ => VaultError::KeyringUnavailable {
+                reason: format!("{e}"),
+            },
         })
     }
 }
@@ -194,13 +242,32 @@ mod tests {
     fn os_backend_missing_entry_maps_to_missing() {
         // A fresh, unpopulated entry should surface as a missing entry rather than a store error.
         let backend = OsKeyringBackend::new();
-        // This may return KeyringEntryMissing (entry never set) or KeyringUnavailable (no store
-        // configured in the test environment); either way it must not panic.
-        match backend.get_dek("conduit-vault-does-not-exist") {
-            Ok(_) => {}
+        let result = backend.get_dek("conduit-vault-does-not-exist");
+        // macOS and Windows always have a store, so a missing entry must read as missing, never
+        // as "no store". A Linux test machine may have no Secret Service, so only there is
+        // KeyringUnavailable accepted.
+        match result {
             Err(VaultError::KeyringEntryMissing { .. }) => {}
-            Err(VaultError::KeyringUnavailable { .. }) => {}
-            Err(e) => panic!("unexpected error: {e}"),
+            Err(VaultError::KeyringUnavailable { .. }) if cfg!(target_os = "linux") => {}
+            other => panic!("expected a missing entry, got {other:?}"),
         }
+    }
+
+    /// Writes, reads back, and deletes a real OS keyring entry. Ignored by default because it
+    /// touches the user's keychain; run with `cargo test -p conduit-vault -- --ignored`.
+    #[test]
+    #[ignore = "uses the real OS keyring"]
+    fn os_backend_round_trips_dek_in_the_real_keyring() {
+        let backend = OsKeyringBackend::new();
+        let id = format!("conduit-vault-test-{}", uuid::Uuid::new_v4());
+        let dek = Dek::random();
+        backend.set_dek(&id, &dek).unwrap();
+        let read = backend.get_dek(&id);
+        backend.delete_dek(&id).unwrap();
+        assert_eq!(read.unwrap().to_bytes(), dek.to_bytes());
+        assert!(matches!(
+            backend.get_dek(&id),
+            Err(VaultError::KeyringEntryMissing { .. })
+        ));
     }
 }

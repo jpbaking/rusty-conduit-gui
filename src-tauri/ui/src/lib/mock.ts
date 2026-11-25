@@ -136,7 +136,7 @@ const sessions: SessionView[] = [
   view(profile("44444444-4444-4444-8444-444444444444", "Archive", "192.0.2.44", 3134), { state: "stopped" }),
 ];
 
-const vault: VaultStatus = { initialized: true, unlocked: true };
+const vault: VaultStatus = { initialized: true, unlocked: true, keyring: false };
 let keys: KeyView[] = [
   {
     id: "55555555-5555-4555-8555-555555555555",
@@ -439,6 +439,10 @@ function dispatch(command: string, args?: Record<string, unknown>): unknown {
     case "create_vault":
       vault.initialized = true;
       vault.unlocked = true;
+      vault.keyring = Boolean(args?.useKeyring);
+      return { ...vault };
+    case "set_vault_keyring":
+      vault.keyring = Boolean(args?.enabled);
       return { ...vault };
     case "unlock_vault":
     case "unlock_vault_keyring":

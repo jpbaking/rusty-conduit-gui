@@ -34,6 +34,8 @@ export interface AppErrorPayload {
 export interface VaultStatus {
   initialized: boolean;
   unlocked: boolean;
+  /** The vault's key is also in the OS keyring, so it can be unlocked without the password. */
+  keyring: boolean;
 }
 
 export interface SecretMeta {

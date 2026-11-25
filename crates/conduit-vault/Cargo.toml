@@ -26,6 +26,20 @@ elliptic-curve = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# The OS keyring store keyring-core uses on each platform. keyring-core has none of its own.
+# macOS: the login Keychain, which works for ad-hoc signed builds. The data-protection keychain
+# (`protected`) would need a signing team and entitlements.
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "1", features = ["keychain"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-native-keyring-store = { version = "1.1", default-features = false }
+
+# Linux: Secret Service over pure-Rust D-Bus (zbus) with pure-Rust crypto. The async-io runtime
+# runs on its own, so calls work from any thread, inside the app's Tokio runtime or not.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus-secret-service-keyring-store = { version = "1", features = ["rt-async-io-crypto-rust"] }
+
 # Dev-dependencies: only needed by the key tests, which encrypt an OpenSSH key
 # via ssh-key's `PrivateKey::encrypt` (requires a `rand_core 0.10` `TryCryptoRng`).
 [dev-dependencies]

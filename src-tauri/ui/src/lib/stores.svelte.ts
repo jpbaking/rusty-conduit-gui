@@ -104,7 +104,7 @@ class AppStore {
   hosts = $state.raw<HostProfile[]>([]);
   keys = $state.raw<KeyView[]>([]);
   pins = $state.raw<HostKeyEntry[]>([]);
-  vault = $state.raw<VaultStatus>({ initialized: false, unlocked: false });
+  vault = $state.raw<VaultStatus>({ initialized: false, unlocked: false, keyring: false });
   /** False until the backend has reported the vault, so a failed load never offers "create". */
   vaultKnown = $state(false);
 
