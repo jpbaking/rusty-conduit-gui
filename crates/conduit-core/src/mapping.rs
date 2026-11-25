@@ -3,11 +3,11 @@
 //!
 //! The [`rusty_conduit_ssh`] engine has no `serde`, so this crate owns the
 //! serde-serializable models (see [`model`]) and converts them into the engine's
-//! [`Config`] here. Secret material (`SecretRef` / `KeyId`) lives in the vault and is
-//! resolved by the runtime layer, so identity and the MITM passphrase are left `None`
-//! here and filled in before the process launches.
+//! [`Config`] here. Secret material (`SecretRef` / `KeyId` / `MitmCaId`) lives in the vault
+//! and is resolved by the runtime layer: identity is left `None` here, and the MITM CA arrives
+//! as the path of a short-lived file the runtime wrote from the vault.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use rusty_conduit_ssh::config::{
@@ -17,7 +17,7 @@ use rusty_conduit_ssh::filter::FilterRule;
 use rusty_conduit_ssh::logging::{LogFormat, LogLevel};
 use thiserror::Error;
 
-use crate::{MitmCaMode, SessionProfile};
+use crate::SessionProfile;
 
 /// Errors raised while mapping a [`SessionProfile`] into a [`Config`].
 #[derive(Debug, Error)]
@@ -36,6 +36,8 @@ pub enum MappingError {
     InvalidLogLevel(String),
     #[error("invalid log format: {0}")]
     InvalidLogFormat(String),
+    #[error("MITM is on but its CA was not loaded from the vault")]
+    MitmCaNotLoaded,
 }
 
 /// Parse a forward/reverse filter list into `rusty-conduit-ssh` [`FilterRule`]s.
@@ -58,12 +60,12 @@ fn parse_rules(scope: &'static str, rules: &[String]) -> Result<Vec<FilterRule>,
 /// string fields and returns [`MappingError`] if any are malformed (defensive against a
 /// profile that bypassed validation).
 ///
-/// `mitm_passphrase` is the already-resolved plaintext CA passphrase. conduit-core never
-/// touches the vault: the runtime resolves the [`SecretRef`] before calling this, so no
-/// secret bytes live inside this crate.
+/// `mitm_ca_pem` is the path of the session's MITM CA, written by the runtime from the vault
+/// as one normalized, unencrypted PEM file (certificate chain and PKCS#8 key). The engine
+/// reads that file for both the certificate and the key. conduit-core never touches the vault.
 pub fn to_config(
     profile: &SessionProfile,
-    mitm_passphrase: Option<&str>,
+    mitm_ca_pem: Option<&Path>,
 ) -> Result<Config, MappingError> {
     let last = profile
         .hops
@@ -86,13 +88,10 @@ pub fn to_config(
     let reverse_allow = parse_rules("reverse", &profile.reverse.reverse_allow)?;
     let reverse_block = parse_rules("reverse", &profile.reverse.reverse_block)?;
 
-    // MITM CA source (PEM or PKCS#12), matching `Config::ca_source`.
-    let (mitm_ca_cert, mitm_ca_key, mitm_ca_p12) = match profile.mitm.as_ref() {
-        Some(mitm) => match &mitm.ca_mode {
-            MitmCaMode::Pem { cert, key } => (Some(cert.clone()), Some(key.clone()), None),
-            MitmCaMode::Pkcs12 { path } => (None, None, Some(path.clone())),
-        },
-        None => (None, None, None),
+    // MITM CA: one normalized PEM file serves as both the certificate and the key.
+    let mitm_ca = match profile.mitm.as_ref() {
+        Some(_) => Some(mitm_ca_pem.ok_or(MappingError::MitmCaNotLoaded)?.to_path_buf()),
+        None => None,
     };
 
     // String-encoded enums.
@@ -127,15 +126,12 @@ pub fn to_config(
             .unwrap_or(profile.forward.max_connections),
         reverse_allow,
         reverse_block,
-        mitm_ca_cert,
-        mitm_ca_key,
-        mitm_ca_p12,
-        // Resolved by the runtime layer from the vault; conduit-core owns no secret bytes.
-        mitm_ca_passphrase: mitm_passphrase.map(str::to_owned),
-        mitm_ca_passphrase_file: profile
-            .mitm
-            .as_ref()
-            .and_then(|m| m.ca_passphrase_file.clone()),
+        mitm_ca_cert: mitm_ca.clone(),
+        mitm_ca_key: mitm_ca,
+        mitm_ca_p12: None,
+        // The vault holds the CA decrypted, so no passphrase is ever needed.
+        mitm_ca_passphrase: None,
+        mitm_ca_passphrase_file: None,
         mitm_cert_ttl: profile
             .mitm
             .as_ref()
@@ -177,7 +173,7 @@ pub fn to_config(
 mod tests {
     use super::*;
     use crate::{
-        ForwardConfig, HopEntry, HostProfile, LoggingConfig, MitmCaMode, ReverseConfig,
+        ForwardConfig, HopEntry, HostProfile, LoggingConfig, MitmCaId, ReverseConfig,
         SessionProfile, SshEngine, TunnelConfig,
     };
     use std::time::Duration;
@@ -253,46 +249,30 @@ mod tests {
     }
 
     #[test]
-    fn maps_pem_ca_source() {
+    fn maps_the_vault_ca_file_as_cert_and_key() {
         let mut p = profile();
-        p.mitm = Some(crate::MitmConfig {
-            ca_mode: MitmCaMode::Pem {
-                cert: PathBuf::from("/tmp/ca.crt"),
-                key: PathBuf::from("/tmp/ca.key"),
-            },
-            ..Default::default()
-        });
-        let cfg = to_config(&p, None).unwrap();
-        assert_eq!(cfg.mitm_ca_cert.as_deref(), Some(PathBuf::from("/tmp/ca.crt").as_path()));
-        assert_eq!(cfg.mitm_ca_key.as_deref(), Some(PathBuf::from("/tmp/ca.key").as_path()));
+        p.mitm = Some(crate::MitmConfig { ca: Some(MitmCaId::new()), ..Default::default() });
+        let path = Path::new("/run/rc/ca.pem");
+        let cfg = to_config(&p, Some(path)).unwrap();
+        assert_eq!(cfg.mitm_ca_cert.as_deref(), Some(path));
+        assert_eq!(cfg.mitm_ca_key.as_deref(), Some(path));
         assert!(cfg.mitm_ca_p12.is_none());
-        assert!(cfg.mitm_enabled());
-    }
-
-    #[test]
-    fn maps_pkcs12_ca_source() {
-        let mut p = profile();
-        p.mitm = Some(crate::MitmConfig {
-            ca_mode: MitmCaMode::Pkcs12 {
-                path: PathBuf::from("/tmp/ca.p12"),
-            },
-            ..Default::default()
-        });
-        let cfg = to_config(&p, None).unwrap();
-        assert_eq!(cfg.mitm_ca_p12.as_deref(), Some(PathBuf::from("/tmp/ca.p12").as_path()));
-        assert!(cfg.mitm_enabled());
-    }
-
-    #[test]
-    fn resolved_passphrase_is_carried_in() {
-        let cfg = to_config(&profile(), Some("hunter2")).unwrap();
-        assert_eq!(cfg.mitm_ca_passphrase.as_deref(), Some("hunter2"));
-    }
-
-    #[test]
-    fn absent_passphrase_is_none() {
-        let cfg = to_config(&profile(), None).unwrap();
         assert!(cfg.mitm_ca_passphrase.is_none());
+        assert!(cfg.mitm_ca_passphrase_file.is_none());
+        assert!(cfg.mitm_enabled());
+    }
+
+    #[test]
+    fn mitm_without_a_loaded_ca_is_an_error() {
+        let mut p = profile();
+        p.mitm = Some(crate::MitmConfig { ca: Some(MitmCaId::new()), ..Default::default() });
+        assert!(matches!(to_config(&p, None), Err(MappingError::MitmCaNotLoaded)));
+    }
+
+    #[test]
+    fn a_ca_file_is_ignored_without_mitm() {
+        let cfg = to_config(&profile(), Some(Path::new("/run/rc/ca.pem"))).unwrap();
+        assert!(!cfg.mitm_enabled());
     }
 
     #[test]

@@ -992,7 +992,6 @@ dependencies = [
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
- "p12-keystore",
  "rcgen",
  "russh",
  "rustls",
@@ -4836,6 +4835,7 @@ name = "rusty-conduit-ssh-gui"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "base64 0.22.1",
  "conduit-core",
  "conduit-openssh",
  "conduit-runtime",
@@ -4845,6 +4845,7 @@ dependencies = [
  "getrandom 0.4.3",
  "p12-keystore",
  "rcgen",
+ "ring",
  "russh",
  "rusty-conduit-ssh",
  "serde",

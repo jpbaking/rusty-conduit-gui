@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use conduit_core::{
-    HostProfile, KeyId, KeySource, MitmCaMode, SecretRef, SessionProfile, VaultKeyMeta,
+    HostProfile, KeyId, KeySource, MitmCaId, SecretRef, SessionProfile, VaultCaMeta, VaultKeyMeta,
 };
 use conduit_openssh::OpenSshBinaryInfo;
 use conduit_runtime::LogLine;
@@ -20,7 +20,8 @@ use crate::controller::export::{ExportSummary, ImportSummary};
 use crate::controller::keys::{
     BackupSummary, DeleteResult, GenerateAlgorithm, ImportBackupResult, KeyView,
 };
-use crate::controller::parity::{self, FilterMode, FilterTestResult, MitmCaInfo, PortConflictReport};
+use crate::controller::mitm_ca::{CaView, MitmCaUpload};
+use crate::controller::parity::{self, FilterMode, FilterTestResult, PortConflictReport};
 use crate::controller::sessions::{ChainTestResult, SessionView, StateSummary};
 use crate::controller::{run_blocking, AppController, AppError, SecretInput, SecretMeta, VaultStatus};
 use crate::platform;
@@ -117,13 +118,31 @@ pub async fn set_password_secret(
     blocking(&c, move |c| c.set_password_secret(existing.as_ref(), password)).await
 }
 
+// MITM CAs: uploaded once into the vault, then chosen by sessions.
+
 #[tauri::command]
-pub async fn set_mitm_passphrase(
+pub async fn import_mitm_ca(
     c: Ctl<'_>,
-    session_id: Uuid,
-    passphrase: SecretInput,
-) -> CmdResult<SecretMeta> {
-    blocking(&c, move |c| c.set_mitm_passphrase(session_id, passphrase)).await
+    name: String,
+    upload: MitmCaUpload,
+    passphrase: Option<SecretInput>,
+) -> CmdResult<VaultCaMeta> {
+    blocking(&c, move |c| c.import_mitm_ca(&name, upload, passphrase)).await
+}
+
+#[tauri::command]
+pub async fn rename_mitm_ca(c: Ctl<'_>, id: MitmCaId, name: String) -> CmdResult<VaultCaMeta> {
+    blocking(&c, move |c| c.rename_mitm_ca(&id, &name)).await
+}
+
+#[tauri::command]
+pub async fn delete_mitm_ca(c: Ctl<'_>, id: MitmCaId, force: Option<bool>) -> CmdResult<DeleteResult> {
+    c.delete_mitm_ca(&id, force.unwrap_or(false)).await
+}
+
+#[tauri::command]
+pub async fn list_mitm_cas(c: Ctl<'_>) -> CmdResult<Vec<CaView>> {
+    blocking(&c, |c| Ok(c.list_mitm_cas())).await
 }
 
 #[tauri::command]
@@ -310,20 +329,6 @@ pub async fn test_filter_rules(
     Ok(parity::test_filter_rules(mode, &rules, &target))
 }
 
-#[tauri::command]
-pub async fn inspect_mitm_ca(
-    c: Ctl<'_>,
-    ca_mode: MitmCaMode,
-    passphrase: Option<SecretInput>,
-    passphrase_ref: Option<SecretRef>,
-    passphrase_file: Option<PathBuf>,
-) -> CmdResult<MitmCaInfo> {
-    blocking(&c, move |c| {
-        c.inspect_mitm_ca(&ca_mode, passphrase, passphrase_ref, passphrase_file)
-    })
-    .await
-}
-
 /// Runs `<ssh_bin> -V`, which can take seconds, on the blocking pool.
 #[tauri::command]
 pub async fn check_openssh_binary(ssh_bin: Option<String>) -> CmdResult<OpenSshBinaryInfo> {
@@ -452,7 +457,10 @@ macro_rules! ipc_handler {
             $crate::commands::delete_key,
             $crate::commands::list_keys,
             $crate::commands::set_password_secret,
-            $crate::commands::set_mitm_passphrase,
+            $crate::commands::import_mitm_ca,
+            $crate::commands::rename_mitm_ca,
+            $crate::commands::delete_mitm_ca,
+            $crate::commands::list_mitm_cas,
             $crate::commands::delete_secret,
             $crate::commands::export_backup,
             $crate::commands::import_backup,
@@ -481,7 +489,6 @@ macro_rules! ipc_handler {
             $crate::commands::test_chain,
             $crate::commands::check_port_conflicts,
             $crate::commands::test_filter_rules,
-            $crate::commands::inspect_mitm_ca,
             $crate::commands::check_openssh_binary,
             $crate::commands::export_config,
             $crate::commands::import_config,
@@ -498,7 +505,8 @@ pub(crate) use ipc_handler;
 mod tests {
     use std::collections::BTreeSet;
 
-    use conduit_core::{MitmCaMode, MitmConfig};
+    use base64::Engine as _;
+    use conduit_core::MitmConfig;
     use conduit_vault::KeyGenAlgorithm;
     use russh::keys::ssh_key::LineEnding;
     use serde_json::{json, Value};
@@ -512,6 +520,7 @@ mod tests {
 
     const MASTER: &str = "canary-master-password-91c2";
     const PASSWORD: &str = "canary-hop-password-44ab";
+    /// Protects the uploaded PKCS#12 CA.
     const MITM: &str = "canary-mitm-passphrase-0d7e";
     const KEY_PASS: &str = "canary-key-passphrase-b18f";
     const BACKUP_PASS: &str = "canary-backup-passphrase-6e30";
@@ -520,14 +529,15 @@ mod tests {
     const ALL_COMMANDS: &[&str] = &[
         "vault_status", "create_vault", "unlock_vault", "unlock_vault_keyring", "set_vault_keyring", "lock_vault",
         "import_key_pem", "generate_key", "rename_key", "delete_key", "list_keys",
-        "set_password_secret", "set_mitm_passphrase", "delete_secret", "export_backup",
+        "set_password_secret", "import_mitm_ca", "rename_mitm_ca", "delete_mitm_ca", "list_mitm_cas",
+        "delete_secret", "export_backup",
         "import_backup", "get_state_summary", "list_sessions", "upsert_session", "delete_session", "duplicate_session",
         "list_hosts", "upsert_host", "delete_host", "promote_hop_to_host", "start_session",
         "stop_session", "restart_session", "start_all", "stop_all", "get_session_logs",
         "clear_session_logs", "approve_host_key", "reject_host_key", "trust_tested_host_key",
         "list_host_key_pins",
         "reset_host_key", "import_known_host", "test_chain", "check_port_conflicts", "test_filter_rules",
-        "inspect_mitm_ca", "check_openssh_binary", "export_config", "import_config",
+        "check_openssh_binary", "export_config", "import_config",
         "get_autostart", "set_autostart", "shell_ready", "resolve_close",
     ];
 
@@ -625,8 +635,8 @@ mod tests {
         all
     }
 
-    /// A PKCS#12 CA protected by the [`MITM`] canary, written to `path`.
-    fn write_mitm_ca(path: &std::path::Path) {
+    /// A PKCS#12 CA protected by the [`MITM`] canary, and its private key PEM.
+    fn mitm_ca_p12() -> (Vec<u8>, String) {
         use p12_keystore::{Certificate, EncryptionAlgorithm, KeyStore, KeyStoreEntry, PrivateKey, PrivateKeyChain};
         let key = rcgen::KeyPair::generate().unwrap();
         let mut params = rcgen::CertificateParams::default();
@@ -649,7 +659,7 @@ mod tests {
             .encryption_algorithm(EncryptionAlgorithm::PbeWithHmacSha256AndAes256)
             .write()
             .unwrap();
-        std::fs::write(path, bytes).unwrap();
+        (bytes, key.serialize_pem())
     }
 
     fn assert_clean(label: &str, text: &str, forbidden: &[String]) {
@@ -730,18 +740,31 @@ mod tests {
             .local_addr()
             .unwrap()
             .port();
-        session.mitm = Some(MitmConfig {
-            ca_mode: MitmCaMode::Pkcs12 { path: dir.path().join("missing.p12") },
-            ..MitmConfig::default()
-        });
+        // MITM CA: uploaded as file contents, never as a path.
+        let (p12, ca_key_pem) = mitm_ca_p12();
+        let upload = json!({ "format": "pkcs12", "data": base64::engine::general_purpose::STANDARD.encode(&p12) });
+        assert_eq!(
+            ipc.err("import_mitm_ca", json!({ "name": "ca", "upload": upload, "passphrase": PASSWORD }))["code"],
+            "invalid"
+        );
+        ipc.err("import_mitm_ca", json!({ "name": "ca", "upload": { "format": "path", "path": "/tmp/ca.p12" } }));
+        let ca = ipc.ok("import_mitm_ca", json!({ "name": "ca", "upload": upload, "passphrase": MITM }));
+        assert!(ca["subject"].as_str().unwrap().contains("IPC Test CA"));
+        assert_eq!(
+            ipc.err("import_mitm_ca", json!({ "name": "again", "upload": upload, "passphrase": MITM }))["code"],
+            "duplicate_ca"
+        );
+        assert_eq!(ipc.ok("rename_mitm_ca", json!({ "id": ca["id"], "name": "corp ca" }))["name"], "corp ca");
+        let ca_id = serde_json::from_value(ca["id"].clone()).unwrap();
+        session.mitm = Some(MitmConfig { ca: Some(ca_id), ..MitmConfig::default() });
         let mut session_json = serde_json::to_value(&session).unwrap();
         session_json["hops"][0]["host"]["auth"] = json!([{ "Password": { "secret": secret_ref } }]);
         let saved = ipc.ok("upsert_session", json!({ "profile": session_json }));
         let id = saved["id"].clone();
         let hop_id = saved["hops"][0]["hop_id"].clone();
 
-        let mitm = ipc.ok("set_mitm_passphrase", json!({ "sessionId": id, "passphrase": MITM }));
-        assert_eq!(mitm["has_secret"], true);
+        let cas = ipc.ok("list_mitm_cas", json!({}));
+        assert_eq!((cas[0]["used_by"].clone(), cas[0]["usage"]["sessions"][0]["name"].clone()), (json!(1), json!("s")));
 
         assert_eq!(ipc.ok("get_state_summary", json!({}))["session_count"], 1);
         assert_eq!(ipc.ok("list_sessions", json!({})).as_array().unwrap().len(), 1);
@@ -749,7 +772,7 @@ mod tests {
         let promoted = ipc.ok("promote_hop_to_host", json!({ "sessionId": id, "hopId": hop_id, "name": "promoted" }));
         assert_eq!(promoted["name"], "promoted");
 
-        // Runtime. The MITM CA file is missing, so starts end in a failed state, not a tunnel.
+        // Runtime. The SSH port is closed, so starts end in a failed state, not a tunnel.
         ipc.ok("start_session", json!({ "id": id }));
         ipc.ok("restart_session", json!({ "id": id }));
         ipc.ok("stop_session", json!({ "id": id }));
@@ -831,19 +854,6 @@ mod tests {
         assert_eq!(bad_rule["rule_errors"][0]["index"], 0);
         ipc.err("test_filter_rules", json!({ "mode": "other", "rules": [], "target": "x" }));
 
-        let ca_path = dir.path().join("inspect.p12");
-        write_mitm_ca(&ca_path);
-        let ca_mode = json!({ "Pkcs12": { "path": ca_path } });
-        let inline = ipc.ok("inspect_mitm_ca", json!({ "caMode": ca_mode, "passphrase": MITM }));
-        assert!(inline["subject"].as_str().unwrap().contains("IPC Test CA"));
-        assert_eq!(inline["expired"], false);
-        let stored = ipc.ok("inspect_mitm_ca", json!({ "caMode": ca_mode, "passphraseRef": mitm["secret_ref"] }));
-        assert_eq!(stored["subject"], inline["subject"]);
-        assert_eq!(
-            ipc.err("inspect_mitm_ca", json!({ "caMode": ca_mode, "passphrase": PASSWORD }))["code"],
-            "invalid"
-        );
-
         // The default program may or may not be installed, so only its name is asserted.
         assert_eq!(ipc.ok("check_openssh_binary", json!({}))["requested"], "ssh");
         assert_eq!(ipc.ok("check_openssh_binary", json!({ "sshBin": "  " }))["requested"], "ssh");
@@ -871,7 +881,7 @@ mod tests {
         );
         assert_eq!(sealed["encrypted"], true);
         assert_eq!(sealed["missing_secrets"], 0);
-        assert_eq!(sealed["secret_count"], 5, "three keys, one password, one passphrase");
+        assert_eq!(sealed["secret_count"], 5, "three keys, one password, one MITM CA");
         assert_eq!(
             ipc.err("import_config", json!({ "path": bundle_path, "passphrase": PASSWORD }))["code"],
             "unlock_failed"
@@ -879,6 +889,7 @@ mod tests {
         let restored = ipc.ok("import_config", json!({ "path": bundle_path, "passphrase": BACKUP_PASS }));
         assert_eq!(restored["sessions_skipped"], 1);
         assert_eq!((restored["keys_added"].clone(), restored["secrets_added"].clone()), (json!(0), json!(0)));
+        assert_eq!(restored["cas_added"], 0);
 
         // Deletes, including the referenced-key confirmation contract.
         let refused = ipc.ok("delete_key", json!({ "id": key_id }));
@@ -894,6 +905,10 @@ mod tests {
         assert!(copy["name"].as_str().unwrap().ends_with(" (copy)"));
         assert_ne!(copy["id"], json!(id));
         ipc.ok("delete_session", json!({ "id": copy["id"] }));
+        // Fails closed: the session keeps MITM on with no CA, so it cannot start until one is chosen.
+        assert_eq!(ipc.ok("delete_mitm_ca", json!({ "id": ca["id"] }))["deleted"], false);
+        assert_eq!(ipc.ok("delete_mitm_ca", json!({ "id": ca["id"], "force": true }))["deleted"], true);
+        assert_eq!(ipc.ok("list_mitm_cas", json!({})), json!([]));
 
         // Read the files before the session is deleted, while they hold the most references.
         let on_disk: Vec<(String, Vec<u8>)> = ["config.json", "vault.bin", "backup.bundle", "config-plain.json", "config-bundle.json"]
@@ -905,7 +920,7 @@ mod tests {
         let expected: BTreeSet<String> = ALL_COMMANDS.iter().map(|c| c.to_string()).collect();
         assert_eq!(ipc.called, expected, "every IPC command must be exercised");
 
-        let forbidden = forbidden(&[&plain_pem, &other_pem, &encrypted_pem]);
+        let forbidden = forbidden(&[&plain_pem, &other_pem, &encrypted_pem, &ca_key_pem]);
         for (index, response) in ipc.transcript.iter().enumerate() {
             assert_clean(&format!("IPC response #{index}"), response, &forbidden);
         }

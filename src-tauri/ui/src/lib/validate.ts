@@ -226,15 +226,7 @@ function filterErrors(
 }
 
 function mitmErrors(errors: FieldErrors, mitm: MitmConfig): void {
-  if ("Pem" in mitm.ca_mode) {
-    if (!mitm.ca_mode.Pem.cert.trim()) errors["mitm.cert"] = "Enter the CA certificate path.";
-    if (!mitm.ca_mode.Pem.key.trim()) errors["mitm.key"] = "Enter the CA private key path.";
-  } else if (!mitm.ca_mode.Pkcs12.path.trim()) {
-    errors["mitm.path"] = "Enter the PKCS#12 bundle path.";
-  }
-  if (mitm.passphrase !== null && mitm.ca_passphrase_file !== null) {
-    errors["mitm.passphrase"] = "Use a saved passphrase or a passphrase file, not both.";
-  }
+  if (!mitm.ca) errors["mitm.ca"] = "Choose a CA, or upload one.";
   if (!isWholeNumber(mitm.cert_ttl) || mitm.cert_ttl < MIN_CERT_TTL_SECS) {
     errors["mitm.cert_ttl"] = `Use a whole number of at least ${MIN_CERT_TTL_SECS} seconds.`;
   }

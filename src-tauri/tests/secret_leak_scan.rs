@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use conduit_core::{
     AuthMethod, ForwardConfig, HopEntry, HostKeyLookup, HostKeyRecord, HostProfile, KeyId,
-    KeySource, KnownHostsStore, MitmCaMode, MitmConfig, SecretRef, SessionProfile, Timestamp,
+    KeySource, KnownHostsStore, MitmCaId, MitmConfig, SecretRef, SessionProfile, Timestamp,
 };
 use conduit_openssh::{write_config, write_known_hosts, ConfigHop, SessionConfig};
 use conduit_runtime::{ManagerConfig, SessionState};
@@ -15,6 +15,7 @@ use conduit_vault::{generate_key, Argon2Params, KeyGenAlgorithm, MemoryKeyringBa
 use russh::keys::ssh_key::LineEnding;
 use russh::keys::PrivateKey;
 use russh::server::{self, Auth};
+use rusty_conduit_ssh_gui_lib::controller::mitm_ca::MitmCaUpload;
 use rusty_conduit_ssh_gui_lib::controller::{AppController, ControllerOptions, SecretInput};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -100,6 +101,7 @@ struct Fixture {
     forbidden: Vec<String>,
     key: KeyId,
     password: SecretRef,
+    ca: MitmCaId,
 }
 
 impl Fixture {
@@ -138,12 +140,18 @@ impl Fixture {
             .set_password_secret(None, SecretInput::new(PASSWORD))
             .unwrap()
             .secret_ref;
+        let (ca_p12, ca_key_pem) = mitm_ca_p12();
+        let upload = MitmCaUpload::Pkcs12 { data: SecretInput::new(base64_encode(&ca_p12)) };
+        let ca = controller
+            .import_mitm_ca("mitm", upload, Some(SecretInput::new(MITM)))
+            .unwrap()
+            .id;
 
         let mut forbidden: Vec<String> = [MASTER, PASSWORD, MITM, KEY_PASS, EXPORT_PASS]
             .map(String::from)
             .to_vec();
         forbidden.push("PRIVATE KEY".into());
-        for pem in [&plain_pem, &protected_plain_pem, &protected_pem] {
+        for pem in [&plain_pem, &protected_plain_pem, &protected_pem, &ca_key_pem] {
             let body = pem
                 .lines()
                 .filter(|line| !line.starts_with("-----") && line.len() >= 16)
@@ -152,7 +160,7 @@ impl Fixture {
         }
         assert!(forbidden.len() > 8, "the key bodies must be part of the scan");
 
-        Self { dir, controller, forbidden, key, password }
+        Self { dir, controller, forbidden, key, password, ca }
     }
 
     fn data_dir(&self) -> PathBuf {
@@ -186,19 +194,10 @@ impl Fixture {
                 socks_port: 0,
                 ..ForwardConfig::default()
             },
-            mitm: with_mitm.then(|| MitmConfig {
-                ca_mode: MitmCaMode::Pkcs12 { path: self.dir.path().join("missing-ca.p12") },
-                ..MitmConfig::default()
-            }),
+            mitm: with_mitm.then(|| MitmConfig { ca: Some(self.ca.clone()), ..MitmConfig::default() }),
             ..SessionProfile::default()
         };
-        let id = self.controller.upsert_session(profile).unwrap().id;
-        if with_mitm {
-            self.controller
-                .set_mitm_passphrase(id, SecretInput::new(MITM))
-                .unwrap();
-        }
-        id
+        self.controller.upsert_session(profile).unwrap().id
     }
 
     fn state(&self, id: Uuid) -> SessionState {
@@ -251,6 +250,33 @@ impl server::Handler for RejectingServer {
     async fn auth_password(&mut self, _user: &str, _password: &str) -> Result<Auth, russh::Error> {
         Ok(Auth::reject())
     }
+}
+
+/// A PKCS#12 CA protected by [`MITM`], and its private key PEM.
+fn mitm_ca_p12() -> (Vec<u8>, String) {
+    use p12_keystore::{Certificate, KeyStore, KeyStoreEntry, PrivateKey, PrivateKeyChain};
+    let key = rcgen::KeyPair::generate().unwrap();
+    let mut params = rcgen::CertificateParams::default();
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params.distinguished_name.push(rcgen::DnType::CommonName, "Leak Scan CA");
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let now = time::OffsetDateTime::now_utc();
+    params.not_before = now - time::Duration::days(1);
+    params.not_after = now + time::Duration::days(30);
+    let cert = params.self_signed(&key).unwrap();
+    let chain = PrivateKeyChain::new(
+        b"ca".to_vec(),
+        PrivateKey::from_der(&key.serialize_der()).unwrap(),
+        [Certificate::from_der(cert.der()).unwrap()],
+    );
+    let mut store = KeyStore::new();
+    store.add_entry("ca", KeyStoreEntry::PrivateKeyChain(chain));
+    (store.writer(MITM).write().unwrap(), key.serialize_pem())
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 /// A loopback SSH server that rejects every login. Each connection uses the current host key,
@@ -378,7 +404,8 @@ async fn session_logs_and_failure_states_hold_no_secrets() {
     fx.assert_session_clean(id);
     fx.controller.stop_session(id).await.unwrap();
 
-    // A MITM session whose CA file is missing fails while holding its passphrase.
+    // A MITM session stages its CA from the vault, then fails to log in. Nothing of the CA may
+    // show in its logs or state, and the staged file must be gone.
     let mitm = fx.add_session("mitm", port, true);
     fx.controller.start_session(mitm).await.unwrap();
     let mitm_reason = fx

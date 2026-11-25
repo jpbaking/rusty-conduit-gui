@@ -142,7 +142,7 @@ impl AppController {
         self.vault_read().list_keys().into_iter().map(|r| r.id).collect()
     }
 
-    fn session_profile(&self, id: Uuid) -> Result<SessionProfile, AppError> {
+    pub(crate) fn session_profile(&self, id: Uuid) -> Result<SessionProfile, AppError> {
         self.config_snapshot()
             .sessions
             .into_iter()
@@ -196,9 +196,9 @@ impl AppController {
             for hop in &profile.hops {
                 check_auth_refs(config, &records, &hop.host.auth)?;
             }
-            if let Some(secret) = profile.mitm.as_ref().and_then(|m| m.passphrase.as_ref()) {
-                if !records.contains(&secret.to_string()) {
-                    return Err(not_found("secret", secret));
+            if let Some(ca) = profile.mitm.as_ref().and_then(|m| m.ca.as_ref()) {
+                if !config.mitm_cas.iter().any(|c| c.id == *ca) {
+                    return Err(not_found("MITM CA", ca));
                 }
             }
             match config.sessions.iter_mut().find(|s| s.id == profile.id) {
@@ -249,7 +249,7 @@ impl AppController {
     ///
     /// Hops get new ids, because a hop id keys its host-key pin, and each trusted pin is copied
     /// to the new hop so the copy connects without asking again. Saved passwords and the MITM
-    /// passphrase are shared by reference; replacing either always writes a new record.
+    /// CA are shared by reference; replacing a password always writes a new record.
     pub fn duplicate_session(&self, id: Uuid) -> Result<SessionProfile, AppError> {
         let mut copy = self.session_profile(id)?;
         copy.id = Uuid::nil();

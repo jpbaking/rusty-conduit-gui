@@ -4,6 +4,7 @@
   import { store } from "../stores.svelte";
   import type { KeyView, Usage } from "../types";
   import AddKeyModal, { type AddKeyMode } from "./AddKeyModal.svelte";
+  import CaVaultSection from "./CaVaultSection.svelte";
   import ModalDialog from "./ModalDialog.svelte";
 
   const uid = $props.id();
@@ -158,6 +159,8 @@
       </table>
     </div>
   {/if}
+
+  <CaVaultSection />
 </main>
 
 {#if adding}

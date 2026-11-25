@@ -3,6 +3,7 @@
 
 import { ApiError } from "./api";
 import type {
+  CaView,
   DeleteResult,
   ExportSummary,
   FilterTestResult,
@@ -12,7 +13,6 @@ import type {
   ImportSummary,
   KeyView,
   LogLine,
-  MitmCaInfo,
   OpenSshBinaryInfo,
   PortConflict,
   PortConflictReport,
@@ -145,6 +145,18 @@ let keys: KeyView[] = [
     fingerprint_sha256: "SHA256:demoFingerprintForPreviewOnly",
     public_key_openssh: "ssh-ed25519 AAAApreview demo",
     source: "Generated",
+    created_at: Math.floor(Date.now() / 1000),
+    used_by: 0,
+    usage: { hosts: [], sessions: [] },
+  },
+];
+let cas: CaView[] = [
+  {
+    id: "66666666-6666-4666-8666-666666666666",
+    name: "Demo inspection CA",
+    subject: "CN=Preview CA",
+    not_after: Math.floor(Date.now() / 1000) + 20 * 86_400,
+    fingerprint_sha256: "SHA256:demoCaFingerprintForPreviewOnly",
     created_at: Math.floor(Date.now() / 1000),
     used_by: 0,
     usage: { hosts: [], sessions: [] },
@@ -393,12 +405,42 @@ function dispatch(command: string, args?: Record<string, unknown>): unknown {
     }
     case "set_password_secret":
       return { secret_ref: crypto.randomUUID(), has_secret: true };
-    case "set_mitm_passphrase": {
-      const session = sessions.find((s) => s.profile.id === args?.sessionId);
-      if (!session?.profile.mitm) throw new ApiError("invalid", "this session has no MITM configuration");
-      const secret_ref = crypto.randomUUID();
-      session.profile.mitm.passphrase = secret_ref;
-      return { secret_ref, has_secret: true };
+    case "list_mitm_cas":
+      return cas.map((ca) => {
+        const users = sessions.filter((s) => s.profile.mitm?.ca === ca.id);
+        const refs = users.map((s) => ({ id: s.profile.id, name: s.profile.name }));
+        return { ...ca, used_by: refs.length, usage: { hosts: [], sessions: refs } } satisfies CaView;
+      });
+    case "import_mitm_ca": {
+      const now = Math.floor(Date.now() / 1000);
+      const ca: CaView = {
+        id: crypto.randomUUID(),
+        name: String(args?.name),
+        subject: "CN=Preview Upload CA",
+        not_after: now + 365 * 86_400,
+        fingerprint_sha256: `SHA256:preview${cas.length}`,
+        created_at: now,
+        used_by: 0,
+        usage: { hosts: [], sessions: [] },
+      };
+      cas = [...cas, ca];
+      return ca;
+    }
+    case "rename_mitm_ca":
+      cas = cas.map((c) => (c.id === args?.id ? { ...c, name: String(args?.name) } : c));
+      return cas.find((c) => c.id === args?.id);
+    case "delete_mitm_ca": {
+      const ca = cas.find((c) => c.id === args?.id);
+      if (!ca) throw new ApiError("not_found", "MITM CA not found");
+      const users = sessions.filter((s) => s.profile.mitm?.ca === ca.id);
+      const usage = { hosts: [], sessions: users.map((s) => ({ id: s.profile.id, name: s.profile.name })) };
+      if (users.length > 0 && !args?.force) return { deleted: false, used_by: users.length, usage } satisfies DeleteResult;
+      for (const s of users) {
+        if (s.profile.mitm) s.profile.mitm.ca = null;
+        s.runtime.state = { state: "stopped" };
+      }
+      cas = cas.filter((c) => c.id !== ca.id);
+      return { deleted: true, used_by: users.length, usage } satisfies DeleteResult;
     }
     case "delete_secret":
       return { deleted: true, used_by: 0, usage: { hosts: [], sessions: [] } } satisfies DeleteResult;
@@ -495,13 +537,6 @@ function dispatch(command: string, args?: Record<string, unknown>): unknown {
       return mockPortConflicts(args);
     case "test_filter_rules":
       return mockFilterTest(args);
-    case "inspect_mitm_ca":
-      return {
-        subject: "CN=Preview CA",
-        not_after: new Date(Date.now() + 90 * 86_400_000).toISOString(),
-        expired: false,
-        days_remaining: 90,
-      } satisfies MitmCaInfo;
     case "check_openssh_binary":
       return mockOpensshCheck(args);
     case "export_config": {
@@ -512,7 +547,8 @@ function dispatch(command: string, args?: Record<string, unknown>): unknown {
         session_count: sessions.length,
         host_count: hosts.length,
         key_count: keys.length,
-        secret_count: encrypted ? keys.length : 0,
+        ca_count: cas.length,
+        secret_count: encrypted ? keys.length + cas.length : 0,
         missing_secrets: 0,
       } satisfies ExportSummary;
     }
@@ -526,6 +562,7 @@ function dispatch(command: string, args?: Record<string, unknown>): unknown {
         hosts_updated: 0,
         hosts_skipped: hosts.length,
         keys_added: 0,
+        cas_added: 0,
         secrets_added: 0,
         known_hosts_added: 0,
         known_hosts_updated: 0,

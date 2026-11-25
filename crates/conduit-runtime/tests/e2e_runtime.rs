@@ -21,7 +21,7 @@ use common::{
 };
 use conduit_core::{
     AuthMethod, ForwardConfig, HopEntry, HostKeyLookup, HostKeyRecord, HostProfile, KeyId,
-    KnownHostsStore, LoggingConfig, MitmCaMode, MitmConfig, SecretRef, SessionProfile, Timestamp, TunnelConfig,
+    KnownHostsStore, LoggingConfig, MitmCaId, MitmConfig, SecretRef, SessionProfile, Timestamp, TunnelConfig,
 };
 use conduit_runtime::{ManagerConfig, RuntimeError, RuntimeEvent, SessionManager, SessionState};
 use conduit_vault::{Argon2Params, Vault};
@@ -680,7 +680,6 @@ fn hops_never_get_an_agent_channel_back_to_the_app() {
     });
 }
 
-const MITM_PASSPHRASE: &str = "e2e-mitm-ca-passphrase";
 const MITM_BODY: &[u8] = b"decrypted origin response";
 const MITM_PATH: &str = "/inspected/path";
 
@@ -730,22 +729,15 @@ async fn spawn_tls_origin() -> u16 {
     port
 }
 
-/// Writes a passphrase-protected PKCS#12 CA and returns its path and certificate.
-fn write_mitm_ca(f: &Fixture) -> (PathBuf, Vec<u8>) {
+/// Stores a CA in the vault the way the app does (normalized PEM: certificate, then PKCS#8
+/// key) and returns its id and certificate.
+fn vault_mitm_ca(f: &Fixture) -> (MitmCaId, Vec<u8>) {
     let key = KeyPair::generate().unwrap();
     let cert = ca_params("Conduit E2E MITM CA").self_signed(&key).unwrap();
-    let cert_der = cert.der().to_vec();
-    let chain = p12_keystore::PrivateKeyChain::new(
-        b"e2e-ca".to_vec(),
-        p12_keystore::PrivateKey::from_der(&key.serialize_der()).unwrap(),
-        [p12_keystore::Certificate::from_der(&cert_der).unwrap()],
-    );
-    let mut store = p12_keystore::KeyStore::new();
-    store.add_entry("ca", p12_keystore::KeyStoreEntry::PrivateKeyChain(chain));
-    let bytes = store.writer(MITM_PASSPHRASE).write().unwrap();
-    let path = f.app_data.join("mitm-ca.p12");
-    std::fs::write(&path, bytes).unwrap();
-    (path, cert_der)
+    let pem = format!("{}{}", cert.pem(), key.serialize_pem());
+    let id = f.put("mitm_ca", pem.as_bytes());
+    let ca: MitmCaId = serde_json::from_value(serde_json::Value::String(id)).unwrap();
+    (ca, cert.der().to_vec())
 }
 
 /// Sends `CONNECT` and reads exactly the response head, leaving TLS bytes unread.
@@ -774,19 +766,12 @@ fn mitm_through_runtime_intercepts_https() {
         let f = Fixture::new();
         let node = spawn_node(None).await;
         f.pin(0, &node, &node.host_key);
-        let (ca_path, ca_der) = write_mitm_ca(&f);
-        let passphrase_id = f.put("mitm_passphrase", MITM_PASSPHRASE.as_bytes());
-        let passphrase: SecretRef =
-            serde_json::from_value(serde_json::Value::String(passphrase_id)).unwrap();
+        let (ca, ca_der) = vault_mitm_ca(&f);
 
         let http_port = free_port().await;
         let mut session = profile("mitm", vec![hop(0, &node, vec![f.password(PASSWORD)])]);
         session.forward.http_port = http_port;
-        session.mitm = Some(MitmConfig {
-            ca_mode: MitmCaMode::Pkcs12 { path: ca_path },
-            passphrase: Some(passphrase),
-            ..Default::default()
-        });
+        session.mitm = Some(MitmConfig { ca: Some(ca), ..Default::default() });
         let id = f.add(session);
         f.manager.start(id).await.unwrap();
         f.until_connected(id).await;
@@ -844,7 +829,7 @@ fn mitm_through_runtime_intercepts_https() {
         assert!(record.contains("proto=https"), "{record}");
         assert!(record.contains("method=GET"), "{record}");
         assert!(record.contains("status=200"), "{record}");
-        assert!(!log.contains(MITM_PASSPHRASE), "passphrase leaked to logs");
+        assert!(!log.contains("PRIVATE KEY"), "CA key leaked to logs");
         f.finish().await;
     });
 }

@@ -23,9 +23,10 @@ import type {
   KeySource,
   KeyView,
   LogLine,
-  MitmCaInfo,
-  MitmCaMode,
-  MitmPassphraseSource,
+  CaView,
+  MitmCaId,
+  MitmCaUpload,
+  VaultCaMeta,
   OpenSshBinaryInfo,
   PortConflictReport,
   RuntimeEvent,
@@ -107,14 +108,19 @@ export const api = {
   listKeys: () => call<KeyView[]>("list_keys"),
   setPasswordSecret: (password: string, existing: SecretRef | null = null) =>
     call<SecretMeta>("set_password_secret", { existing, password }),
-  setMitmPassphrase: (sessionId: Uuid, passphrase: string) =>
-    call<SecretMeta>("set_mitm_passphrase", { sessionId, passphrase }),
   deleteSecret: (secret: SecretRef, force = false) =>
     call<DeleteResult>("delete_secret", { secret, force }),
   exportBackup: (path: string, passphrase: string) =>
     call<BackupSummary>("export_backup", { path, passphrase }),
   importBackup: (path: string, passphrase: string) =>
     call<ImportBackupResult>("import_backup", { path, passphrase }),
+
+  // MITM CAs.
+  importMitmCa: (name: string, upload: MitmCaUpload, passphrase: string | null) =>
+    call<VaultCaMeta>("import_mitm_ca", { name, upload, passphrase }),
+  renameMitmCa: (id: MitmCaId, name: string) => call<VaultCaMeta>("rename_mitm_ca", { id, name }),
+  deleteMitmCa: (id: MitmCaId, force = false) => call<DeleteResult>("delete_mitm_ca", { id, force }),
+  listMitmCas: () => call<CaView[]>("list_mitm_cas"),
 
   // Sessions and hosts.
   getStateSummary: () => call<StateSummary>("get_state_summary"),
@@ -156,13 +162,6 @@ export const api = {
     call<PortConflictReport>("check_port_conflicts", { sessionId, bind, httpPort, socksPort }),
   testFilterRules: (mode: FilterMode, rules: string[], target: string) =>
     call<FilterTestResult>("test_filter_rules", { mode, rules, target }),
-  inspectMitmCa: (caMode: MitmCaMode, source: MitmPassphraseSource = {}) =>
-    call<MitmCaInfo>("inspect_mitm_ca", {
-      caMode,
-      passphrase: source.passphrase ?? null,
-      passphraseRef: source.passphraseRef ?? null,
-      passphraseFile: source.passphraseFile ?? null,
-    }),
   checkOpensshBinary: (sshBin?: string) =>
     call<OpenSshBinaryInfo>("check_openssh_binary", { sshBin: sshBin ?? null }),
 

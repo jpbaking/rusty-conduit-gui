@@ -1,254 +1,109 @@
 <script lang="ts">
-  import { api, errorMessage } from "../api";
+  import { caExpiry } from "../format";
   import { store } from "../stores.svelte";
-  import type {
-    MitmCaInfo,
-    MitmCaMode,
-    MitmConfig,
-    MitmPassphraseSource,
-    SessionProfile,
-  } from "../types";
+  import type { MitmConfig, SessionProfile, VaultCaMeta } from "../types";
   import { MIN_CERT_TTL_SECS } from "../validate";
+  import AddCaModal from "./AddCaModal.svelte";
   import NumberField from "./NumberField.svelte";
 
-  type CaKind = "off" | "pem" | "pkcs12";
-
-  const KINDS: { value: CaKind; label: string }[] = [
-    { value: "off", label: "Off" },
-    { value: "pem", label: "PEM (cert + key)" },
-    { value: "pkcs12", label: "PKCS#12" },
-  ];
   const DEFAULT_CERT_TTL_SECS = 3600;
   const DEFAULT_CACHE_ENTRIES = 10_000;
-  const EXPIRY_WARNING_DAYS = 30;
 
   const uid = $props.id();
   const mitm = $derived((store.draft as SessionProfile).mitm);
   const errors = $derived(store.draftErrors);
-  const kind = $derived<CaKind>(!mitm ? "off" : "Pem" in mitm.ca_mode ? "pem" : "pkcs12");
-  const pem = $derived(mitm && "Pem" in mitm.ca_mode ? mitm.ca_mode.Pem : null);
-  const p12 = $derived(mitm && "Pkcs12" in mitm.ca_mode ? mitm.ca_mode.Pkcs12 : null);
-  const caReady = $derived(
-    pem ? !!pem.cert.trim() && !!pem.key.trim() : !!p12 && !!p12.path.trim(),
-  );
-  const storeBlocker = $derived.by(() => {
-    if (store.isNew || store.dirty) return "Save the session first, then set the passphrase.";
-    if (!store.vault.unlocked) return "Unlock the vault to set the passphrase.";
-    return null;
-  });
+  const selected = $derived(mitm?.ca ? (store.cas.find((ca) => ca.id === mitm.ca) ?? null) : null);
+  const expiry = $derived(selected ? caExpiry(selected.not_after) : null);
+  const vaultReady = $derived(store.vault.initialized && store.vault.unlocked);
 
-  // Paths and settings from a mode the user switched away from.
-  let lastPem = { cert: "", key: "" };
-  let lastP12 = "";
-  let lastSettings: Pick<
-    MitmConfig,
-    "ca_passphrase_file" | "cert_ttl" | "cert_cache_max_entries" | "socks_block_web"
-  > | null = null;
-
-  /** Write-only. Never stored outside this field and cleared as soon as it is submitted. */
-  let passphrase = $state("");
-  let savingPassphrase = $state(false);
-  let passphraseError = $state<string | null>(null);
-  let inspecting = $state(false);
-  let caInfo = $state.raw<MitmCaInfo | null>(null);
-  let inspectError = $state<string | null>(null);
-  let inspectRun = 0;
+  // Settings from before MITM was switched off, restored if it is switched back on.
+  let lastSettings: MitmConfig | null = null;
+  let uploading = $state(false);
 
   function setMitm(patch: Partial<MitmConfig>) {
     store.updateDraft((p) => (p.mitm ? { ...p, mitm: { ...p.mitm, ...patch } } : p));
   }
 
-  function remember() {
-    if (pem) lastPem = { ...pem };
-    if (p12) lastP12 = p12.path;
-    if (mitm) {
-      const { ca_passphrase_file, cert_ttl, cert_cache_max_entries, socks_block_web } = mitm;
-      lastSettings = { ca_passphrase_file, cert_ttl, cert_cache_max_entries, socks_block_web };
-    }
-  }
-
-  function setKind(next: CaKind) {
-    if (next === kind) return;
-    remember();
-    if (next === "off") {
-      passphrase = "";
+  function setEnabled(enabled: boolean) {
+    if (enabled === !!mitm) return;
+    if (!enabled) {
+      lastSettings = mitm;
       store.updateDraft((p) => ({ ...p, mitm: null }));
       return;
     }
-    const ca_mode: MitmCaMode = next === "pem" ? { Pem: { ...lastPem } } : { Pkcs12: { path: lastP12 } };
-    // Only the saved reference is safe to restore: a dropped one may already be deleted.
-    const savedRef = store.selected?.profile.mitm?.passphrase ?? null;
-    store.updateDraft((p) => {
-      if (p.mitm) return { ...p, mitm: { ...p.mitm, ca_mode } };
-      const settings = lastSettings ?? {
-        ca_passphrase_file: null,
-        cert_ttl: DEFAULT_CERT_TTL_SECS,
-        cert_cache_max_entries: DEFAULT_CACHE_ENTRIES,
-        socks_block_web: false,
-      };
-      const passphraseRef = settings.ca_passphrase_file ? null : savedRef;
-      return { ...p, mitm: { ...settings, ca_mode, passphrase: passphraseRef } };
-    });
+    // A CA deleted while MITM was off must not come back.
+    const restored = lastSettings && store.cas.some((ca) => ca.id === lastSettings?.ca) ? lastSettings : null;
+    const settings: MitmConfig = restored ?? {
+      ca: store.cas.length === 1 ? (store.cas[0]?.id ?? null) : null,
+      cert_ttl: lastSettings?.cert_ttl ?? DEFAULT_CERT_TTL_SECS,
+      cert_cache_max_entries: lastSettings?.cert_cache_max_entries ?? DEFAULT_CACHE_ENTRIES,
+      socks_block_web: lastSettings?.socks_block_web ?? false,
+    };
+    store.updateDraft((p) => ({ ...p, mitm: { ...settings } }));
   }
 
-  async function savePassphrase(event: SubmitEvent) {
-    event.preventDefault();
-    const id = store.selectedId;
-    const value = passphrase;
-    if (id === null || !value || storeBlocker || mitm?.ca_passphrase_file) return;
-    passphrase = "";
-    passphraseError = null;
-    savingPassphrase = true;
-    try {
-      await store.setMitmPassphrase(id, value);
-    } catch (error) {
-      passphraseError = errorMessage(error);
-    } finally {
-      savingPassphrase = false;
-    }
+  function added(ca: VaultCaMeta) {
+    setMitm({ ca: ca.id });
   }
-
-  async function inspect() {
-    if (!mitm || !caReady) return;
-    const source: MitmPassphraseSource = passphrase
-      ? { passphrase }
-      : mitm.passphrase
-        ? { passphraseRef: mitm.passphrase }
-        : mitm.ca_passphrase_file
-          ? { passphraseFile: mitm.ca_passphrase_file }
-          : {};
-    const run = ++inspectRun;
-    inspecting = true;
-    caInfo = null;
-    inspectError = null;
-    try {
-      const info = await api.inspectMitmCa(mitm.ca_mode, source);
-      if (run === inspectRun) caInfo = info;
-    } catch (error) {
-      if (run === inspectRun) inspectError = errorMessage(error);
-    } finally {
-      if (run === inspectRun) inspecting = false;
-    }
-  }
-
-  // A parsed result only describes the exact CA source it was read from.
-  $effect(() => {
-    void JSON.stringify([mitm?.ca_mode, mitm?.passphrase, mitm?.ca_passphrase_file]);
-    inspectRun += 1;
-    inspecting = false;
-    caInfo = null;
-    inspectError = null;
-  });
 </script>
-
-{#snippet pathField(label: string, value: string, error: string | undefined, onValue: (path: string) => void)}
-  <div class="field grow">
-    <label class="field">
-      {label}
-      <input
-        {value}
-        spellcheck="false"
-        aria-invalid={!!error}
-        oninput={(e) => onValue(e.currentTarget.value)}
-      />
-    </label>
-    {#if error}<span class="field-error">{error}</span>{/if}
-  </div>
-{/snippet}
 
 <section class="card" aria-labelledby={`${uid}-heading`}>
   <h2 id={`${uid}-heading`}>HTTPS MITM <small class="muted">decrypts HTTPS using your own CA</small></h2>
 
   <div class="segmented" role="group" aria-label="MITM mode">
-    {#each KINDS as option (option.value)}
-      <button type="button" aria-pressed={kind === option.value} onclick={() => setKind(option.value)}>
-        {option.label}
-      </button>
-    {/each}
+    <button type="button" aria-pressed={!mitm} onclick={() => setEnabled(false)}>Off</button>
+    <button type="button" aria-pressed={!!mitm} onclick={() => setEnabled(true)}>On</button>
   </div>
 
   {#if !mitm}
     <p class="muted">MITM is off. HTTPS traffic passes through unchanged.</p>
   {:else}
     <div class="field-row">
-      {#if pem}
-        {@render pathField("CA certificate path", pem.cert, errors["mitm.cert"], (cert) =>
-          setMitm({ ca_mode: { Pem: { cert, key: pem.key } } }),
-        )}
-        {@render pathField("CA private key path", pem.key, errors["mitm.key"], (key) =>
-          setMitm({ ca_mode: { Pem: { cert: pem.cert, key } } }),
-        )}
-      {:else if p12}
-        {@render pathField("PKCS#12 bundle path", p12.path, errors["mitm.path"], (path) =>
-          setMitm({ ca_mode: { Pkcs12: { path } } }),
-        )}
+      <div class="field grow">
+        <label class="field">
+          CA
+          <select
+            value={mitm.ca ?? ""}
+            aria-invalid={!!errors["mitm.ca"]}
+            onchange={(e) => setMitm({ ca: e.currentTarget.value || null })}
+          >
+            <option value="" disabled>{store.cas.length ? "Choose a CA…" : "No CAs in the vault yet"}</option>
+            {#each store.cas as ca (ca.id)}
+              <option value={ca.id}>{ca.name} ({ca.subject})</option>
+            {/each}
+          </select>
+        </label>
+        {#if errors["mitm.ca"]}<span class="field-error">{errors["mitm.ca"]}</span>{/if}
+      </div>
+    </div>
+    <div class="inline-form">
+      <button type="button" disabled={!vaultReady} onclick={() => (uploading = true)}>Upload CA…</button>
+      {#if !vaultReady}
+        <small class="muted">Unlock the vault to upload a CA.</small>
+      {:else}
+        <small class="muted">Uploaded CAs are kept in the vault and listed in the Key Vault.</small>
       {/if}
     </div>
 
-    <div class="inline-form">
-      <button type="button" disabled={!caReady || inspecting} onclick={inspect}>
-        {inspecting ? "Inspecting…" : "Inspect CA"}
-      </button>
-    </div>
-    <div role="status">
-      {#if caInfo}
-        <dl class="fact-list">
-          <dt>Subject</dt>
-          <dd>{caInfo.subject}</dd>
-          <dt>Expires</dt>
-          <dd>{new Date(caInfo.not_after).toLocaleString()}</dd>
-        </dl>
-        {#if caInfo.expired}
-          <p class="field-error">This CA has expired. Sessions using it will not start.</p>
-        {:else if caInfo.days_remaining <= EXPIRY_WARNING_DAYS}
-          <p class="warning">
-            This CA expires in {caInfo.days_remaining} {caInfo.days_remaining === 1 ? "day" : "days"}.
-          </p>
-        {/if}
+    {#if selected && expiry}
+      <dl class="fact-list">
+        <dt>Subject</dt>
+        <dd>{selected.subject}</dd>
+        <dt>Fingerprint</dt>
+        <dd><code>{selected.fingerprint_sha256}</code></dd>
+        <dt>Expiry</dt>
+        <dd><span class={`pill ${expiry.tone}`}>{expiry.label}</span></dd>
+      </dl>
+      {#if expiry.tone === "alert"}
+        <p class="field-error">This CA has expired. The session will not start until you choose another.</p>
       {/if}
-      {#if inspectError}<p class="field-error">Could not read the CA: {inspectError}</p>{/if}
-    </div>
+    {:else if mitm.ca}
+      <p class="field-error">This CA is no longer in the vault. Choose another.</p>
+    {/if}
   {/if}
 </section>
 
 {#if mitm}
-  <section class="card" aria-labelledby={`${uid}-passphrase`}>
-    <h2 id={`${uid}-passphrase`}>CA passphrase <small class="muted">use a saved passphrase or a file, not both</small></h2>
-    {#if errors["mitm.passphrase"]}<p class="field-error">{errors["mitm.passphrase"]}</p>{/if}
-    {#if mitm.passphrase}
-      <p>
-        <span class="pill ok">Saved passphrase</span>
-        <button type="button" onclick={() => setMitm({ passphrase: null })}>Remove</button>
-      </p>
-    {/if}
-    <form class="inline-form" onsubmit={savePassphrase} autocomplete="off">
-      <input
-        type="password"
-        bind:value={passphrase}
-        autocomplete="new-password"
-        placeholder={mitm.passphrase ? "Enter a new passphrase to replace it" : "Passphrase"}
-        aria-label="CA passphrase"
-        disabled={!!mitm.ca_passphrase_file || savingPassphrase}
-      />
-      <button type="submit" disabled={!passphrase || !!storeBlocker || !!mitm.ca_passphrase_file || savingPassphrase}>
-        {savingPassphrase ? "Saving…" : "Save to vault"}
-      </button>
-    </form>
-    {#if passphrase && storeBlocker}<small class="muted">{storeBlocker}</small>{/if}
-    {#if passphraseError}<span class="field-error" role="alert">{passphraseError}</span>{/if}
-
-    <label class="field">
-      Passphrase file path
-      <input
-        value={mitm.ca_passphrase_file ?? ""}
-        spellcheck="false"
-        disabled={!!mitm.passphrase || !!passphrase}
-        oninput={(e) => setMitm({ ca_passphrase_file: e.currentTarget.value || null })}
-      />
-    </label>
-
-  </section>
-
   <section class="card" aria-labelledby={`${uid}-certs`}>
     <h2 id={`${uid}-certs`}>Generated certificates</h2>
     <div class="field-row">
@@ -279,4 +134,8 @@
     </label>
 
   </section>
+{/if}
+
+{#if uploading}
+  <AddCaModal onClose={() => (uploading = false)} onAdded={added} />
 {/if}

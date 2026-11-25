@@ -337,9 +337,7 @@ describe("sessionErrors", () => {
   test("requires a MITM certificate TTL of at least 10 seconds", () => {
     const profile = validProfile();
     profile.mitm = {
-      ca_mode: { Pem: { cert: "ca.pem", key: "ca.key" } },
-      passphrase: null,
-      ca_passphrase_file: null,
+      ca: "ca-1",
       cert_ttl: 9,
       cert_cache_max_entries: 0,
       socks_block_web: false,
@@ -349,6 +347,14 @@ describe("sessionErrors", () => {
       "Use a whole number of at least 10 seconds.",
     );
     profile.mitm.cert_ttl = 10;
+    assert.deepEqual(sessionErrors(profile), {});
+  });
+
+  test("requires a MITM CA to be chosen", () => {
+    const profile = validProfile();
+    profile.mitm = { ca: null, cert_ttl: 3600, cert_cache_max_entries: 0, socks_block_web: false };
+    assert.equal(sessionErrors(profile)["mitm.ca"], "Choose a CA, or upload one.");
+    profile.mitm.ca = "ca-1";
     assert.deepEqual(sessionErrors(profile), {});
   });
 

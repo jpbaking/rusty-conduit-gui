@@ -39,10 +39,11 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, Instant};
 use tokio_util::sync::CancellationToken;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use crate::backoff::Backoff;
 use crate::logs::LogRingBuffer;
+use crate::mitm_ca_file::MitmCaFile;
 use crate::state::{HostKeyPrompt, ListenerInfo, SessionState, StateCell};
 
 /// Queued inbound reverse channels per connection.
@@ -439,8 +440,7 @@ pub(crate) fn needs_secrets(profile: &SessionProfile) -> bool {
             .iter()
             .any(|m| matches!(m, AuthMethod::Key { .. } | AuthMethod::Password { .. }))
     });
-    hop_secret
-        || profile.mitm.as_ref().is_some_and(|m| m.passphrase.is_some())
+    hop_secret || profile.mitm.as_ref().is_some_and(|m| m.ca.is_some())
 }
 
 /// Resolves one auth method. Returns `None` for a method this engine does not provide.
@@ -566,26 +566,26 @@ impl ProxyStack {
         listeners: SharedListeners,
         base: Arc<dyn UpstreamDialer>,
     ) -> Result<Self, LinkError> {
-        let passphrase = {
+        // Lives only until the MITM state below has loaded it.
+        let ca_file = {
             let vault = vault.read().unwrap_or_else(PoisonError::into_inner);
             if needs_secrets(profile) && !vault.is_unlocked() {
                 return Err(LinkError::Locked);
             }
-            match profile.mitm.as_ref().and_then(|m| m.passphrase.as_ref()) {
-                Some(secret) => {
-                    let bytes = vault.get_secret(&secret.to_string()).map_err(vault_error)?;
-                    let text = std::str::from_utf8(&bytes).map_err(|_| {
-                        LinkError::Attention(format!("secret {secret} is not valid text"))
+            match profile.mitm.as_ref().and_then(|m| m.ca.as_ref()) {
+                Some(ca) => {
+                    let pem = vault.get_secret(&ca.to_string()).map_err(vault_error)?;
+                    let staged = MitmCaFile::write(&pem).map_err(|e| {
+                        LinkError::Fatal(format!("failed to stage the MITM CA: {e}"))
                     })?;
-                    Some(Zeroizing::new(text.to_owned()))
+                    Some(staged)
                 }
                 None => None,
             }
         };
 
-        let mut cfg = to_config(profile, passphrase.as_ref().map(|p| p.as_str()))
+        let cfg = to_config(profile, ca_file.as_ref().map(MitmCaFile::path))
             .map_err(|e| LinkError::Fatal(e.to_string()))?;
-        drop(passphrase);
 
         let logger = Logger::with_writer(cfg.log_level, Box::new(logs.writer()));
         let access = match AccessLogger::start_with_stdout(
@@ -602,7 +602,6 @@ impl ProxyStack {
         {
             Ok(access) => access,
             Err(e) => {
-                scrub_passphrase(&mut cfg);
                 return Err(LinkError::Fatal(format!("failed to open access log: {e}")));
             }
         };
@@ -614,8 +613,8 @@ impl ProxyStack {
         };
 
         let started = start_proxies(&cfg, &access, &logger, Arc::clone(&upstream)).await;
-        // Both TLS contexts are built, so the passphrase is no longer needed.
-        scrub_passphrase(&mut cfg);
+        // The MITM state holds the CA in memory now, so its file goes.
+        drop(ca_file);
         let (reverse, mitm) = match started {
             Ok(parts) => parts,
             Err(message) => {
@@ -803,12 +802,6 @@ fn remote_listener_info(
             ListenerInfo { role: role.to_string(), addr: SocketAddr::new(ip, port) }
         })
         .collect()
-}
-
-fn scrub_passphrase(cfg: &mut Config) {
-    if let Some(mut passphrase) = cfg.mitm_ca_passphrase.take() {
-        passphrase.zeroize();
-    }
 }
 
 async fn start_proxies(

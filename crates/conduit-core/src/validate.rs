@@ -15,7 +15,7 @@ use rusty_conduit_ssh::filter::FilterRule;
 use rusty_conduit_ssh::logging::{LogFormat, LogLevel};
 use thiserror::Error;
 
-use crate::{MitmCaMode, SessionProfile};
+use crate::SessionProfile;
 
 /// Errors raised when a [`SessionProfile`] fails validation. Every variant is `FATAL`.
 #[derive(Debug, Error)]
@@ -24,16 +24,8 @@ pub enum ValidateError {
         "no listeners: turn on the forward or reverse proxy with at least one non-zero port"
     )]
     NoListeners,
-    // Structural: `MitmCaMode` is an enum, so a PKCS#12 bundle and a PEM pair can never coexist.
-    // Kept for parity with the upstream `Config` which stored these as independent optionals.
-    #[error("ambiguous MITM CA source: a PKCS#12 bundle cannot be combined with a PEM cert/key")]
-    AmbiguousCaSource,
-    #[error("incomplete PEM MITM CA: both cert and key must be provided")]
-    IncompletePemCa,
-    #[error(
-        "conflicting passphrase sources: use only one of an inline passphrase or a passphrase file"
-    )]
-    ConflictingPassphrase,
+    #[error("MITM is on but no CA is selected: upload a CA in the Key Vault and choose it")]
+    MissingMitmCa,
     #[error("--mitm-cert-ttl must be at least 10s (got {})", humantime::format_duration(*.0))]
     CertTtlTooShort(Duration),
     #[error("missing SSH target: the session must have at least one hop")]
@@ -182,20 +174,10 @@ pub fn validate(profile: &SessionProfile) -> Result<(), ValidateError> {
         return Err(ValidateError::NoListeners);
     }
 
-    // MITM: structural completeness, conflicting passphrase source, and cert TTL.
+    // MITM: a CA must be chosen, and the cert TTL must be long enough.
     if let Some(mitm) = &profile.mitm {
-        match &mitm.ca_mode {
-            MitmCaMode::Pkcs12 { .. } => {}
-            MitmCaMode::Pem { cert, key } => {
-                if cert.to_str().map(|s| s.is_empty()).unwrap_or(true)
-                    || key.to_str().map(|s| s.is_empty()).unwrap_or(true)
-                {
-                    return Err(ValidateError::IncompletePemCa);
-                }
-            }
-        }
-        if mitm.passphrase.is_some() && mitm.ca_passphrase_file.is_some() {
-            return Err(ValidateError::ConflictingPassphrase);
+        if mitm.ca.is_none() {
+            return Err(ValidateError::MissingMitmCa);
         }
         if mitm.cert_ttl < MIN_MITM_CERT_TTL {
             return Err(ValidateError::CertTtlTooShort(mitm.cert_ttl));
@@ -295,7 +277,7 @@ pub fn validate(profile: &SessionProfile) -> Result<(), ValidateError> {
 mod tests {
     use super::*;
     use crate::{
-        ForwardConfig, HopEntry, HostProfile, MitmCaMode, ReverseConfig, SessionProfile,
+        ForwardConfig, HopEntry, HostProfile, MitmCaId, ReverseConfig, SessionProfile,
     };
 
     fn target_hop() -> HopEntry {
@@ -480,29 +462,19 @@ mod tests {
     }
 
     #[test]
-    fn conflicting_passphrase_is_rejected() {
+    fn mitm_without_a_ca_is_rejected() {
         let mut p = forward_profile();
-        p.mitm = Some(crate::MitmConfig {
-            ca_mode: MitmCaMode::Pkcs12 {
-                path: "/tmp/ca.p12".into(),
-            },
-            passphrase: Some(crate::SecretRef::new()),
-            ca_passphrase_file: Some("/tmp/ca.txt".into()),
-            ..Default::default()
-        });
-        assert!(matches!(
-            validate(&p),
-            Err(ValidateError::ConflictingPassphrase)
-        ));
+        p.mitm = Some(crate::MitmConfig::default());
+        assert!(matches!(validate(&p), Err(ValidateError::MissingMitmCa)));
+        p.mitm.as_mut().unwrap().ca = Some(MitmCaId::new());
+        assert!(validate(&p).is_ok());
     }
 
     #[test]
     fn short_cert_ttl_is_rejected() {
         let mut p = forward_profile();
         p.mitm = Some(crate::MitmConfig {
-            ca_mode: MitmCaMode::Pkcs12 {
-                path: "/tmp/ca.p12".into(),
-            },
+            ca: Some(MitmCaId::new()),
             cert_ttl: Duration::from_secs(1),
             ..Default::default()
         });

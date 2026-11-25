@@ -11,6 +11,7 @@ pub mod events;
 pub mod hardening;
 pub mod logs;
 pub mod manager;
+mod mitm_ca_file;
 pub(crate) mod runner;
 pub mod state;
 pub mod wake;

@@ -6,6 +6,7 @@ import { isActive } from "./format";
 import { hostErrors, sessionErrors, type FieldErrors } from "./validate";
 import type {
   AuthMethod,
+  CaView,
   ChainTestResult,
   CloseChoice,
   HopEntry,
@@ -14,6 +15,7 @@ import type {
   HostProfile,
   KeyId,
   KeyView,
+  MitmCaId,
   RuntimeEvent,
   SessionProfile,
   SessionSnapshot,
@@ -103,6 +105,7 @@ class AppStore {
   sessions = $state.raw<SessionView[]>([]);
   hosts = $state.raw<HostProfile[]>([]);
   keys = $state.raw<KeyView[]>([]);
+  cas = $state.raw<CaView[]>([]);
   pins = $state.raw<HostKeyEntry[]>([]);
   vault = $state.raw<VaultStatus>({ initialized: false, unlocked: false, keyring: false });
   /** False until the backend has reported the vault, so a failed load never offers "create". */
@@ -234,16 +237,18 @@ class AppStore {
   async refresh(): Promise<boolean> {
     this.#snapshotsInFlight += 1;
     try {
-      const [sessions, hosts, keys, vault, pins] = await Promise.all([
+      const [sessions, hosts, keys, cas, vault, pins] = await Promise.all([
         api.listSessions(),
         api.listHosts(),
         api.listKeys(),
+        api.listMitmCas(),
         api.vaultStatus(),
         api.listHostKeyPins(),
       ]);
       this.sessions = sessions;
       this.hosts = hosts;
       this.keys = keys;
+      this.cas = cas;
       this.setVault(vault);
       this.pins = pins;
       this.#reconcileSelection();
@@ -314,6 +319,34 @@ class AppStore {
     if (this.hostDraft && usesKey(this.hostDraft.auth, id)) {
       this.hostDraft = { ...this.hostDraft, auth: withoutKey(this.hostDraft.auth, id) };
     }
+    await this.refresh();
+    return null;
+  }
+
+  /** Names of unsaved edits whose MITM uses this CA. */
+  draftsUsingCa(id: MitmCaId): string[] {
+    return Object.values(this.drafts)
+      .filter((profile) => profile.mitm?.ca === id)
+      .map((profile) => profile.name);
+  }
+
+  /**
+   * Deletes a CA the user confirmed, with the same contract as {@link deleteKey}. Sessions that
+   * used it keep MITM on with no CA, so they cannot start until another is chosen.
+   */
+  async deleteMitmCa(id: MitmCaId, confirmed: Usage): Promise<Usage | null> {
+    const first = await api.deleteMitmCa(id);
+    if (!first.deleted) {
+      const seen = new Set(confirmed.sessions.map((ref) => ref.id));
+      if (first.usage.sessions.some((ref) => !seen.has(ref.id))) return first.usage;
+      const forced = await api.deleteMitmCa(id, true);
+      if (!forced.deleted) return forced.usage;
+    }
+    const drafts = Object.entries(this.drafts).map(([key, profile]) => [
+      key,
+      profile.mitm?.ca === id ? { ...profile, mitm: { ...profile.mitm, ca: null } } : profile,
+    ]);
+    this.drafts = Object.fromEntries(drafts);
     await this.refresh();
     return null;
   }
@@ -496,26 +529,6 @@ class AppStore {
     } finally {
       this.saving = false;
     }
-  }
-
-  /**
-   * Stores a CA passphrase on the saved session. The backend replaces and deletes the previous
-   * record, so a draft edited during the call must move to the new reference. Throws on failure.
-   */
-  async setMitmPassphrase(id: Uuid, passphrase: string): Promise<void> {
-    const { secret_ref } = await api.setMitmPassphrase(id, passphrase);
-    const draft = this.drafts[id];
-    if (draft?.mitm) {
-      const mitm = { ...draft.mitm, passphrase: secret_ref, ca_passphrase_file: null };
-      this.drafts = { ...this.drafts, [id]: { ...draft, mitm } };
-    } else if (draft) {
-      // MITM was turned off meanwhile. Saving that draft leaves this record unused.
-      this.#orphanedSecrets.add(secret_ref);
-    }
-    await this.refresh();
-    const latest = this.drafts[id];
-    const saved = this.sessions.find((s) => s.profile.id === id)?.profile;
-    if (latest && saved && sameProfile(saved, latest)) this.#dropDraft(id);
   }
 
   pinFor(hop: HopEntry): HostKeyEntry | null {

@@ -7,8 +7,8 @@
 //!
 //! A plain file is unauthenticated, so anyone could have edited it. Importing one therefore
 //! never lets a file attach an existing credential to a new destination: a key, password,
-//! agent key, or CA passphrase reference survives only where the same host, port, and user
-//! already hold it.
+//! agent key, or MITM CA reference survives only where the same host, port, and user (or, for
+//! a CA, the same session) already hold it.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 use std::sync::PoisonError;
 
 use conduit_core::{
-    validate, AppConfig, AuthMethod, HopEntry, HostProfile, KeyId, KnownHostsStore, SecretRef,
-    SessionProfile, VaultKeyMeta,
+    validate, AppConfig, AuthMethod, HopEntry, HostProfile, KeyId, KnownHostsStore, MitmCaId,
+    SecretRef, SessionProfile, VaultCaMeta, VaultKeyMeta,
 };
 use conduit_vault::{
     decrypt_record, derive_master_key, encrypt_record, generate_dek, Argon2Params, Dek, VaultError,
@@ -26,7 +26,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
-use super::keys::{write_private_file, KEY_RECORD, PASSPHRASE_RECORD, PASSWORD_RECORD};
+use super::keys::{write_private_file, KEY_RECORD, PASSWORD_RECORD};
+use super::mitm_ca::{ca_id_from_record, stored_facts, MITM_CA_RECORD};
 use super::{
     key_id_from_record, secret_ref_from_record, AppController, AppError, SecretInput,
     SCHEMA_VERSION,
@@ -101,6 +102,7 @@ pub struct ExportSummary {
     pub session_count: usize,
     pub host_count: usize,
     pub key_count: usize,
+    pub ca_count: usize,
     /// Vault records sealed into the bundle. Always `0` for a plain export.
     pub secret_count: usize,
     /// References whose vault record no longer exists, so they could not be included.
@@ -118,6 +120,7 @@ pub struct ImportSummary {
     pub hosts_updated: usize,
     pub hosts_skipped: usize,
     pub keys_added: usize,
+    pub cas_added: usize,
     pub secrets_added: usize,
     pub known_hosts_added: usize,
     pub known_hosts_updated: usize,
@@ -147,9 +150,10 @@ fn referenced_records(config: &AppConfig) -> BTreeSet<String> {
             _ => false,
         };
     }
+    ids.extend(config.mitm_cas.iter().map(|c| c.id.to_string()));
     for session in &config.sessions {
-        if let Some(secret) = session.mitm.as_ref().and_then(|m| m.passphrase.as_ref()) {
-            ids.insert(secret.to_string());
+        if let Some(ca) = session.mitm.as_ref().and_then(|m| m.ca.as_ref()) {
+            ids.insert(ca.to_string());
         }
     }
     ids
@@ -234,12 +238,10 @@ fn strip_untrusted_credentials(incoming: &mut AppConfig, current: &AppConfig) ->
             let trusted = existing.and_then(|s| s.hops.iter().find(|h| h.hop_id == hop.hop_id));
             removed += strip_hop(hop, trusted);
         }
-        if let Some(mitm) = session.mitm.as_mut().filter(|m| m.passphrase.is_some()) {
-            let keep = existing.and_then(|s| s.mitm.as_ref()).is_some_and(|e| {
-                e.passphrase == mitm.passphrase && e.ca_mode == mitm.ca_mode
-            });
+        if let Some(mitm) = session.mitm.as_mut().filter(|m| m.ca.is_some()) {
+            let keep = existing.and_then(|s| s.mitm.as_ref()).is_some_and(|e| e.ca == mitm.ca);
             if !keep {
-                mitm.passphrase = None;
+                mitm.ca = None;
                 removed += 1;
             }
         }
@@ -340,8 +342,9 @@ fn check_bundle_params(file: &EncryptedExport) -> Result<(), AppError> {
 struct RestoredRecords {
     keys: HashMap<String, KeyId>,
     passwords: HashMap<String, SecretRef>,
-    passphrases: HashMap<String, SecretRef>,
+    cas: HashMap<String, MitmCaId>,
     new_metas: Vec<VaultKeyMeta>,
+    new_ca_metas: Vec<VaultCaMeta>,
     /// Records created by this import, deleted again if it fails.
     created: Vec<String>,
 }
@@ -380,9 +383,9 @@ impl RestoredRecords {
                 removed += self.remap_auth(&mut hop.host.auth);
             }
             if let Some(mitm) = session.mitm.as_mut() {
-                if let Some(old) = mitm.passphrase.take() {
-                    mitm.passphrase = self.passphrases.get(&old.to_string()).cloned();
-                    removed += usize::from(mitm.passphrase.is_none());
+                if let Some(old) = mitm.ca.take() {
+                    mitm.ca = self.cas.get(&old.to_string()).cloned();
+                    removed += usize::from(mitm.ca.is_none());
                 }
             }
         }
@@ -405,6 +408,7 @@ impl AppController {
             session_count: config.sessions.len(),
             host_count: config.hosts.len(),
             key_count: config.keys.len(),
+            ca_count: config.mitm_cas.len(),
             secret_count: 0,
             missing_secrets: 0,
         };
@@ -514,8 +518,9 @@ impl AppController {
         let file: PlainExport = serde_json::from_slice(data).map_err(|_| not_an_export())?;
         let mut incoming = file.config;
         prepare(&mut incoming)?;
-        // Key metadata without its vault record would list a key that cannot be used.
+        // Key or CA metadata without its vault record would list one that cannot be used.
         incoming.keys.clear();
+        incoming.mitm_cas.clear();
         let (summary, changed) = self.mutate_config(move |config| {
             let removed = strip_untrusted_credentials(&mut incoming, config);
             neutralize_untrusted_paths(&mut incoming, config);
@@ -563,10 +568,16 @@ impl AppController {
         let merged = stored.and_then(|()| {
             let removed = restored.remap(&mut incoming);
             let metas = restored.new_metas.clone();
+            let ca_metas = restored.new_ca_metas.clone();
             self.mutate_config(move |config| {
                 for meta in metas {
                     if !config.keys.iter().any(|k| k.fingerprint_sha256 == meta.fingerprint_sha256) {
                         config.keys.push(meta);
+                    }
+                }
+                for meta in ca_metas {
+                    if !config.mitm_cas.iter().any(|c| c.fingerprint_sha256 == meta.fingerprint_sha256) {
+                        config.mitm_cas.push(meta);
                     }
                 }
                 let (mut summary, changed) = merge(config, incoming, replace);
@@ -590,14 +601,16 @@ impl AppController {
         summary.sessions_skipped += sessions_skipped;
         summary.hosts_skipped += hosts_skipped;
         summary.keys_added = restored.new_metas.len();
-        summary.secrets_added = restored.created.len() - restored.new_metas.len();
+        summary.cas_added = restored.new_ca_metas.len();
+        summary.secrets_added =
+            restored.created.len() - restored.new_metas.len() - restored.new_ca_metas.len();
         let (added, updated) = self.merge_known_hosts(known_hosts, replace)?;
         summary.known_hosts_added = added;
         summary.known_hosts_updated = updated;
         Ok(summary)
     }
 
-    /// Stores the bundle's keys and the passwords and passphrases `incoming` still refers to.
+    /// Stores the bundle's keys and CAs, and the passwords `incoming` still refers to.
     fn restore_records(
         &self,
         incoming: &AppConfig,
@@ -644,6 +657,39 @@ impl AppController {
             });
         }
 
+        let mut ca_fingerprints: HashMap<String, MitmCaId> = current
+            .mitm_cas
+            .iter()
+            .map(|c| (c.fingerprint_sha256.clone(), c.id.clone()))
+            .collect();
+        for meta in &incoming.mitm_cas {
+            let bundle_id = meta.id.to_string();
+            let Some(secret) = find(&bundle_id, MITM_CA_RECORD) else { continue };
+            let facts = stored_facts(&secret.value)?;
+            if facts.fingerprint_sha256 != meta.fingerprint_sha256 {
+                return Err(AppError::Invalid(format!(
+                    "MITM CA {bundle_id} does not match its recorded fingerprint"
+                )));
+            }
+            if let Some(existing) = ca_fingerprints.get(&facts.fingerprint_sha256) {
+                restored.cas.insert(bundle_id, existing.clone());
+                continue;
+            }
+            let record = self.vault_write().put_secret(MITM_CA_RECORD, &secret.value)?;
+            restored.created.push(record.clone());
+            let id = ca_id_from_record(&record)?;
+            ca_fingerprints.insert(facts.fingerprint_sha256.clone(), id.clone());
+            restored.cas.insert(bundle_id, id.clone());
+            restored.new_ca_metas.push(VaultCaMeta {
+                id,
+                name: meta.name.clone(),
+                subject: facts.subject,
+                not_after: facts.not_after,
+                fingerprint_sha256: facts.fingerprint_sha256,
+                created_at: meta.created_at,
+            });
+        }
+
         let passwords: BTreeSet<String> = all_hosts(incoming)
             .flat_map(|h| &h.auth)
             .filter_map(|m| match m {
@@ -655,18 +701,6 @@ impl AppController {
             if let Some(secret) = find(&id, PASSWORD_RECORD) {
                 let reference = self.restore_secret(secret, restored)?;
                 restored.passwords.insert(id, reference);
-            }
-        }
-        let passphrases: BTreeSet<String> = incoming
-            .sessions
-            .iter()
-            .filter_map(|s| s.mitm.as_ref()?.passphrase.as_ref())
-            .map(ToString::to_string)
-            .collect();
-        for id in passphrases {
-            if let Some(secret) = find(&id, PASSPHRASE_RECORD) {
-                let reference = self.restore_secret(secret, restored)?;
-                restored.passphrases.insert(id, reference);
             }
         }
         Ok(())
@@ -720,15 +754,18 @@ mod tests {
     use super::super::keys::GenerateAlgorithm;
     use super::super::test_support::*;
     use super::*;
-    use conduit_core::{HostKeyLookup, HostKeyRecord, MitmCaMode, MitmConfig, Timestamp};
+    use super::super::mitm_ca::{test_ca, MitmCaUpload};
+    use conduit_core::{HostKeyLookup, HostKeyRecord, MitmConfig, Timestamp};
     use serde_json::{json, Value};
 
     const PASSWORD: &str = "export-canary-password-71fe";
-    const MITM: &str = "export-canary-mitm-pass-2c90";
     const BUNDLE_PASS: &str = "export-canary-bundle-pass-a4d1";
 
     struct Seed {
         key: VaultKeyMeta,
+        ca: VaultCaMeta,
+        /// Base64 lines of the CA's private key, none of which may leak.
+        ca_key_lines: Vec<String>,
         password: SecretRef,
         session: Uuid,
         host: Uuid,
@@ -747,13 +784,21 @@ mod tests {
             AuthMethod::Key { key: key.id.clone() },
             AuthMethod::Password { secret: password.clone() },
         ];
-        session.mitm = Some(MitmConfig {
-            ca_mode: MitmCaMode::Pkcs12 { path: "/tmp/seed.p12".into() },
-            ..MitmConfig::default()
-        });
+        let test_ca = test_ca::valid_ca("Seed CA");
+        let upload = MitmCaUpload::Pem {
+            cert: test_ca.cert_pem.clone(),
+            key: SecretInput::new(test_ca.key_pem.as_str()),
+        };
+        let ca = c.import_mitm_ca("seed-ca", upload, None).unwrap();
+        session.mitm = Some(MitmConfig { ca: Some(ca.id.clone()), ..MitmConfig::default() });
         let saved = c.upsert_session(session).unwrap();
-        c.set_mitm_passphrase(saved.id, SecretInput::new(MITM)).unwrap();
-        Seed { key, password, session: saved.id, host: linked.id }
+        let ca_key_lines = test_ca
+            .key_pem
+            .lines()
+            .filter(|l| !l.starts_with("-----") && l.len() >= 16)
+            .map(String::from)
+            .collect();
+        Seed { key, ca, ca_key_lines, password, session: saved.id, host: linked.id }
     }
 
     fn pin(fingerprint: &str) -> HostKeyRecord {
@@ -803,9 +848,11 @@ mod tests {
 
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("seed-key"));
-        for secret in [PASSWORD, MITM, "PRIVATE KEY", "ciphertext", "wrapped_dek"] {
+        for secret in [PASSWORD, "PRIVATE KEY", "ciphertext", "wrapped_dek"] {
             assert!(!text.contains(secret), "plain export leaked {secret}");
         }
+        assert!(seeded.ca_key_lines.iter().all(|l| !text.contains(l.as_str())));
+        assert!(text.contains("seed-ca"), "CA metadata is exported");
         for line in pem.lines().filter(|l| !l.starts_with("-----") && l.len() >= 16) {
             assert!(!text.contains(line));
         }
@@ -846,9 +893,10 @@ mod tests {
         let path = bundle(&c, &source_dir);
 
         let text = fs::read_to_string(&path).unwrap();
-        for secret in [PASSWORD, MITM, BUNDLE_PASS, "PRIVATE KEY", "seed-key", "linked"] {
+        for secret in [PASSWORD, BUNDLE_PASS, "PRIVATE KEY", "seed-key", "seed-ca", "linked"] {
             assert!(!text.contains(secret), "bundle exposed {secret}");
         }
+        assert!(seeded.ca_key_lines.iter().all(|l| !text.contains(l.as_str())));
 
         let target_dir = TempDir::new();
         let t = unlocked(&target_dir).await;
@@ -862,7 +910,7 @@ mod tests {
         let summary = t.import_config(&path, pass(), false).unwrap();
         assert!(summary.encrypted);
         assert_eq!((summary.sessions_added, summary.hosts_added), (1, 1));
-        assert_eq!((summary.keys_added, summary.secrets_added), (1, 2));
+        assert_eq!((summary.keys_added, summary.cas_added, summary.secrets_added), (1, 1, 1));
         assert_eq!(summary.known_hosts_added, 1);
         assert_eq!(summary.credentials_removed, 0);
 
@@ -875,8 +923,12 @@ mod tests {
         let AuthMethod::Password { secret } = &hop.host.auth[1] else { panic!("password lost") };
         assert_ne!(*secret, seeded.password);
         assert_eq!(t.vault_read().get_secret(&secret.to_string()).unwrap().as_slice(), PASSWORD.as_bytes());
-        let mitm = config.sessions[0].mitm.as_ref().unwrap().passphrase.clone().unwrap();
-        assert_eq!(t.vault_read().get_secret(&mitm.to_string()).unwrap().as_slice(), MITM.as_bytes());
+        let new_ca = &config.mitm_cas[0];
+        assert_ne!(new_ca.id, seeded.ca.id);
+        assert_eq!((new_ca.name.as_str(), &new_ca.fingerprint_sha256), ("seed-ca", &seeded.ca.fingerprint_sha256));
+        assert_eq!(config.sessions[0].mitm.as_ref().unwrap().ca.as_ref(), Some(&new_ca.id));
+        let stored = t.vault_read().get_secret(&new_ca.id.to_string()).unwrap();
+        assert!(std::str::from_utf8(&stored).unwrap().contains("PRIVATE KEY"));
         assert!(t.known_hosts().read().unwrap().contains_key("hop-0", "127.0.0.1", 22));
         assert!(target_dir.path().join("known_hosts.json").exists());
         assert!(t.manager().snapshot(seeded.session).is_ok(), "the runtime must know the session");
@@ -894,9 +946,10 @@ mod tests {
         assert_eq!((skipped.sessions_skipped, skipped.hosts_skipped), (1, 1));
         let updated = c.import_config(&path, pass(), true).unwrap();
         assert_eq!((updated.sessions_updated, updated.hosts_updated), (1, 1));
-        assert_eq!((updated.keys_added, updated.secrets_added), (0, 0));
+        assert_eq!((updated.keys_added, updated.cas_added, updated.secrets_added), (0, 0, 0));
         assert_eq!(c.vault_read().record_count(), records);
         assert_eq!(c.config_snapshot().keys.len(), 1);
+        assert_eq!(c.config_snapshot().mitm_cas.len(), 1);
     }
 
     #[tokio::test]
@@ -970,15 +1023,16 @@ mod tests {
         let summary = t.import_config(&path, None, false).unwrap();
         assert!(!summary.encrypted);
         assert_eq!((summary.sessions_added, summary.hosts_added), (1, 1));
-        // Host key, hop key, hop password, and MITM passphrase.
+        // Host key, hop key, hop password, and MITM CA.
         assert_eq!(summary.credentials_removed, 4);
 
         let config = t.config_snapshot();
         assert!(config.keys.is_empty());
+        assert!(config.mitm_cas.is_empty());
         assert!(config.hosts[0].auth.is_empty());
         let session = config.sessions.iter().find(|s| s.id == seeded.session).unwrap();
         assert!(session.hops[0].host.auth.is_empty());
-        assert_eq!(session.mitm.as_ref().unwrap().passphrase, None);
+        assert_eq!(session.mitm.as_ref().unwrap().ca, None);
     }
 
     #[tokio::test]
@@ -1005,7 +1059,11 @@ mod tests {
         c.export_config(&path, false, None).unwrap();
         edit_json(&path, |v| {
             v["config"]["sessions"][0]["hops"][0]["host"]["host"] = json!("attacker.example");
-            v["config"]["sessions"][0]["mitm"]["ca_mode"] = json!({ "Pkcs12": { "path": "/tmp/evil.p12" } });
+            // A new session that tries to borrow the existing CA.
+            let mut borrower = v["config"]["sessions"][0].clone();
+            borrower["id"] = json!(Uuid::new_v4());
+            borrower["name"] = json!("borrower");
+            v["config"]["sessions"].as_array_mut().unwrap().push(borrower);
         });
 
         c.import_config(&path, None, true).unwrap();
@@ -1013,7 +1071,10 @@ mod tests {
         let session = config.sessions.iter().find(|s| s.id == seeded.session).unwrap();
         assert_eq!(session.hops[0].host.host, "attacker.example");
         assert!(session.hops[0].host.auth.is_empty());
-        assert_eq!(session.mitm.as_ref().unwrap().passphrase, None);
+        // The CA is session-scoped: the session that already had it keeps it.
+        assert_eq!(session.mitm.as_ref().unwrap().ca.as_ref(), Some(&seeded.ca.id));
+        let borrower = config.sessions.iter().find(|s| s.name == "borrower").unwrap();
+        assert_eq!(borrower.mitm.as_ref().unwrap().ca, None);
     }
 
     #[tokio::test]

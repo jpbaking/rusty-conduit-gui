@@ -6,6 +6,7 @@
 
 pub mod export;
 pub mod keys;
+pub mod mitm_ca;
 pub mod parity;
 pub mod sessions;
 #[cfg(test)]
@@ -101,6 +102,8 @@ pub enum AppError {
     NotFound { kind: &'static str, id: String },
     #[error("a key with fingerprint {fingerprint} is already in the vault")]
     DuplicateKey { fingerprint: String },
+    #[error("a MITM CA with fingerprint {fingerprint} is already in the vault")]
+    DuplicateCa { fingerprint: String },
     #[error("{0}")]
     Invalid(String),
     #[error("{0}")]
@@ -122,6 +125,7 @@ impl AppError {
             Self::VaultExists => "vault_exists",
             Self::NotFound { .. } => "not_found",
             Self::DuplicateKey { .. } => "duplicate_key",
+            Self::DuplicateCa { .. } => "duplicate_ca",
             Self::Invalid(_) => "invalid",
             Self::Io(_) => "io",
             Self::Task(_) => "task",
@@ -513,11 +517,29 @@ impl AppController {
             let mut fresh = Vault::open_locked(&inner.paths.vault)?;
             unlock(&mut fresh, inner.keyring.as_ref())?;
             *controller.vault_write() = fresh;
+            controller.purge_retired_records();
             Ok(())
         })
         .await?;
         self.inner.manager.on_vault_unlocked().await;
         Ok(self.vault_status())
+    }
+
+    /// Deletes vault records no config can refer to any more: MITM CA passphrases, which
+    /// earlier betas stored for path-based CAs. Best effort, since they are unreachable anyway.
+    fn purge_retired_records(&self) {
+        let mut vault = self.vault_write();
+        let retired: Vec<String> = vault
+            .list_keys()
+            .into_iter()
+            .filter(|r| r.r#type == keys::RETIRED_PASSPHRASE_RECORD)
+            .map(|r| r.id)
+            .collect();
+        for id in retired {
+            if let Err(error) = vault.delete_secret(&id) {
+                eprintln!("failed to delete a retired vault record: {error}");
+            }
+        }
     }
 
     /// Wipes the in-memory key. Connected sessions stay up; reconnects then wait in `Locked`.
@@ -628,6 +650,19 @@ mod tests {
             Err(AppError::Vault(VaultError::KeyringEntryMissing { .. }))
         ));
         assert!(c.unlock_vault_with_password(SecretInput::new("master")).await.unwrap().unlocked);
+    }
+
+    #[tokio::test]
+    async fn unlock_deletes_retired_mitm_passphrase_records() {
+        let dir = TempDir::new();
+        let c = controller(&dir);
+        c.create_vault(SecretInput::new("master"), false).await.unwrap();
+        let retired = c.vault_write().put_secret(keys::RETIRED_PASSPHRASE_RECORD, b"old").unwrap();
+        let kept = c.set_password_secret(None, SecretInput::new("pw")).unwrap().secret_ref;
+        c.lock_vault();
+        c.unlock_vault_with_password(SecretInput::new("master")).await.unwrap();
+        assert!(c.record_type(&retired).is_none());
+        assert_eq!(c.record_type(&kept.to_string()).as_deref(), Some(keys::PASSWORD_RECORD));
     }
 
     #[tokio::test]

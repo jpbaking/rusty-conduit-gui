@@ -16,7 +16,7 @@ function result(status: HopTestResult["status"], error: string | null, elapsed_m
   return { hop_index: 0, hop_id: "hop-1", host: "example.com", port: 22, status, error, elapsed_ms, host_key: null };
 }
 
-function profile(hops: HopEntry[], passphrase: string | null): SessionProfile {
+function profile(hops: HopEntry[], ca: string | null): SessionProfile {
   return {
     id: "00000000-0000-0000-0000-000000000001",
     name: "Work",
@@ -43,12 +43,10 @@ function profile(hops: HopEntry[], passphrase: string | null): SessionProfile {
       reverse_block: [],
     },
     mitm:
-      passphrase === null
+      ca === null
         ? null
         : {
-            ca_mode: { Pem: { cert: "ca.pem", key: "ca.key" } },
-            passphrase,
-            ca_passphrase_file: null,
+            ca,
             cert_ttl: 3600,
             cert_cache_max_entries: 0,
             socks_block_web: false,
@@ -152,11 +150,11 @@ describe("profileRefs", () => {
     hop("target", "target.example", [{ Key: { key: "key-1" } }, { Password: { secret: "secret-2" } }]),
   ];
 
-  test("collects every hop's secrets and the MITM passphrase", () => {
-    assert.deepEqual(profileRefs(profile(hops, "mitm-secret")), ["secret-1", "secret-2", "mitm-secret"]);
+  test("collects every hop's secrets but not the MITM CA, which the vault lists itself", () => {
+    assert.deepEqual(profileRefs(profile(hops, "ca-1")), ["secret-1", "secret-2"]);
   });
 
-  test("skips the MITM passphrase when there is none", () => {
+  test("handles a session without MITM", () => {
     assert.deepEqual(profileRefs(profile(hops, null)), ["secret-1", "secret-2"]);
     assert.deepEqual(profileRefs(profile([], null)), []);
   });

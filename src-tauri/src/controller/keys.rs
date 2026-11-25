@@ -20,7 +20,9 @@ use super::{
 
 pub(super) const KEY_RECORD: &str = "key";
 pub(super) const PASSWORD_RECORD: &str = "password";
-pub(super) const PASSPHRASE_RECORD: &str = "passphrase";
+/// MITM CA passphrases, stored by earlier betas for path-based CAs. Nothing refers to them now;
+/// they are deleted on unlock.
+pub(super) const RETIRED_PASSPHRASE_RECORD: &str = "passphrase";
 
 /// A host or session that references a key or secret.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -98,21 +100,8 @@ fn key_usage(config: &AppConfig, id: &KeyId) -> Usage {
     usage_of(config, |m| matches!(m, AuthMethod::Key { key } if key == id))
 }
 
-fn mitm_uses(session: &SessionProfile, secret: &SecretRef) -> bool {
-    session
-        .mitm
-        .as_ref()
-        .is_some_and(|m| m.passphrase.as_ref() == Some(secret))
-}
-
 fn secret_usage(config: &AppConfig, secret: &SecretRef) -> Usage {
-    let mut usage = usage_of(config, |m| matches!(m, AuthMethod::Password { secret: s } if s == secret));
-    for session in &config.sessions {
-        if mitm_uses(session, secret) && !usage.sessions.iter().any(|u| u.id == session.id) {
-            usage.sessions.push(UsageRef { id: session.id, name: session.name.clone() });
-        }
-    }
-    usage
+    usage_of(config, |m| matches!(m, AuthMethod::Password { secret: s } if s == secret))
 }
 
 /// Applies `edit` to every host's and hop's auth list, returning the sessions it changed.
@@ -133,7 +122,7 @@ fn edit_auth(config: &mut AppConfig, edit: impl Fn(&mut Vec<AuthMethod>)) -> Vec
     changed
 }
 
-fn require_name(name: &str) -> Result<String, AppError> {
+pub(super) fn require_name(name: &str) -> Result<String, AppError> {
     let name = name.trim();
     if name.is_empty() {
         return Err(AppError::Invalid("name must not be empty".into()));
@@ -374,70 +363,16 @@ impl AppController {
         Ok(SecretMeta { secret_ref, has_secret: true })
     }
 
-    /// Stores a session's MITM CA passphrase, replacing any previous one.
-    pub fn set_mitm_passphrase(
-        &self,
-        session_id: Uuid,
-        passphrase: SecretInput,
-    ) -> Result<SecretMeta, AppError> {
-        passphrase.require_non_empty("passphrase")?;
-        let session = self
-            .config_snapshot()
-            .sessions
-            .into_iter()
-            .find(|s| s.id == session_id)
-            .ok_or_else(|| AppError::NotFound { kind: "session", id: session_id.to_string() })?;
-        let mitm = session
-            .mitm
-            .as_ref()
-            .ok_or_else(|| AppError::Invalid("this session has no MITM configuration".into()))?;
-        if mitm.ca_passphrase_file.is_some() {
-            return Err(conduit_core::ValidateError::ConflictingPassphrase.into());
-        }
-        let previous = mitm.passphrase.clone();
-
-        let record = self.vault_write().put_secret(PASSPHRASE_RECORD, passphrase.as_bytes())?;
-        let secret_ref = secret_ref_from_record(&record)?;
-        let replacement = secret_ref.clone();
-        let updated = self.mutate_config(|config| {
-            let session = config
-                .sessions
-                .iter_mut()
-                .find(|s| s.id == session_id)
-                .ok_or_else(|| AppError::NotFound { kind: "session", id: session_id.to_string() })?;
-            let mitm = session
-                .mitm
-                .as_mut()
-                .ok_or_else(|| AppError::Invalid("this session has no MITM configuration".into()))?;
-            mitm.passphrase = Some(replacement);
-            Ok(session.clone())
-        });
-        let updated = match updated {
-            Ok(updated) => updated,
-            Err(error) => {
-                let _ = self.vault_write().delete_secret(&record);
-                return Err(error);
-            }
-        };
-        self.sync_profiles([updated]);
-        // A duplicated session may still use the old record.
-        let previous = previous.filter(|old| usage_is_empty(&secret_usage(&self.config_snapshot(), old)));
-        if let Some(previous) = previous {
-            match self.vault_write().delete_secret(&previous.to_string()) {
-                Ok(()) | Err(VaultError::SecretNotFound { .. }) => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Ok(SecretMeta { secret_ref, has_secret: true })
-    }
-
-    /// Deletes a password or passphrase. Same `force` contract as [`Self::delete_key`]. Key
-    /// records are refused, because they must go through `delete_key`.
+    /// Deletes a password. Same `force` contract as [`Self::delete_key`]. Key and CA records
+    /// are refused, because they must go through `delete_key` and `delete_mitm_ca`.
     pub fn delete_secret(&self, secret: &SecretRef, force: bool) -> Result<DeleteResult, AppError> {
         match self.record_type(&secret.to_string()).as_deref() {
             None => return Err(AppError::NotFound { kind: "secret", id: secret.to_string() }),
             Some(KEY_RECORD) => {
                 return Err(AppError::Invalid("use delete_key to remove a private key".into()))
+            }
+            Some(super::mitm_ca::MITM_CA_RECORD) => {
+                return Err(AppError::Invalid("use delete_mitm_ca to remove a MITM CA".into()))
             }
             Some(_) => {}
         }
@@ -450,19 +385,9 @@ impl AppController {
             return Err(VaultError::Locked.into());
         }
         let changed = self.mutate_config(|config| {
-            let mut changed = edit_auth(config, |auth| {
+            Ok(edit_auth(config, |auth| {
                 auth.retain(|m| !matches!(m, AuthMethod::Password { secret: s } if s == secret));
-            });
-            for session in &mut config.sessions {
-                if mitm_uses(session, secret) {
-                    if let Some(mitm) = session.mitm.as_mut() {
-                        mitm.passphrase = None;
-                    }
-                    changed.retain(|s: &SessionProfile| s.id != session.id);
-                    changed.push(session.clone());
-                }
-            }
-            Ok(changed)
+            }))
         })?;
         self.sync_profiles(changed);
         self.vault_write().delete_secret(&secret.to_string())?;
@@ -549,7 +474,6 @@ impl AppController {
 mod tests {
     use super::super::test_support::*;
     use super::*;
-    use conduit_core::{MitmCaMode, MitmConfig};
 
     fn openssh_pem() -> String {
         let (key, _) = conduit_vault::generate_key(KeyGenAlgorithm::Ed25519).unwrap();
@@ -777,81 +701,22 @@ mod tests {
         assert_eq!(c.vault_read().record_count(), 0);
     }
 
-    fn mitm_session(c: &AppController) -> Uuid {
-        let mut s = profile("mitm", 22);
-        s.mitm = Some(MitmConfig {
-            ca_mode: MitmCaMode::Pkcs12 { path: "/tmp/ca.p12".into() },
-            ..MitmConfig::default()
-        });
-        let id = s.id;
-        c.mutate_config(|config| {
-            config.sessions.push(s.clone());
-            Ok(())
-        })
-        .unwrap();
-        c.sync_profiles([s]);
-        id
-    }
-
-    #[tokio::test]
-    async fn keys_mitm_passphrase_set_replace_and_validate() {
-        let dir = TempDir::new();
-        let c = unlocked(&dir).await;
-        let id = mitm_session(&c);
-        let first = c.set_mitm_passphrase(id, SecretInput::new("one")).unwrap();
-        let second = c.set_mitm_passphrase(id, SecretInput::new("two")).unwrap();
-        assert_eq!(c.vault_read().record_count(), 1);
-        let session = c.config_snapshot().sessions[0].clone();
-        assert_eq!(session.mitm.unwrap().passphrase, Some(second.secret_ref));
-        assert!(c.vault_read().get_secret(&first.secret_ref.to_string()).is_err());
-
-        let plain = profile("plain", 22);
-        let plain_id = plain.id;
-        c.mutate_config(|config| {
-            config.sessions.push(plain);
-            Ok(())
-        })
-        .unwrap();
-        assert!(matches!(
-            c.set_mitm_passphrase(plain_id, SecretInput::new("x")),
-            Err(AppError::Invalid(_))
-        ));
-        assert!(matches!(
-            c.set_mitm_passphrase(Uuid::new_v4(), SecretInput::new("x")),
-            Err(AppError::NotFound { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn keys_mitm_passphrase_replace_keeps_a_record_another_session_uses() {
-        let dir = TempDir::new();
-        let c = unlocked(&dir).await;
-        let id = mitm_session(&c);
-        let shared = c.set_mitm_passphrase(id, SecretInput::new("one")).unwrap().secret_ref;
-        let copy = c.duplicate_session(id).unwrap();
-        assert_eq!(copy.mitm.as_ref().unwrap().passphrase.as_ref(), Some(&shared));
-
-        c.set_mitm_passphrase(id, SecretInput::new("two")).unwrap();
-        assert!(
-            c.vault_read().get_secret(&shared.to_string()).is_ok(),
-            "the copy still uses the old passphrase record"
-        );
-    }
-
     #[tokio::test]
     async fn keys_delete_secret_contract() {
         let dir = TempDir::new();
         let c = unlocked(&dir).await;
-        let id = mitm_session(&c);
-        let meta = c.set_mitm_passphrase(id, SecretInput::new("one")).unwrap();
+        let meta = c.set_password_secret(None, SecretInput::new("one")).unwrap();
+        let mut s = profile("pw", 22);
+        s.hops[0].host.auth = vec![AuthMethod::Password { secret: meta.secret_ref.clone() }];
+        c.upsert_session(s).unwrap();
 
         let refused = c.delete_secret(&meta.secret_ref, false).unwrap();
         assert!(!refused.deleted);
-        assert_eq!(refused.usage.sessions[0].name, "mitm");
+        assert_eq!(refused.usage.sessions[0].name, "pw");
 
         assert!(c.delete_secret(&meta.secret_ref, true).unwrap().deleted);
         assert_eq!(c.vault_read().record_count(), 0);
-        assert_eq!(c.config_snapshot().sessions[0].mitm.as_ref().unwrap().passphrase, None);
+        assert!(c.config_snapshot().sessions[0].hops[0].host.auth.is_empty());
         assert!(matches!(
             c.delete_secret(&meta.secret_ref, true),
             Err(AppError::NotFound { .. })

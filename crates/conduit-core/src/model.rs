@@ -88,6 +88,32 @@ impl Default for SecretRef {
     }
 }
 
+/// Opaque identifier of a MITM CA record inside `vault.bin`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MitmCaId(Uuid);
+
+impl MitmCaId {
+    pub fn new() -> Self {
+        MitmCaId(Uuid::new_v4())
+    }
+
+    pub fn as_uuid(&self) -> Uuid {
+        self.0
+    }
+}
+
+impl std::fmt::Display for MitmCaId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl Default for MitmCaId {
+    fn default() -> Self {
+        MitmCaId(Uuid::nil())
+    }
+}
+
 /// How a private-key record entered the vault (write-only in the UI).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KeySource {
@@ -132,6 +158,23 @@ pub struct VaultKeyMeta {
     /// Safe to display & copy into `authorized_keys`.
     pub public_key_openssh: String,
     pub source: KeySource,
+    #[serde(default)]
+    pub created_at: Timestamp,
+}
+
+/// Metadata for one MITM CA record. The certificate chain and private key live only in
+/// `vault.bin`, stored decrypted inside the vault as normalized PEM, so the files it was
+/// uploaded from are no longer needed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VaultCaMeta {
+    pub id: MitmCaId,
+    pub name: String,
+    /// The signing certificate's subject.
+    pub subject: String,
+    /// When the signing certificate expires.
+    pub not_after: Timestamp,
+    /// SHA-256 of the signing certificate's DER (`SHA256:<base64>`).
+    pub fingerprint_sha256: String,
     #[serde(default)]
     pub created_at: Timestamp,
 }
@@ -467,23 +510,15 @@ fn default_ssh_bin() -> String {
     "ssh".to_string()
 }
 
-/// Where the MITM CA certificate comes from. Mutually exclusive by construction.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MitmCaMode {
-    /// PEM certificate + key pair.
-    Pem { cert: PathBuf, key: PathBuf },
-    /// Single PKCS#12 bundle.
-    Pkcs12 { path: PathBuf },
-}
-
 /// HTTPS MITM inspection configuration. `None` disables MITM.
+///
+/// The CA lives in the vault ([`VaultCaMeta`]); a session only refers to it. Sessions saved
+/// by earlier betas named CA files by path (`ca_mode`, `passphrase`, `ca_passphrase_file`).
+/// Those fields are ignored when loading, so such a session has no CA until one is chosen.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MitmConfig {
-    pub ca_mode: MitmCaMode,
-    /// Opaque reference to the encrypted CA passphrase in `vault.bin` (resolved at runtime).
-    pub passphrase: Option<SecretRef>,
     #[serde(default)]
-    pub ca_passphrase_file: Option<PathBuf>,
+    pub ca: Option<MitmCaId>,
     #[serde(default = "default_cert_ttl", with = "serde_duration")]
     pub cert_ttl: Duration,
     #[serde(default = "default_cert_cache_max_entries")]
@@ -495,13 +530,7 @@ pub struct MitmConfig {
 impl Default for MitmConfig {
     fn default() -> Self {
         Self {
-            // A placeholder mode; `ca_mode` is always set explicitly in production since the
-            // session-level `mitm: Option<MitmConfig>` is `None` when MITM is disabled.
-            ca_mode: MitmCaMode::Pkcs12 {
-                path: PathBuf::new(),
-            },
-            passphrase: None,
-            ca_passphrase_file: None,
+            ca: None,
             cert_ttl: default_cert_ttl(),
             cert_cache_max_entries: default_cert_cache_max_entries(),
             socks_block_web: false,
@@ -675,6 +704,8 @@ pub struct AppConfig {
     pub hosts: Vec<HostProfile>,
     #[serde(default)]
     pub keys: Vec<VaultKeyMeta>,
+    #[serde(default)]
+    pub mitm_cas: Vec<VaultCaMeta>,
 }
 
 /// Composite key for an app-owned known_hosts entry: a specific hop, host, and port.
@@ -807,6 +838,23 @@ mod tests {
         };
         let json = serde_json::to_string(&record).unwrap();
         assert_eq!(serde_json::from_str::<HostKeyRecord>(&json).unwrap(), record);
+    }
+
+    #[test]
+    fn mitm_saved_with_ca_file_paths_loads_without_a_ca() {
+        let json = r#"{
+            "ca_mode": { "Pkcs12": { "path": "/home/u/ca.p12" } },
+            "passphrase": "00000000-0000-0000-0000-000000000001",
+            "ca_passphrase_file": null,
+            "cert_ttl": 3600,
+            "cert_cache_max_entries": 50,
+            "socks_block_web": true
+        }"#;
+        let mitm: MitmConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(mitm.ca, None);
+        assert_eq!((mitm.cert_ttl.as_secs(), mitm.socks_block_web), (3600, true));
+        let saved = serde_json::to_string(&mitm).unwrap();
+        assert!(!saved.contains("ca_mode") && !saved.contains("passphrase"), "{saved}");
     }
 
     #[test]

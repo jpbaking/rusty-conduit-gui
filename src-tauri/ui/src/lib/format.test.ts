@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import type { OpenSshBinaryInfo, SessionState } from "./types.ts";
 import {
+  caExpiry,
   checkStatus,
   formatBytes,
   formatUptime,
@@ -211,5 +212,18 @@ describe("checkStatus", () => {
       checkStatus(info({ supported: false, resolved_path: null, major: null, minor: null })),
       { tone: "alert", label: "Not found" },
     );
+  });
+});
+
+describe("caExpiry", () => {
+  const now = 1_700_000_000;
+  const day = 86_400;
+
+  test("flags expired, soon, and distant expiry", () => {
+    assert.deepEqual(caExpiry(now - 1, now), { tone: "alert", label: "Expired" });
+    assert.deepEqual(caExpiry(now + 3600, now), { tone: "busy", label: "Expires today" });
+    assert.deepEqual(caExpiry(now + day + 60, now), { tone: "busy", label: "Expires in 1 day" });
+    assert.deepEqual(caExpiry(now + 30 * day + 60, now), { tone: "busy", label: "Expires in 30 days" });
+    assert.equal(caExpiry(now + 90 * day, now).tone, "ok");
   });
 });

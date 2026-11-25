@@ -5,7 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
-use conduit_core::{HostKeyLookup, HostKeyRecord, KnownHostsStore, SessionProfile, Timestamp};
+use conduit_core::{
+    validate, HostKeyLookup, HostKeyRecord, KnownHostsStore, SessionProfile, Timestamp,
+};
 use conduit_ssh::AtomicStats;
 use conduit_vault::Vault;
 use thiserror::Error;
@@ -54,6 +56,9 @@ pub enum RuntimeError {
     FingerprintMismatch,
     #[error("a different host key is already pinned for {hop_id}; it will not be overwritten")]
     PinConflict { hop_id: String },
+    /// The saved profile cannot run as it stands, such as MITM on with no CA chosen.
+    #[error("session cannot start: {0}")]
+    InvalidProfile(String),
 }
 
 struct Running {
@@ -195,13 +200,23 @@ impl SessionManager {
         if let Some(previous) = lifecycle.take() {
             let _ = previous.task.await;
         }
+        // Refused before anything starts, so the reason shows and nothing retries.
+        let profile = lock(&slot.profile).clone();
+        if let Err(error) = validate(&profile) {
+            let reason = error.to_string();
+            *lock(&slot.control) = None;
+            // A halted state is only left through `Starting`, as any failed start does.
+            slot.cell.set(SessionState::Starting);
+            slot.cell.set(SessionState::NeedsAttention { reason: reason.clone() });
+            return Err(RuntimeError::InvalidProfile(reason));
+        }
 
         let (sender, receiver) = mpsc::unbounded_channel();
         *lock(&slot.control) = Some(sender);
         slot.cell.set(SessionState::Starting);
 
         let ctx = SessionContext {
-            profile: lock(&slot.profile).clone(),
+            profile,
             vault: Arc::clone(&self.inner.vault),
             known_hosts: Arc::clone(&self.inner.known_hosts),
             logs: slot.logs.clone(),
@@ -454,10 +469,12 @@ mod tests {
         Vault::create_with_password(path, b"pw", params).unwrap()
     }
 
+    /// A valid profile. The script engine never dials its hop or binds its ports.
     fn profile(name: &str) -> SessionProfile {
         SessionProfile {
             id: Uuid::new_v4(),
             name: name.into(),
+            hops: vec![hop(Vec::new())],
             ..Default::default()
         }
     }
@@ -735,6 +752,31 @@ mod tests {
             Arc::new(RwLock::new(KnownHostsStore::default())),
             ManagerConfig::default(),
         )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_invalid_profile_is_refused_before_it_starts() {
+        let f = fixture();
+        let mut p = profile("mitm-without-ca");
+        p.mitm = Some(conduit_core::MitmConfig::default());
+        let (id, script) = f.add(p.clone(), vec![Ok(())]);
+        let refused = f.manager.start(id).await;
+        assert!(
+            matches!(refused, Err(RuntimeError::InvalidProfile(ref r)) if r.contains("no CA")),
+            "{refused:?}"
+        );
+        assert!(matches!(f.state(id), SessionState::NeedsAttention { .. }));
+        f.manager.start_all().await;
+        f.manager.restart(id).await.unwrap_err();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(script.connects(), 0, "nothing may start");
+
+        // Turning MITM off makes it startable again.
+        p.mitm = None;
+        f.manager.upsert_profile(p);
+        f.manager.start(id).await.unwrap();
+        f.until_state(id, SessionState::Connected).await;
+        f.manager.stop(id).await.unwrap();
     }
 
     fn hop(auth: Vec<AuthMethod>) -> HopEntry {

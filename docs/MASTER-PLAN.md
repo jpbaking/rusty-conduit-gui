@@ -149,7 +149,7 @@ Abstract tray operations behind a `TrayBackend` trait:
 
 ### 5.1 Hybrid Envelope-Encrypted Vault (`vault.bin`)
 
-All sensitive values — hop/target passwords, SSH private keys, key passphrases, and MITM CA passphrases — live exclusively in a single encrypted file (`vault.bin`), referenced from profiles by opaque `SecretRef` / `KeyId` UUIDs.
+All sensitive values — hop/target passwords, SSH private keys, and MITM CAs (certificate chain and private key) — live exclusively in a single encrypted file (`vault.bin`), referenced from profiles by opaque `SecretRef` / `KeyId` / `MitmCaId` UUIDs. Uploaded keys and CAs are decrypted once with their passphrase and stored normalized, so neither the source files nor their passphrases are needed afterwards.
 
 - **Encryption:** Random 256-bit Data Encryption Key (DEK); each record encrypted with `XChaCha20-Poly1305` and a fresh random nonce, binding `(record_id, record_type, vault_version)` as Associated Data (AAD).
 - **Key Wrapping (Hybrid Unlock):**
@@ -182,6 +182,12 @@ Private keys are managed as first-class records inside `vault.bin` with **zero r
 - **Per-Target & Per-Jumphost Picking:**
   - Every Host Profile and every hop in a session's Jump Chain (`Jump 1 → Jump 2 → … → Target`) gets a clean **Key Vault picker** allowing the user to select one or more vaulted keys (ordered) and/or password auth.
   - At connect time, the embedded isolated `ssh-agent` / signer loads *only* the vaulted keys selected for that specific hop.
+- **MITM CAs (same write-only model):**
+  - **Upload** a PKCS#12 bundle (`.p12`/`.pfx`) or a PEM certificate (or chain) plus PEM private key, from the Key Vault's **MITM CAs** section or from a session's HTTPS MITM tab. The WebView sends file contents, never paths. The backend decrypts the files once with the passphrase, checks them with the engine's own CA loader (key matches certificate, currently valid), and stores the chain and an unencrypted PKCS#8 key as one normalized PEM record inside `vault.bin`. Neither the original files nor the passphrase are needed afterwards, and duplicates are refused by certificate fingerprint.
+  - The list shows name, subject, SHA-256 fingerprint, expiry (flagged within 30 days and once expired), created date, and **"Used by N sessions"**, with **Rename** and **Delete**.
+  - Sessions refer to a CA by `MitmCaId`; sessions saved by earlier betas with CA file paths load with no CA, and the CA passphrases those betas stored are deleted from the vault on unlock.
+  - **Delete** of a CA in use lists the sessions and which of them are running. Forcing it leaves those sessions with MITM on and no CA, and **stops** the running ones, because a running session holds the CA in memory and would otherwise keep signing with it.
+- **Sessions that cannot run are refused at start:** `SessionManager::start` validates the saved profile before anything is launched (Start, Restart, Start All, autostart, tray). A refused session shows `NeedsAttention` with the reason and is not retried. In particular, a session with MITM on but no CA will not start until a CA is chosen; turning MITM off makes it startable again.
 
 ### 5.4 Host-Key Verification (Zero `~/.ssh/known_hosts`)
 
@@ -266,7 +272,7 @@ struct SessionProfile {
     hops: Vec<HopEntry>,             // Ordered chain: [Jump 1, Jump 2, ..., Target] (HostProfileRef or Inline)
     forward: ForwardConfig,          // bind, http_port, socks_port, max_connections, allow/block rules
     reverse: ReverseConfig,          // reverse_bind, reverse_http_port, reverse_socks_port, reverse_allow/block rules
-    mitm: Option<MitmConfig>,        // PEM (cert+key) or PKCS#12, SecretRef passphrase, cert_ttl, cache_max, socks_block_web
+    mitm: Option<MitmConfig>,        // MitmCaId of a vault CA, cert_ttl, cache_max, socks_block_web
     tunnel: TunnelConfig,            // ip_version, server_alive_interval/count_max, no_reconnect, initial/max delay, startup_timeout
     logging: LoggingConfig,          // level, format (text|json), http_access_log, socks_log
     openssh_only: OpenSshOptions,    // ssh_bin, ssh_socks_bind/port, extra_args (validated against isolation denylist)
@@ -309,7 +315,7 @@ Quit                             (confirms when sessions are active)
   2. **Forward Proxy:** Bind IP (with non-loopback warning), HTTP port, SOCKS port, single-port mux toggle, `max_connections`, live port-conflict check across saved sessions and OS sockets.
   3. **Reverse Proxy (`-R`):** Remote bind IP (with exposure/GatewayPorts warning), remote HTTP/SOCKS ports, mux indicator.
   4. **Destination Filters:** Forward and reverse Allowlist/Blocklist mode toggle (enforcing mutual exclusivity), IP/CIDR/FQDN/`*.domain` rule editor, bulk paste import, and interactive "Test host against rules" checker.
-  5. **HTTPS MITM:** Off / PEM / PKCS#12 selector, file pickers, write-only passphrase stored in vault, cert TTL (`≥ 10s`), cache cap, `socks_block_web_in_mitm` toggle, parsed CA subject & expiry display.
+  5. **HTTPS MITM:** Off / On, a picker of vault CAs (uploaded from PEM or PKCS#12 files in the Key Vault or from this tab), cert TTL (`≥ 10s`), cache cap, `socks_block_web_in_mitm` toggle, CA subject & expiry display. At session start the CA is staged from the vault into an owner-only temporary file for the engine and removed as soon as it is loaded.
   6. **Keepalive & Reconnect:** `ServerAliveInterval`, `ServerAliveCountMax`, auto-reconnect toggle, initial/max backoff delays, startup timeout, session autostart toggle.
   7. **Logging & Advanced:** Log level (`QUIET`..`VERBOSE`), format (`text`/`json`), file log paths, OpenSSH-only `ssh_bin` / `ssh_socks_bind` / `extra_args` (with isolation validation and redacted preview).
 - **Bottom Collapsible Drawer:** Live virtualized diagnostic + access log viewer per session (level filter, text search, pause/autoscroll, copy, clear), backed by a bounded ring buffer in Rust streamed only while the window is open.
@@ -334,7 +340,7 @@ Quit                             (confirms when sessions are active)
 ### Phase 2 — Tauri v2 Shell, Systray & Core Manage Window
 - Wire `conduit-tray` (`ksni` on Linux, Tauri tray on Windows/macOS) + no-tray fallback + macOS `Accessory`/`Regular` policy.
 - Implement `tauri-plugin-single-instance`, `tauri-plugin-autostart` (`--tray`), and destroy-webview-on-close lifecycle.
-- Build Svelte 5 Manage Window: Session Sidebar, Connection & Multi-Hop Jump Chain Builder, Host Profiles, Key Vault (import/generate/delete keys, write-only secrets), Host-Key Approval modal, Vault Unlock modal, and Live Log Drawer.
+- Build Svelte 5 Manage Window: Session Sidebar, Connection & Multi-Hop Jump Chain Builder, Host Profiles, Key Vault (import/generate/delete keys, upload/rename/delete MITM CAs, write-only secrets), Host-Key Approval modal, Vault Unlock modal, and Live Log Drawer.
 - Implement prefix-by-prefix **Test Connection** showing exact failing hop.
 
 ### Phase 3 — Full `rusty-conduit-ssh` Option Parity & Embedded Scoped Agent Forwarding

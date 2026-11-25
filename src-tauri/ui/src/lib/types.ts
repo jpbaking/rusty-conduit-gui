@@ -4,6 +4,7 @@
 export type Uuid = string;
 export type KeyId = Uuid;
 export type SecretRef = Uuid;
+export type MitmCaId = Uuid;
 /** Unix epoch seconds. */
 export type Timestamp = number;
 
@@ -20,6 +21,7 @@ export type AppErrorCode =
   | "vault_exists"
   | "not_found"
   | "duplicate_key"
+  | "duplicate_ca"
   | "invalid"
   | "io"
   | "task";
@@ -70,6 +72,29 @@ export interface KeyView extends VaultKeyMeta {
   used_by: number;
   usage: Usage;
 }
+
+/** A MITM CA held in the vault. Its certificate and key never leave the backend. */
+export interface VaultCaMeta {
+  id: MitmCaId;
+  name: string;
+  /** The signing certificate's subject. */
+  subject: string;
+  /** When the signing certificate expires. */
+  not_after: Timestamp;
+  fingerprint_sha256: string;
+  created_at: Timestamp;
+}
+
+export interface CaView extends VaultCaMeta {
+  used_by: number;
+  usage: Usage;
+}
+
+/** A CA's file contents for upload. Never a path: the backend keeps its own copy. */
+export type MitmCaUpload =
+  | { format: "pem"; cert: string; key: string }
+  /** `data` is the PKCS#12 file, base64-encoded. */
+  | { format: "pkcs12"; data: string };
 
 export interface DeleteResult {
   deleted: boolean;
@@ -166,12 +191,9 @@ export interface ReverseConfig {
   reverse_block: string[];
 }
 
-export type MitmCaMode = { Pem: { cert: string; key: string } } | { Pkcs12: { path: string } };
-
 export interface MitmConfig {
-  ca_mode: MitmCaMode;
-  passphrase: SecretRef | null;
-  ca_passphrase_file: string | null;
+  /** A CA in the vault. `null` until one is chosen; the session cannot start without it. */
+  ca: MitmCaId | null;
   /** Seconds. */
   cert_ttl: number;
   cert_cache_max_entries: number;
@@ -348,16 +370,6 @@ export interface FilterTestResult {
   rule_errors: RuleError[];
 }
 
-/** Public facts about a MITM CA. Never carries key material or a passphrase. */
-export interface MitmCaInfo {
-  subject: string;
-  /** RFC 3339. */
-  not_after: string;
-  expired: boolean;
-  /** Whole days until expiry. Negative once expired. */
-  days_remaining: number;
-}
-
 /** The result of checking a configured `ssh` program. */
 export interface OpenSshBinaryInfo {
   requested: string;
@@ -374,13 +386,6 @@ export interface OpenSshBinaryInfo {
   note: string | null;
 }
 
-/** At most one source may be set. */
-export interface MitmPassphraseSource {
-  passphrase?: string | null;
-  passphraseRef?: SecretRef | null;
-  passphraseFile?: string | null;
-}
-
 // Config export and import. Summaries hold counts only.
 
 export interface ExportSummary {
@@ -389,6 +394,7 @@ export interface ExportSummary {
   session_count: number;
   host_count: number;
   key_count: number;
+  ca_count: number;
   /** Vault records sealed into the bundle. Always 0 for a plain export. */
   secret_count: number;
   /** References whose vault record no longer exists. */
@@ -404,6 +410,7 @@ export interface ImportSummary {
   hosts_updated: number;
   hosts_skipped: number;
   keys_added: number;
+  cas_added: number;
   secrets_added: number;
   known_hosts_added: number;
   known_hosts_updated: number;

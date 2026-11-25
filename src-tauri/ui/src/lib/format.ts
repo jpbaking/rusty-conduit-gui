@@ -128,3 +128,22 @@ export function checkStatus(info: OpenSshBinaryInfo): CheckStatus {
   if (info.resolved_path !== null) return { tone: "alert", label: "Not usable" };
   return { tone: "alert", label: "Not found" };
 }
+
+/** CAs that expire within this many days are flagged. */
+export const CA_EXPIRY_WARNING_DAYS = 30;
+
+export interface CaExpiry {
+  tone: StatusTone;
+  label: string;
+}
+
+/** How soon a CA expires, as of `nowSeconds`. Sessions using an expired CA will not start. */
+export function caExpiry(notAfter: number, nowSeconds = Date.now() / 1000): CaExpiry {
+  const days = Math.floor((notAfter - nowSeconds) / 86_400);
+  if (notAfter <= nowSeconds) return { tone: "alert", label: "Expired" };
+  if (days < 1) return { tone: "busy", label: "Expires today" };
+  if (days <= CA_EXPIRY_WARNING_DAYS) {
+    return { tone: "busy", label: `Expires in ${days} ${days === 1 ? "day" : "days"}` };
+  }
+  return { tone: "ok", label: `Expires ${formatDate(notAfter)}` };
+}

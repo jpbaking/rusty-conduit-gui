@@ -56,7 +56,5 @@ export function authRefs(auth: readonly AuthMethod[]): string[] {
   );
 }
 
-export const profileRefs = (profile: SessionProfile): string[] => [
-  ...profile.hops.flatMap((hop) => authRefs(hop.host.auth)),
-  ...(profile.mitm?.passphrase ? [profile.mitm.passphrase] : []),
-];
+export const profileRefs = (profile: SessionProfile): string[] =>
+  profile.hops.flatMap((hop) => authRefs(hop.host.auth));
