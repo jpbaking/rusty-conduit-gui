@@ -290,17 +290,17 @@
           <small class="muted">{pin.record.algorithm} · first seen {new Date(pin.record.first_seen * 1000).toLocaleString()}</small>
         </div>
         {#if !confirmReset}
-          <button onclick={() => (confirmReset = true)}>Reset Pin</button>
+          <button onclick={() => (confirmReset = true)} use:tooltip={"Forget this host's key, like ssh-keygen -R"}>Clear</button>
         {/if}
         {#if !importing}
           <button onclick={() => (importing = true)}>Import…</button>
         {/if}
       </div>
       {#if confirmReset}
-        <p class="warning">The next connection will ask you to approve this host's key again.</p>
+        <p class="warning">Clear this host's key? The next connection will ask you to approve it again.</p>
         <div class="button-row">
           <button onclick={() => (confirmReset = false)}>Cancel</button>
-          <button class="danger" disabled={resetting} onclick={resetPin}>Confirm Reset</button>
+          <button class="danger" disabled={resetting} onclick={resetPin}>Clear Key</button>
         </div>
       {/if}
     {:else}
