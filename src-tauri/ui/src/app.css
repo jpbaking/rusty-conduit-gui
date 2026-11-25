@@ -50,6 +50,16 @@ button, select, input:not([type="checkbox"]) {
   border: 1px solid var(--border);
   border-radius: 5px;
 }
+/* WebKit draws a native <select> at its own height, so it is styled like a text box instead. */
+select:not([multiple]):not([size]), input:not([type="checkbox"]):not([type="radio"]):not([type="file"]) { height: 28px; }
+select:not([multiple]):not([size]) {
+  appearance: none; -webkit-appearance: none; padding-right: 26px; line-height: 20px; cursor: pointer;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%2398a1af' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 9px center; background-size: 10px 6px;
+}
+select:disabled { cursor: default; opacity: 0.6; }
+@media (prefers-color-scheme: light) {
+  select:not([multiple]):not([size]) { background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%235c6673' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E"); }
+}
 button { cursor: pointer; white-space: nowrap; }
 button:hover:not(:disabled) { border-color: var(--muted); }
 button:disabled { opacity: 0.5; cursor: default; }
