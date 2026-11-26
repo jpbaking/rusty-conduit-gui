@@ -8,7 +8,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use conduit_core::{
-    ForwardPreset, HostProfile, KeyId, KeySource, MitmCaId, Proxy, ProxyId, RouteInbound, SecretRef,
+    CliTomlFormat, ForwardPreset, HostProfile, KeyId, KeySource, MitmCaId, Proxy, ProxyId,
+    RouteInbound, SecretRef,
     SessionProfile, Tunnel, TunnelId, UpstreamProfile, VaultCaMeta, VaultKeyMeta,
 };
 use conduit_openssh::OpenSshBinaryInfo;
@@ -18,6 +19,10 @@ use tauri::{AppHandle, Manager, Runtime, State};
 use uuid::Uuid;
 
 use crate::controller::export::{ExportSummary, ImportSummary};
+use crate::controller::import_export::{
+    AirSwitchCommitResult, AirSwitchPreview, TomlExportResult, TomlImportCommitResult,
+    TomlImportPreview,
+};
 use crate::controller::keys::{DeleteResult, GenerateAlgorithm, KeyView};
 use crate::controller::mitm_ca::{CaView, MitmCaUpload};
 use crate::controller::parity::{self, FilterMode, FilterTestResult, PortConflictReport};
@@ -578,6 +583,77 @@ pub async fn import_config(
     blocking(&c, move |c| c.import_config(&path, passphrase, replace_existing.unwrap_or(false))).await
 }
 
+// U4 import / export and External TOML link mode. No response carries a plaintext password.
+
+/// What an AirSwitch / ZeroOmega / SwitchyOmega `.bak` would import.
+#[tauri::command]
+pub async fn preview_airswitch_import(c: Ctl<'_>, path: PathBuf) -> CmdResult<AirSwitchPreview> {
+    blocking(&c, move |c| c.preview_airswitch_import(&path)).await
+}
+
+/// Imports a `.bak` as a new Proxy (or into `target_proxy_id`); inline passwords go to the
+/// Vault, so a locked vault is refused with `vault_locked`.
+#[tauri::command]
+pub async fn commit_airswitch_import(
+    c: Ctl<'_>,
+    path: PathBuf,
+    proxy_name: Option<String>,
+    target_proxy_id: Option<ProxyId>,
+) -> CmdResult<AirSwitchCommitResult> {
+    c.commit_airswitch_import(path, proxy_name, target_proxy_id).await
+}
+
+/// What a CLI `config.toml` would import; `format` is detected when omitted.
+#[tauri::command]
+pub async fn preview_toml_import(
+    c: Ctl<'_>,
+    path: PathBuf,
+    format: Option<CliTomlFormat>,
+) -> CmdResult<TomlImportPreview> {
+    blocking(&c, move |c| c.preview_toml_import(&path, format)).await
+}
+
+#[tauri::command]
+pub async fn commit_toml_import(
+    c: Ctl<'_>,
+    path: PathBuf,
+    format: Option<CliTomlFormat>,
+    name: Option<String>,
+) -> CmdResult<TomlImportCommitResult> {
+    c.commit_toml_import(path, format, name).await
+}
+
+/// Exports a Proxy as a CLI `config.toml`, written owner-only when `path` is given.
+#[tauri::command]
+pub async fn export_proxy_toml(
+    c: Ctl<'_>,
+    proxy_id: ProxyId,
+    format: CliTomlFormat,
+    path: Option<PathBuf>,
+) -> CmdResult<TomlExportResult> {
+    blocking(&c, move |c| c.export_proxy_toml(proxy_id, format, path)).await
+}
+
+#[tauri::command]
+pub async fn link_proxy_external_toml(
+    c: Ctl<'_>,
+    proxy_id: ProxyId,
+    path: PathBuf,
+    debounce_ms: u64,
+) -> CmdResult<ProxySaveResult> {
+    c.link_proxy_external_toml(proxy_id, path, debounce_ms).await
+}
+
+#[tauri::command]
+pub async fn unlink_proxy_external_toml(c: Ctl<'_>, proxy_id: ProxyId) -> CmdResult<ProxySaveResult> {
+    c.unlink_proxy_external_toml(proxy_id).await
+}
+
+#[tauri::command]
+pub async fn reload_proxy_external_toml(c: Ctl<'_>, proxy_id: ProxyId) -> CmdResult<ProxySaveResult> {
+    c.reload_proxy_external_toml(proxy_id).await
+}
+
 // Desktop shell.
 
 /// Login autostart, behind a trait so tests never write a real autostart entry.
@@ -748,6 +824,14 @@ macro_rules! ipc_handler {
             $crate::commands::check_openssh_binary,
             $crate::commands::export_config,
             $crate::commands::import_config,
+            $crate::commands::preview_airswitch_import,
+            $crate::commands::commit_airswitch_import,
+            $crate::commands::preview_toml_import,
+            $crate::commands::commit_toml_import,
+            $crate::commands::export_proxy_toml,
+            $crate::commands::link_proxy_external_toml,
+            $crate::commands::unlink_proxy_external_toml,
+            $crate::commands::reload_proxy_external_toml,
             $crate::commands::get_autostart,
             $crate::commands::set_autostart,
             $crate::commands::shell_ready,
@@ -810,6 +894,13 @@ mod tests {
         "start_tunnel", "stop_tunnel", "restart_tunnel", "get_tunnel_logs", "clear_tunnel_logs",
         "approve_tunnel_host_key", "reject_tunnel_host_key", "test_tunnel_chain", "start_all_v2",
         "stop_all_v2",
+    ];
+
+    /// Every U4 import / export command, exercised by its own test.
+    const U4_COMMANDS: &[&str] = &[
+        "preview_airswitch_import", "commit_airswitch_import", "preview_toml_import",
+        "commit_toml_import", "export_proxy_toml", "link_proxy_external_toml",
+        "unlink_proxy_external_toml", "reload_proxy_external_toml",
     ];
 
     /// Keeps autostart in memory, so tests never touch the real login items.
@@ -1352,6 +1443,93 @@ mod tests {
         }
         let config = std::fs::read(dir.path().join("config.json")).unwrap();
         assert_clean("config.json", &String::from_utf8_lossy(&config), &forbidden);
+    }
+
+    #[test]
+    fn every_u4_ipc_command_works_and_no_response_leaks_an_imported_password() {
+        const AIR: &str = "canary-airswitch-password-71d0";
+        const SWITCH: &str = "canary-switch-password-c4a9";
+        let dir = TempDir::new();
+        let files = TempDir::new();
+        let mut ipc = Ipc::new(&dir);
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+
+        let bak = files.path().join("switchy.bak");
+        std::fs::write(
+            &bak,
+            json!({
+                "+Work": {
+                    "profileType": "FixedProfile",
+                    "fallbackProxy": { "scheme": "http", "host": "proxy.corp.example", "port": 3128 },
+                    "auth": { "fallbackProxy": { "username": "alice", "password": AIR } }
+                },
+                "+auto": {
+                    "profileType": "SwitchProfile",
+                    "defaultProfileName": "direct",
+                    "rules": [{ "condition": { "conditionType": "HostWildcardCondition",
+                                               "pattern": "*.corp.example" }, "profileName": "Work" }]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let toml = files.path().join("config.toml");
+        std::fs::write(
+            &toml,
+            format!(
+                "bind = \"127.0.0.1\"\nhttp_port = {port}\nsocks_port = 0\n\n[profiles.corp]\n\
+                 type = \"http\"\nhost = \"10.0.0.2\"\nport = 3128\npassword = \"{SWITCH}\"\n\n\
+                 [routing]\ndefault = \"direct\"\n"
+            ),
+        )
+        .unwrap();
+
+        // AirSwitch: preview needs no vault; commit needs it unlocked.
+        let preview = ipc.ok("preview_airswitch_import", json!({ "path": bak }));
+        assert_eq!(preview["extracted_password_count"], 1);
+        assert_eq!(ipc.err("commit_airswitch_import", json!({ "path": bak }))["code"], "vault_locked");
+        ipc.ok("create_vault", json!({ "password": MASTER, "useKeyring": false }));
+        let air = ipc.ok("commit_airswitch_import", json!({ "path": bak, "proxyName": "air" }));
+        assert_eq!(air["stored_passwords"], 1);
+        assert_eq!(air["proxy"]["name"], "air");
+
+        // CLI config.toml.
+        let preview = ipc.ok("preview_toml_import", json!({ "path": toml }));
+        assert_eq!(preview["format"], "rusty-conduit-switch");
+        let imported = ipc.ok(
+            "commit_toml_import",
+            json!({ "path": toml, "format": "rusty-conduit-switch", "name": "switchy" }),
+        );
+        assert_eq!(imported["stored_passwords"], 1);
+        let proxy_id = imported["proxy"]["id"].clone();
+        let out = files.path().join("export.toml");
+        let export = ipc.ok(
+            "export_proxy_toml",
+            json!({ "proxyId": proxy_id, "format": "rusty-conduit-switch", "path": out }),
+        );
+        assert!(export["toml"].as_str().unwrap().contains("password_env"));
+        ipc.err("export_proxy_toml", json!({ "proxyId": proxy_id, "format": "warp" }));
+
+        // External TOML link mode.
+        let linked = ipc.ok(
+            "link_proxy_external_toml",
+            json!({ "proxyId": proxy_id, "path": toml, "debounceMs": 500 }),
+        );
+        assert_eq!(linked["profile"]["source"]["external_toml"]["debounce_ms"], 500);
+        ipc.ok("reload_proxy_external_toml", json!({ "proxyId": proxy_id }));
+        let unlinked = ipc.ok("unlink_proxy_external_toml", json!({ "proxyId": proxy_id }));
+        assert_eq!(unlinked["profile"]["source"], "managed");
+        assert_eq!(ipc.err("reload_proxy_external_toml", json!({ "proxyId": proxy_id }))["code"], "invalid");
+
+        let expected: BTreeSet<String> = U4_COMMANDS.iter().map(|c| c.to_string()).collect();
+        assert!(ipc.called.is_superset(&expected), "missing: {:?}", expected.difference(&ipc.called).collect::<Vec<_>>());
+        let forbidden: Vec<String> = [MASTER, AIR, SWITCH].map(String::from).to_vec();
+        for (index, response) in ipc.transcript.iter().enumerate() {
+            assert_clean(&format!("IPC response #{index}"), response, &forbidden);
+        }
+        let config = std::fs::read(dir.path().join("config.json")).unwrap();
+        assert_clean("config.json", &String::from_utf8_lossy(&config), &forbidden);
+        assert_clean("export.toml", &std::fs::read_to_string(&out).unwrap(), &forbidden);
     }
 
     #[test]

@@ -435,6 +435,9 @@ export interface ExportSummary {
   host_count: number;
   key_count: number;
   ca_count: number;
+  proxy_count: number;
+  tunnel_count: number;
+  library_profile_count: number;
   /** Vault records sealed into the bundle. Always 0 for a plain export. */
   secret_count: number;
   /** References whose vault record no longer exists. */
@@ -456,6 +459,15 @@ export interface ImportSummary {
   presets_added: number;
   presets_updated: number;
   presets_skipped: number;
+  proxies_added: number;
+  proxies_updated: number;
+  proxies_skipped: number;
+  tunnels_added: number;
+  tunnels_updated: number;
+  tunnels_skipped: number;
+  library_profiles_added: number;
+  library_profiles_updated: number;
+  library_profiles_skipped: number;
   keys_added: number;
   /** Keys from a key-only backup that the vault already holds. */
   keys_skipped: number;
@@ -465,6 +477,78 @@ export interface ImportSummary {
   known_hosts_updated: number;
   /** Credential references dropped because they could not be trusted or resolved. */
   credentials_removed: number;
+}
+
+// U4 import / export: AirSwitch `.bak`, CLI `config.toml`, and External TOML link mode.
+// None of these ever carries a plaintext secret.
+
+/** Which CLI a `config.toml` belongs to. */
+export type CliTomlFormat = "rusty-conduit" | "rusty-conduit-ssh" | "rusty-conduit-switch";
+
+/** One imported upstream profile, as an import preview lists it. */
+export interface ImportedProfileSummary {
+  name: string;
+  kind: "http" | "https" | "socks5" | "socks4a" | "composite" | "tunnel";
+  host: string | null;
+  port: number | null;
+  username: string | null;
+  /** An inline password was found and will be stored in the Vault on commit. */
+  password_extracted: boolean;
+  /** Set when the profile already names a password source. */
+  password_source: "vault" | "env" | "file" | null;
+}
+
+/** What an AirSwitch / ZeroOmega / SwitchyOmega `.bak` would import. */
+export interface AirSwitchPreview {
+  suggested_name: string;
+  profile_count: number;
+  rule_count: number;
+  extracted_password_count: number;
+  warnings: string[];
+  profiles: ImportedProfileSummary[];
+}
+
+export interface AirSwitchCommitResult {
+  proxy: Proxy;
+  warnings: string[];
+  /** Passwords stored in the Vault. */
+  stored_passwords: number;
+}
+
+/** What a CLI `config.toml` would import. */
+export interface TomlImportPreview {
+  format: CliTomlFormat;
+  /** `format` was detected from the file, not given. */
+  detected: boolean;
+  proxy_name: string | null;
+  /** The Tunnel a `rusty-conduit-ssh` file creates. */
+  tunnel_name: string | null;
+  profile_count: number;
+  rule_count: number;
+  extracted_password_count: number;
+  warnings: string[];
+  /** What must be completed by hand after import. */
+  notes: string[];
+  profiles: ImportedProfileSummary[];
+}
+
+export interface TomlImportCommitResult {
+  format: CliTomlFormat;
+  proxy: Proxy | null;
+  tunnel: Tunnel | null;
+  warnings: string[];
+  notes: string[];
+  /** Passwords stored in the Vault. */
+  stored_passwords: number;
+}
+
+/** An exported `config.toml`. `toml` never contains a plaintext secret. */
+export interface TomlExportResult {
+  format: CliTomlFormat;
+  toml: string;
+  notes: string[];
+  /** Where it was written (owner-only), when a path was given. */
+  path: string | null;
 }
 
 // Desktop shell.

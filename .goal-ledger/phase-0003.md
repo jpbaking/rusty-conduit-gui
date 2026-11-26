@@ -1,52 +1,55 @@
-# phase-0003 — Update Svelte UI core layer (types, api, mock, stores, validation, and tests) for v2 Proxies and Tunnels
+# phase-0003 — Bump app backup format to v2 (Tunnels, Proxies, Profile Library, upstream passwords, v1 migration) and update secret_leak_scan
 
 - Status: done
 - Owner: executor
 - Depends on: phase-0002
-- Goal: Update `src-tauri/ui/src/lib/` (`types.ts`, `api.ts`, `mock.ts`, `stores.svelte.ts`, `validate.ts`, and unit tests) to model and manage v2 `Proxy`, `Tunnel`, `UpstreamProfile`, routing rules, Profile Library, Route Tester, Test Upstream, and tray overrides.
-- Done when: `cd src-tauri/ui && npm run check && npm test && npm run build` exits 0 with new frontend unit tests covering Proxy/Tunnel/rule validation.
-- Pattern to follow: `src-tauri/ui/src/lib/types.ts`, `src-tauri/ui/src/lib/api.ts`, `src-tauri/ui/src/lib/stores.svelte.ts`, `src-tauri/ui/src/lib/validate.ts`
+- Goal: Bump `src-tauri/src/controller/export.rs` backup format to `VERSION = 2` so plain and encrypted app backups include v2 `tunnels`, `proxies`, `profile_library`, and vaulted `UPSTREAM_PASSWORD_RECORD` secrets (while still importing v1 backups through §6.4 `migrate_v1_sessions`), and extend `src-tauri/tests/secret_leak_scan.rs` to verify v2 backups and CLI TOML exports never leak secrets.
+- Done when: `cargo test -p rusty-conduit-gui --lib export` and `cargo test -p rusty-conduit-gui --test secret_leak_scan` and `cargo clippy -p rusty-conduit-gui --all-targets -- -D warnings` pass with zero warnings.
+- Pattern to follow: `src-tauri/src/controller/export.rs:1-350`, `src-tauri/tests/secret_leak_scan.rs:576-820`, `docs/MASTER-PLAN.md:185-195`
 
 ## Context
-- Keep existing Svelte components compiling during this phase (phases 4 & 5 replace/re-home the UI components). Do not break `npm run check` or `npm run build`.
-- `types.ts`: add TypeScript interfaces matching the Rust serde wire shapes from `conduit-core/src/v2_model.rs`, `conduit-runtime/src/proxy_manager.rs`, `conduit-runtime/src/tunnel_manager.rs`, and `src-tauri/src/controller/{proxies,tunnels}.rs`:
-  - `Proxy`, `ProxyId`, `SourceMode`, `ListenerConfig`, `NetworkConfig`, `GlobalFilterConfig`, `UpstreamProfile`, `UpstreamKind`, `UpstreamPasswordSource`, `RouteInbound`, `RouteTarget`, `RoutePortSpec`, `RouteHostLevels`, `RoutingRule`, `RoutingTable`, `RoutingTablesConfig`, `ProxyState`, `ProxySnapshot`, `ProxyTrafficSnapshot`, `ProxyView`, `RouteTestResult`, `RouteTestTarget`, `UpstreamProbeResult`.
-  - `Tunnel`, `TunnelId`, `TunnelStartMode`, `TunnelSnapshot`, `TunnelView`.
-- `api.ts` & `mock.ts`: add typed invoke wrappers and browser-preview mock implementations for all new v2 commands (`list_proxies`, `upsert_proxy`, `delete_proxy`, `duplicate_proxy`, `start_proxy`, `stop_proxy`, `restart_proxy`, `set_proxy_override`, `get_proxy_logs`, `clear_proxy_logs`, `get_proxy_access_records`, `test_route`, `test_upstream`, `list_tunnels`, `upsert_tunnel`, `delete_tunnel`, `duplicate_tunnel`, `start_tunnel`, `stop_tunnel`, `restart_tunnel`, `get_tunnel_logs`, `clear_tunnel_logs`, `approve_tunnel_host_key`, `reject_tunnel_host_key`, `test_tunnel_chain`, `list_profile_library`, `upsert_library_profile`, `delete_library_profile`, `set_upstream_password`, `check_proxy_port_conflicts`).
-- `stores.svelte.ts`: add reactive state & actions for `proxies`, `tunnels`, `profileLibrary`, active selection (`proxy` | `tunnel` | `hosts` | `profileLibrary` | `vault` | `settings`), draft editing for both Proxy and Tunnel, `proxy-state-changed` / `proxy-reloaded` / `proxy-override-changed` / `tunnel-state-changed` event subscriptions, and `newProxyFromPreset("direct" | "tunnel" | "switch")` + `newTunnel()` factories. Note: tray "View Logs" emits `UiEvent::ViewLogs { session_id: <uuid> }` for Proxies, Tunnels, and legacy sessions (UUIDs never collide), so handle `view_logs` by checking `proxies`, `tunnels`, and `sessions` to open the log drawer for the matching item.
-- `validate.ts` & `validate.test.ts`: add `proxyErrors(proxy, knownTunnels)` and `tunnelErrors(tunnel)` matching `conduit-core`'s `validate_proxy` and `validate_tunnel` rules, plus unit tests.
+- Disk constraint: ALWAYS pass `CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_NET_GIT_FETCH_WITH_CLI=true` on every `cargo` command.
+- **`src-tauri/src/controller/export.rs`**:
+  - Bump `const VERSION: u32 = 2;` (keep accepting `version == 1` on import for backwards compatibility!).
+  - Use versioned AADs: `config-bundle-v2` / `config-only-v2` when writing v2, while still accepting `config-bundle-v1` / `config-only-v1` when decrypting v1 encrypted backups.
+  - On **export**:
+    - Collect referenced secret IDs across `sessions`, `hosts`, **`tunnels`**, **`proxies`** (`UpstreamPasswordSource::Vault(ref)` and `mitm.ca`), and **`profile_library`** (`UpstreamPasswordSource::Vault(ref)`).
+    - Seal `UPSTREAM_PASSWORD_RECORD` records alongside `KEY_RECORD`, `PASSWORD_RECORD`, and `MITM_CA_RECORD` in encrypted-with-secrets bundles.
+    - Add v2 counts to `ExportSummary`: `proxy_count`, `tunnel_count`, `library_profile_count` (keep existing `session_count`, `host_count`, `key_count`, `ca_count`, `secret_count`, `missing_secrets`).
+  - On **import**:
+    - If an imported backup has `version == 1` (or `config.schema_version < 2` with non-empty `sessions` and empty `tunnels`/`proxies`), run `conduit_core::migrate_v1_sessions(&mut config)` so older v1 backups import cleanly into v2 `tunnels` + `proxies`! (Check existing v1 export tests in `export.rs` — keep all existing security/tampering/plain-credential-stripping guarantees intact; update v1 round-trip assertions only where v1 sessions now migrate or if a v2 backup is tested.)
+    - Validate imported `tunnels` (`validate_tunnel`) and `proxies` (`validate_proxy`), assign missing UUIDs, neutralize untrusted `openssh.ssh_bin` / log file paths on unauthenticated plain imports, and strip unverified `KeyId` / `SecretRef` / `MitmCaId` references on unauthenticated plain imports (same security contract as v1 sessions!).
+    - For encrypted-with-secrets imports, restore `UPSTREAM_PASSWORD_RECORD` records under fresh `SecretRef` IDs and remap all Proxy & Profile Library references; restore `tunnels`, `proxies`, and `profile_library` into `AppConfig` and sync `TunnelManager` + `ProxyManager`.
+    - Add v2 counts to `ImportSummary`: `proxies_added`, `proxies_updated`, `proxies_skipped`, `tunnels_added`, `tunnels_updated`, `tunnels_skipped`, `library_profiles_added`, `library_profiles_updated`, `library_profiles_skipped`.
+- **`src-tauri/tests/secret_leak_scan.rs`**:
+  - Update `v2_proxies_tunnels_and_upstream_passwords_hold_no_secrets` to assert `summary.secret_count >= 4` (now that the vaulted upstream password IS sealed in encrypted v2 backups!) AND also run `export_proxy_toml` for `RustyConduitSwitch` (and `RustyConduitSsh` if applicable) and scan the resulting TOML bytes for zero plaintext secret leaks!
 
 ## Scope
-- In: `src-tauri/ui/src/lib/types.ts`, `src-tauri/ui/src/lib/api.ts`, `src-tauri/ui/src/lib/mock.ts`, `src-tauri/ui/src/lib/stores.svelte.ts`, `src-tauri/ui/src/lib/validate.ts`, `src-tauri/ui/src/lib/validate.test.ts`
-- Out: `crates/`, `src-tauri/src/`, `src-tauri/ui/src/lib/components/`
+- In: `src-tauri/src/controller/export.rs`, `src-tauri/tests/secret_leak_scan.rs`
+- Out: `crates/`, `src-tauri/src/controller/{proxies,tunnels,import_export,keys,mitm_ca,sessions}.rs`, `src-tauri/ui/`
 
 ## Sub-tasks
-1. [done] Add all v2 TypeScript wire types (`Proxy`, `Tunnel`, `UpstreamProfile`, `RoutingRule`, snapshots, Route Tester, Test Upstream) to `src-tauri/ui/src/lib/types.ts` — done when: `npm run check` passes.
-2. [done] Add v2 command wrappers in `src-tauri/ui/src/lib/api.ts` and browser-preview mock handlers in `src-tauri/ui/src/lib/mock.ts` — done when: `npm run check` passes.
-3. [done] Extend `src-tauri/ui/src/lib/stores.svelte.ts` with reactive `proxies`, `tunnels`, `profileLibrary`, v2 draft/save/hot-reload/override/start/stop actions, and v2 event listeners — done when: `npm run check` passes.
-4. [done] Add `proxyErrors` and `tunnelErrors` to `src-tauri/ui/src/lib/validate.ts` and unit tests to `src-tauri/ui/src/lib/validate.test.ts`, then run `## Verify` — done when: `## Verify` exits 0.
+1. [done] Upgrade `src-tauri/src/controller/export.rs` to backup format `VERSION = 2` (v2 AADs, v1 backwards-compat + §6.4 migration on v1 import, Tunnels/Proxies/Profile Library + `UPSTREAM_PASSWORD_RECORD` sealing/restoring, plain-import credential/path neutralization, v2 summary counts, and unit tests) — done when: `cargo test -p rusty-conduit-gui --lib export` passes.
+2. [done] Update `src-tauri/tests/secret_leak_scan.rs` to assert `secret_count >= 4` on v2 encrypted backup and scan `export_proxy_toml` output for zero plaintext leaks — done when: `cargo test -p rusty-conduit-gui --test secret_leak_scan` passes.
+3. [done] Run `## Verify` and record observed results in `## Evidence` — done when: `## Verify` exits 0.
 
 ## Verify
 ```sh
-cd src-tauri/ui && npm run check && npm test && npm run build
+CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test -p rusty-conduit-gui --lib && CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test -p rusty-conduit-gui --test secret_leak_scan && CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_NET_GIT_FETCH_WITH_CLI=true cargo clippy -p rusty-conduit-gui --all-targets -- -D warnings
 ```
 
 ## Escalate when
-- A Rust serde tag or field name in `commands.rs` / `v2_model.rs` is ambiguous → stop, set Status: needs-human — reason: document the exact field name mismatch
+- An existing `export.rs` security test conflicts with running `migrate_v1_sessions` on v1 imports and needs a planner decision on v1 vs v2 test semantics → stop, set Status: needs-human — reason: list the exact conflicting test(s) and why
 
 ## Log
 - (append-only, one line per event)
-- sub-task 1: added v2 wire types (Tunnel, Proxy, UpstreamProfile, UpstreamKind, routing, ProxyState/Snapshot/View/SaveResult, AccessRecordView, RouteTest*, UpstreamProbeResult, TunnelSnapshot/View/ChainTestResult, ProxyEvent/TunnelEvent) to types.ts; added Usage.tunnels/proxies/library_profiles as optional (components outside scope build Usage literals); updated mock Usage literals
-- sub-task 2: added typed wrappers for all 30 listed v2 commands (+ start_all_v2/stop_all_v2) and subscribeV2Events (proxy-state-changed, proxy-reloaded, proxy-override-changed, tunnel-state-changed) to api.ts; added in-memory browser-preview handlers for every v2 command to mock.ts via dispatchV2
-- sub-task 3: extended stores.svelte.ts with proxies/tunnels/profileLibrary state, NavView v2 members (proxy/tunnel/hosts/profileLibrary/vault/settings, legacy sessions/keys kept), Proxy+Tunnel drafts with save (ProxySaveNote for gen #N/hot-reload/reload_error)/discard/duplicate/delete/enable, start/stop/restart/override/Route Tester/Test Upstream/Test Chain/library actions, newProxyFromPreset(direct|tunnel|switch) + newTunnel, v2 event subscription (proxy-state-changed/proxy-reloaded/proxy-override-changed/tunnel-state-changed) with snapshot replay, v2 snapshot polling, and view-logs resolving proxies → tunnels → sessions via openLogsFor/logTarget
-- sub-task 4: added tunnelErrors(tunnel) and proxyErrors(proxy, knownTunnels) (+ portSpecError, BUILTIN_PROFILES) to validate.ts mirroring validate_tunnel / validate_proxy and the engine's profile, target, composite, self-loop, port-spec, cidr/ip, and host_levels checks; renamed the private v1 keepalive helper to keepaliveErrors(prefix) and generalized portForwardErrors/opensshErrors (v1 keys unchanged); wired proxyDraftErrors/tunnelDraftErrors into the store; added 16 v2 tests to validate.test.ts
-- note: `npm run build` rewrites the tracked `src-tauri/ui/dist/` (outside Scope: In); restored it to HEAD with `git checkout -- src-tauri/ui/dist` and removed the 2 new hashed assets instead of committing it
-- phase-0003 done: Verify exit 0
+- sub-task 1: bumped `export.rs` to `VERSION = 2` with `config-bundle-v2`/`config-only-v2` AADs (v1 AADs still accepted, picked by header version); export collects Tunnel hop, Proxy MITM CA, and Proxy/Profile Library vaulted upstream refs (sealing `UPSTREAM_PASSWORD_RECORD`) and reports `proxy_count`/`tunnel_count`/`library_profile_count`; import runs `migrate_v1_sessions` for v1 files (or schema < 2), validates Tunnels (`validate_tunnel`), Proxies (`validate_proxy`), and library names, assigns ids, strips untrusted hop creds / Proxy MITM CA (MITM switched off) / upstream passwords (vault, env, file) on unauthenticated imports, neutralizes Tunnel `ssh_bin`, Tunnel/Proxy log paths, and Proxy External TOML source, restores and remaps upstream passwords in bundles, merges Tunnels/Proxies/library with new `ImportSummary` counts, and syncs TunnelManager + ProxyManager; added 6 unit tests
+- sub-task 1: one test assertion was wrong (a replace re-import on a *different* install makes new password records, as v1 always did); moved the no-new-records check to the source install, matching the existing v1 test
+- sub-task 2: `secret_leak_scan` v2 test now asserts `secret_count >= 4` and proxy/tunnel counts, and scans `export_proxy_toml` output, notes, and written file for RustyConduitSwitch (must succeed, uses `password_env`) and RustyConduitSsh (refused for this routed Proxy: the error text is scanned and no file is written)
+- sub-task 3: `## Verify` exit 0
 
 ## Evidence
 - (append-only: command → observed result)
-- sub-task 1: `cd src-tauri/ui && npm run check` → COMPLETED 188 FILES 0 ERRORS 0 WARNINGS
-- sub-task 2: `cd src-tauri/ui && npm run check` → COMPLETED 188 FILES 0 ERRORS 0 WARNINGS
-- sub-task 3: `cd src-tauri/ui && npm run check` → COMPLETED 188 FILES 0 ERRORS 0 WARNINGS
-- sub-task 4 / ## Verify: `cd src-tauri/ui && npm run check && npm test && npm run build` → exit 0; svelte-check COMPLETED 188 FILES 0 ERRORS 0 WARNINGS; node --test tests 93 pass 93 fail 0; vite ✓ built in 2.14s
-- scope: `git status --short` after restoring dist → only the 6 Scope-In files + .goal-ledger modified
+- `cargo test -p rusty-conduit-gui --lib export` (with low-disk env) → `test result: ok. 32 passed; 0 failed` (26 existing + 6 new v2/v1 tests)
+- `cargo test -p rusty-conduit-gui --test secret_leak_scan` → `test result: ok. 6 passed; 0 failed`
+- `## Verify` block → EXIT=0: `--lib` `174 passed; 0 failed`; `secret_leak_scan` `6 passed; 0 failed`; `clippy -p rusty-conduit-gui --all-targets -- -D warnings` `Finished` with no warnings

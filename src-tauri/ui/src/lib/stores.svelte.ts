@@ -21,6 +21,7 @@ import type {
   Proxy,
   ProxyEvent,
   ProxyId,
+  ProxySaveResult,
   ProxySnapshot,
   ProxyView,
   RouteInbound,
@@ -1042,6 +1043,45 @@ class AppStore {
     } finally {
       this.#finishSnapshot();
     }
+  }
+
+  /**
+   * After a `.bak` or `config.toml` import: reloads the v2 lists and opens what was imported,
+   * the Proxy first, else the Tunnel.
+   */
+  async openImported(proxy: Proxy | null, tunnel: Tunnel | null = null): Promise<void> {
+    await this.refreshV2();
+    if (proxy) {
+      // An import into an existing Proxy replaces it, so any unsaved edits to it are stale.
+      if (proxy.id in this.proxyDrafts) {
+        const { [proxy.id]: _dropped, ...rest } = this.proxyDrafts;
+        this.proxyDrafts = rest;
+      }
+      this.selectProxy(proxy.id);
+    } else if (tunnel) {
+      this.selectTunnel(tunnel.id);
+    }
+  }
+
+  /**
+   * Applies what an External TOML link, unlink, or reload saved: the Proxy's draft is dropped,
+   * since the file (or the switch back) replaced it, and the v2 lists are reloaded.
+   */
+  async applyProxySourceChange(result: ProxySaveResult): Promise<void> {
+    const id = result.profile.id;
+    if (id in this.proxyDrafts) {
+      const { [id]: _dropped, ...rest } = this.proxyDrafts;
+      this.proxyDrafts = rest;
+    }
+    this.proxySaveNote = {
+      proxyId: id,
+      configGeneration: result.snapshot.config_generation,
+      reloaded: result.reloaded,
+      reloadError: result.reload_error,
+    };
+    const viewed: ProxyView = { profile: result.profile, snapshot: result.snapshot };
+    this.proxies = this.proxies.map((p) => (p.profile.id === id ? viewed : p));
+    await this.refreshV2();
   }
 
   selectProxy(id: ProxyId): void {

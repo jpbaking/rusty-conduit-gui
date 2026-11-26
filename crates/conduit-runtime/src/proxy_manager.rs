@@ -14,13 +14,14 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use conduit_core::{
     proxy_mitm_options, proxy_referenced_tunnels, proxy_server_options, proxy_to_routing_input,
-    proxy_vault_secret_refs, validate_proxy, Proxy, ProxyId, RouteInbound, TunnelId,
+    proxy_vault_secret_refs, validate_proxy, Proxy, ProxyId, RouteInbound, SourceMode, TunnelId,
     UpstreamKind, UpstreamPasswordSource,
 };
 use conduit_vault::{Vault, VaultError};
@@ -46,6 +47,9 @@ use zeroize::Zeroizing;
 use crate::logs::{redact, LogRingBuffer};
 use crate::manager::ManagerConfig;
 use crate::state::ListenerInfo;
+use crate::toml_watcher::{
+    merge_external_toml_text, spawn_toml_watcher, TomlWatchEvent, TomlWatcherHandle,
+};
 use crate::tunnel_manager::{TunnelError, TunnelManager};
 
 /// Stands in for vaulted passwords where only routing, not dialing, is needed.
@@ -363,6 +367,13 @@ impl Live {
     }
 }
 
+/// The External TOML watcher of a running linked Proxy.
+struct LinkedWatcher {
+    path: PathBuf,
+    debounce_ms: u64,
+    _handle: TomlWatcherHandle,
+}
+
 struct ProxySlot {
     proxy: Mutex<Proxy>,
     state: Mutex<ProxyState>,
@@ -371,6 +382,8 @@ struct ProxySlot {
     live: Mutex<Option<Live>>,
     /// Serializes start, stop, reload, and override, so a Proxy never has two servers.
     lifecycle: tokio::sync::Mutex<Option<ServerHandles>>,
+    /// Follows the linked file while an External TOML Proxy runs; dropping it stops it.
+    watcher: Mutex<Option<LinkedWatcher>>,
 }
 
 impl ProxySlot {
@@ -600,6 +613,7 @@ impl ProxyManager {
                         records: AccessRecordBuffer::new(self.inner.config.log_capacity),
                         live: Mutex::new(None),
                         lifecycle: tokio::sync::Mutex::new(None),
+                        watcher: Mutex::new(None),
                     });
                     proxies.insert(id, Arc::clone(&slot));
                     slot
@@ -609,9 +623,118 @@ impl ProxyManager {
         if lock(&slot.live).is_none() {
             return Ok(());
         }
-        match self.reload(id).await {
+        let result = match self.reload(id).await {
             Ok(_) | Err(ProxyError::NotRunning(_)) => Ok(()),
             Err(e) => Err(e),
+        };
+        let logger = slot.lifecycle.lock().await.as_ref().map(|h| h.logger.clone());
+        self.sync_watcher(&slot, id, logger);
+        result
+    }
+
+    /// Starts, keeps, or stops the External TOML watcher so it matches the Proxy's source.
+    /// `logger` is the running server's logger (`None` = not running: no watcher).
+    fn sync_watcher(&self, slot: &ProxySlot, id: ProxyId, logger: Option<Logger>) {
+        let source = lock(&slot.proxy).source.clone();
+        let mut watcher = lock(&slot.watcher);
+        let (SourceMode::ExternalToml { path, debounce_ms }, Some(logger)) = (source, logger) else {
+            *watcher = None;
+            return;
+        };
+        if watcher
+            .as_ref()
+            .is_some_and(|w| w.path == path && w.debounce_ms == debounce_ms)
+        {
+            return;
+        }
+        let weak: Weak<Inner> = Arc::downgrade(&self.inner);
+        let watched = path.clone();
+        let handle = spawn_toml_watcher(path.clone(), debounce_ms, move |event| {
+            let weak = weak.clone();
+            let logger = logger.clone();
+            let watched = watched.clone();
+            async move {
+                if let Some(inner) = weak.upgrade() {
+                    ProxyManager { inner }
+                        .apply_external_toml(id, &watched, event, &logger)
+                        .await;
+                }
+            }
+        });
+        *watcher = Some(LinkedWatcher { path, debounce_ms, _handle: handle });
+    }
+
+    /// Applies a linked-file change to a running Proxy. An unreadable file, invalid TOML, or a
+    /// config the reload rejects is logged and the last good routing keeps serving.
+    async fn apply_external_toml(
+        &self,
+        id: ProxyId,
+        path: &Path,
+        event: TomlWatchEvent,
+        logger: &Logger,
+    ) {
+        let shown = path.display();
+        let bytes = match event {
+            TomlWatchEvent::Unreadable(error) => {
+                logger.error(format!(
+                    "warning: external TOML {shown} cannot be read ({error}); keeping the last \
+                     good configuration"
+                ));
+                return;
+            }
+            TomlWatchEvent::Changed(bytes) => bytes,
+        };
+        let Ok(slot) = self.slot(id) else { return };
+        let (previous, merged) = {
+            let mut proxy = lock(&slot.proxy);
+            // A stale event from a watcher being replaced or stopped.
+            if !matches!(&proxy.source, SourceMode::ExternalToml { path: p, .. } if p == path) {
+                return;
+            }
+            let Ok(text) = std::str::from_utf8(&bytes) else {
+                logger.error(format!(
+                    "warning: external TOML {shown} is not valid UTF-8; keeping the last good \
+                     configuration"
+                ));
+                return;
+            };
+            let merged = match merge_external_toml_text(&proxy, text) {
+                Ok(merged) => merged,
+                Err(error) => {
+                    logger.error(format!(
+                        "warning: external TOML {shown} was rejected ({}); keeping the last good \
+                         configuration",
+                        redact(&error)
+                    ));
+                    return;
+                }
+            };
+            if merged.proxy == *proxy {
+                return;
+            }
+            let previous = std::mem::replace(&mut *proxy, merged.proxy.clone());
+            (previous, merged)
+        };
+        for warning in &merged.warnings {
+            logger.info(format!("external TOML {shown}: {warning}"));
+        }
+        match self.reload(id).await {
+            Ok(generation) => logger.info(format!(
+                "external TOML {shown} applied (generation {generation})"
+            )),
+            Err(ProxyError::NotRunning(_)) => {}
+            Err(error) => {
+                {
+                    let mut proxy = lock(&slot.proxy);
+                    if *proxy == merged.proxy {
+                        *proxy = previous;
+                    }
+                }
+                logger.error(format!(
+                    "warning: external TOML {shown} was rejected ({error}); keeping the last good \
+                     configuration"
+                ));
+            }
         }
     }
 
@@ -634,9 +757,11 @@ impl ProxyManager {
         match self.launch(&slot, &proxy).await {
             Ok((handles, live)) => {
                 let state = live.running_state();
+                let logger = handles.logger.clone();
                 *lock(&slot.live) = Some(live);
                 *lifecycle = Some(handles);
                 self.set_state(&slot, id, state);
+                self.sync_watcher(&slot, id, Some(logger));
                 Ok(())
             }
             Err(error) => {
@@ -782,6 +907,8 @@ impl ProxyManager {
     /// Stops a Proxy: drain the server, stop the reaper, flush the loggers, release Tunnels.
     pub async fn stop(&self, id: ProxyId) -> Result<(), ProxyError> {
         let slot = self.slot(id)?;
+        // Not awaited: a change being applied would wait on the lifecycle lock held below.
+        lock(&slot.watcher).take();
         let mut lifecycle = slot.lifecycle.lock().await;
         if let Some(handles) = lifecycle.take() {
             self.set_state(&slot, id, ProxyState::Stopping);
@@ -1707,5 +1834,129 @@ mod tests {
 
         manager.stop(id).await.unwrap();
         assert_eq!(tunnels.snapshot(tid).unwrap().linked_holders, 0);
+    }
+
+    fn linked_toml(port: u16, rules: &[(&str, &str)]) -> String {
+        let mut text = format!(
+            "bind = \"127.0.0.1\"\nhttp_port = {port}\nsocks_port = 0\n\n\
+             [profiles.corp]\ntype = \"http\"\nhost = \"10.0.0.5\"\nport = 3128\n\n\
+             [routing]\ndefault = \"direct\"\n"
+        );
+        for (wildcard, target) in rules {
+            text.push_str(&format!(
+                "\n[[routing.rules]]\nhost_wildcard = \"{wildcard}\"\ntarget = \"{target}\"\n"
+            ));
+        }
+        text
+    }
+
+    async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + TIMEOUT;
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn external_toml_hot_reloads_and_keeps_last_good_on_invalid_files() {
+        let (manager, _tunnels) = manager_with(temp_vault());
+        let mut events = manager.subscribe_events();
+        let dir = std::env::temp_dir().join(format!("conduit-linked-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let port = free_port().await;
+        std::fs::write(&path, linked_toml(port, &[("*.corp.example", "corp")])).unwrap();
+
+        let base = Proxy {
+            id: ProxyId::new(),
+            name: "linked".into(),
+            source: SourceMode::ExternalToml { path: path.clone(), debounce_ms: 250 },
+            ..Proxy::default()
+        };
+        let text = std::fs::read_to_string(&path).unwrap();
+        let proxy = merge_external_toml_text(&base, &text).unwrap().proxy;
+        let id = proxy.id;
+        manager.upsert_proxy(proxy.clone()).await.unwrap();
+        manager.start(id).await.unwrap();
+        let rules = || manager.current_routing(id).unwrap().unwrap().router.rule_count();
+        let generation = || manager.snapshot(id).unwrap().config_generation;
+        assert_eq!((generation(), rules()), (0, 1));
+
+        // An unchanged file is not reloaded; an edited one is, live.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert_eq!(generation(), 0);
+        std::fs::write(
+            &path,
+            linked_toml(port, &[("*.corp.example", "corp"), ("*.more.example", "corp")]),
+        )
+        .unwrap();
+        wait_until("the edited file to reload", || generation() == 1).await;
+        assert_eq!(rules(), 2);
+        assert!(!manager.snapshot(id).unwrap().restart_required);
+        let mut reloaded = false;
+        while let Ok(event) = events.try_recv() {
+            reloaded |= matches!(event, ProxyEvent::Reloaded { config_generation: 1, .. });
+        }
+        assert!(reloaded);
+        assert_eq!(lock(&manager.slot(id).unwrap().proxy).source, proxy.source);
+
+        // Invalid TOML: a warning, and the last good routing keeps serving.
+        let logs = manager.logs(id).unwrap();
+        let warnings = |logs: &LogRingBuffer| {
+            logs.query(None)
+                .iter()
+                .filter(|l| l.text.contains("external TOML") && l.text.contains("rejected"))
+                .count()
+        };
+        std::fs::write(&path, "http_port = [\n").unwrap();
+        wait_until("the invalid-TOML warning", || warnings(&logs) == 1).await;
+        assert_eq!((generation(), rules()), (1, 2));
+        assert!(matches!(manager.snapshot(id).unwrap().state, ProxyState::Running { .. }));
+
+        // Valid TOML that fails validation: rejected, and the saved config is restored.
+        std::fs::write(&path, linked_toml(port, &[("*", "missing")])).unwrap();
+        wait_until("the rejected-config warning", || warnings(&logs) == 2).await;
+        assert_eq!((generation(), rules()), (1, 2));
+        assert_eq!(lock(&manager.slot(id).unwrap().proxy).routing.rules.len(), 2);
+
+        // A deleted file is reported and changes nothing.
+        std::fs::remove_file(&path).unwrap();
+        wait_until("the unreadable warning", || {
+            logs.query(None).iter().any(|l| l.text.contains("cannot be read"))
+        })
+        .await;
+        assert_eq!((generation(), rules()), (1, 2));
+
+        // It recovers on the next good file.
+        std::fs::write(&path, linked_toml(port, &[("*.only.example", "direct")])).unwrap();
+        wait_until("the recovered file to reload", || generation() == 2).await;
+        assert_eq!(rules(), 1);
+
+        // A listener change in the file only flags a restart.
+        let moved = free_port().await;
+        std::fs::write(&path, linked_toml(moved, &[("*.only.example", "direct")])).unwrap();
+        wait_until("the listener change", || generation() == 3).await;
+        assert!(manager.snapshot(id).unwrap().restart_required);
+
+        // Unlinking (back to Managed) stops following the file.
+        let mut managed = lock(&manager.slot(id).unwrap().proxy).clone();
+        managed.source = SourceMode::Managed;
+        manager.upsert_proxy(managed).await.unwrap();
+        let after_unlink = generation();
+        assert!(lock(&manager.slot(id).unwrap().watcher).is_none());
+        std::fs::write(&path, linked_toml(moved, &[("*.a.example", "corp"), ("*.b.example", "corp")]))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert_eq!(generation(), after_unlink);
+
+        // Stopping a linked Proxy drops its watcher.
+        let mut linked = lock(&manager.slot(id).unwrap().proxy).clone();
+        linked.source = SourceMode::ExternalToml { path: path.clone(), debounce_ms: 250 };
+        manager.upsert_proxy(linked).await.unwrap();
+        assert!(lock(&manager.slot(id).unwrap().watcher).is_some());
+        manager.stop(id).await.unwrap();
+        assert!(lock(&manager.slot(id).unwrap().watcher).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

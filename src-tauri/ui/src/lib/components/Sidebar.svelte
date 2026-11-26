@@ -10,9 +10,11 @@
   interface Props {
     /** Opens the New Proxy wizard. */
     onNewProxy: () => void;
+    /** Opens the Import modal (`.bak` or CLI `config.toml`). */
+    onImport: () => void;
   }
 
-  let { onNewProxy }: Props = $props();
+  let { onNewProxy, onImport }: Props = $props();
 
   const NAV: { view: NavView; label: string; also?: NavView[] }[] = [
     { view: "hosts", label: "Host Profiles" },
@@ -148,7 +150,10 @@
     <section aria-labelledby="sidebar-proxies">
       <div class="list-head">
         <h2 id="sidebar-proxies">Proxies</h2>
-        <button class="primary small" onclick={onNewProxy}>+ New Proxy</button>
+        <span class="list-actions">
+          <button class="small" onclick={onImport} title="Import an AirSwitch .bak or a CLI config.toml">Import…</button>
+          <button class="primary small" onclick={onNewProxy}>+ New Proxy</button>
+        </span>
       </div>
       <ul class="session-list" aria-label="Proxies">
         {#if unsavedProxy}
@@ -336,6 +341,10 @@
     justify-content: space-between;
     gap: 6px;
     margin-bottom: 4px;
+  }
+  .list-actions {
+    display: flex;
+    gap: 4px;
   }
   .list-head h2 {
     font-size: 12px;

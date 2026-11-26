@@ -5,6 +5,12 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AccessRecordView,
+  AirSwitchCommitResult,
+  AirSwitchPreview,
+  CliTomlFormat,
+  TomlExportResult,
+  TomlImportCommitResult,
+  TomlImportPreview,
   AppErrorCode,
   AutostartStatus,
   ChainTestResult,
@@ -189,6 +195,29 @@ export const api = {
     call<ExportSummary>("export_config", { path, includeSecrets, passphrase }),
   importConfig: (path: string, passphrase: string | null = null, replaceExisting = false) =>
     call<ImportSummary>("import_config", { path, passphrase, replaceExisting }),
+
+  // U4: AirSwitch `.bak` and CLI `config.toml` import / export, External TOML link mode.
+  previewAirswitchImport: (path: string) => call<AirSwitchPreview>("preview_airswitch_import", { path }),
+  /** Imports as a new Proxy, or into `targetProxyId`. Refused with `vault_locked` while locked. */
+  commitAirswitchImport: (
+    path: string,
+    proxyName: string | null = null,
+    targetProxyId: ProxyId | null = null,
+  ) => call<AirSwitchCommitResult>("commit_airswitch_import", { path, proxyName, targetProxyId }),
+  /** `format` is detected from the file when `null`. */
+  previewTomlImport: (path: string, format: CliTomlFormat | null = null) =>
+    call<TomlImportPreview>("preview_toml_import", { path, format }),
+  commitTomlImport: (path: string, format: CliTomlFormat | null = null, name: string | null = null) =>
+    call<TomlImportCommitResult>("commit_toml_import", { path, format, name }),
+  /** Writes the file owner-only when `path` is given; otherwise only returns the text. */
+  exportProxyToml: (proxyId: ProxyId, format: CliTomlFormat, path: string | null = null) =>
+    call<TomlExportResult>("export_proxy_toml", { proxyId, format, path }),
+  linkProxyExternalToml: (proxyId: ProxyId, path: string, debounceMs: number) =>
+    call<ProxySaveResult>("link_proxy_external_toml", { proxyId, path, debounceMs }),
+  unlinkProxyExternalToml: (proxyId: ProxyId) =>
+    call<ProxySaveResult>("unlink_proxy_external_toml", { proxyId }),
+  reloadProxyExternalToml: (proxyId: ProxyId) =>
+    call<ProxySaveResult>("reload_proxy_external_toml", { proxyId }),
 
   // Proxies (v2).
   listProxies: () => call<ProxyView[]>("list_proxies"),

@@ -23,6 +23,8 @@ serde_json = "1"
 thiserror = "2"
 uuid = { version = "1", features = ["serde", "v4"] }
 humantime = "2"
+# conduit-core: CLI config.toml import/export (U4); matches the version already in Cargo.lock.
+toml = "1.2"
 tokio = { version = "1", features = ["net", "time", "sync", "rt", "macros", "io-util"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 

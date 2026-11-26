@@ -13,7 +13,7 @@
 
   /** A relative path would land in the app's working directory, and `~` is not expanded. */
   const isAbsolutePath = (path: string) => /^(\/|[A-Za-z]:[\\/]|\\\\)/.test(path);
-  const plural = (count: number, noun: string) => `${count} ${noun}${count === 1 ? "" : "s"}`;
+  const plural = (count: number, noun: string, many = `${noun}s`) => `${count} ${count === 1 ? noun : many}`;
 
   let exportPath = $state("");
   let includeSecrets = $state(false);
@@ -79,7 +79,8 @@
             : summary.encrypted
               ? "Backed up without secrets, encrypted."
               : "Backed up without secrets, not encrypted.",
-          `${plural(summary.session_count, "session")}, ${plural(summary.host_count, "host")}, ${plural(summary.key_count, "key")}, ${plural(summary.ca_count, "CA")}.`,
+          `${plural(summary.proxy_count, "proxy", "proxies")}, ${plural(summary.tunnel_count, "tunnel")}, ${plural(summary.library_profile_count, "library profile")}.`,
+          `${summary.session_count ? `${plural(summary.session_count, "session")}, ` : ""}${plural(summary.host_count, "host")}, ${plural(summary.key_count, "key")}, ${plural(summary.ca_count, "CA")}.`,
           ...(withSecrets ? [`${plural(summary.secret_count, "secret")} encrypted.`] : []),
         ];
         if (summary.missing_secrets > 0) {
@@ -102,7 +103,12 @@
       summary.with_secrets
         ? "Restored a backup with secrets."
         : `Restored a backup without secrets${summary.encrypted ? ", from an encrypted file" : ""}.`,
-      `Sessions: ${summary.sessions_added} added, ${summary.sessions_updated} updated, ${summary.sessions_skipped} skipped.`,
+      `Proxies: ${summary.proxies_added} added, ${summary.proxies_updated} updated, ${summary.proxies_skipped} skipped.`,
+      `Tunnels: ${summary.tunnels_added} added, ${summary.tunnels_updated} updated, ${summary.tunnels_skipped} skipped.`,
+      `Profile Library: ${summary.library_profiles_added} added, ${summary.library_profiles_updated} updated, ${summary.library_profiles_skipped} skipped.`,
+      ...(summary.sessions_added + summary.sessions_updated + summary.sessions_skipped > 0
+        ? [`Sessions: ${summary.sessions_added} added, ${summary.sessions_updated} updated, ${summary.sessions_skipped} skipped.`]
+        : []),
       `Hosts: ${summary.hosts_added} added, ${summary.hosts_updated} updated, ${summary.hosts_skipped} skipped.`,
       `Port forward presets: ${summary.presets_added} added, ${summary.presets_updated} updated, ${summary.presets_skipped} skipped.`,
       ...(summary.with_secrets
@@ -164,11 +170,12 @@
       </div>
     </div>
     <p class="muted">
-      Holds sessions, hosts, and port forward presets. An existing file at this path is replaced.
+      Holds proxies, tunnels, the Profile Library, hosts, and port forward presets. An existing file at this
+      path is replaced.
     </p>
     <label class="check">
       <input type="checkbox" bind:checked={includeSecrets} />
-      Include secrets: SSH keys, MITM CAs, saved passwords, and pinned host keys
+      Include secrets: SSH keys, MITM CAs, saved and upstream proxy passwords, and pinned host keys
     </label>
     <label class="field">
       <span>
@@ -217,8 +224,8 @@
     </label>
     <p class="muted">
       {replaceExisting
-        ? "Matching sessions, hosts, and presets are overwritten."
-        : "Matching sessions, hosts, and presets are skipped."}
+        ? "Matching proxies, tunnels, library profiles, hosts, and presets are overwritten."
+        : "Matching proxies, tunnels, library profiles, hosts, and presets are skipped."}
       Older key-only backups can be restored here too.
     </p>
     <div class="form-actions">

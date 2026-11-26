@@ -1,12 +1,12 @@
-# GOAL — U3 Manage Window & Tray
+# GOAL — U4 Import / Export
 
 ## Goal
-- Goal ID: 20261126-u3-manage-window-tray
-- Outcome: Complete Milestone U3 (`docs/MASTER-PLAN.md` §9 & §10 U3) by wiring `src-tauri` (`AppController`, IPC `commands.rs`, `tray_bridge.rs`, `tray_tauri.rs`) and `conduit-tray` (`model.rs`, `linux_ksni.rs`) to `TunnelManager` + `ProxyManager` (with §9.1 PROXIES/TUNNELS tray sections and Mode override submenu), and upgrading the Svelte 5 Manage Window (`src-tauri/ui`) with the Proxies + Tunnels sidebar, New Proxy wizard, 7-tab Proxy editor (inline Route Tester, Test Upstream, `gen #N · hot-reloaded`, `Restart to Apply` banner), re-homed 5-tab Tunnel editor, Profile Library, Vault upstream-password support, and Log drawer quick actions.
-- Done when: All Rust workspace tests (including updated `src-tauri`, `conduit-tray`, and `secret_leak_scan`), `clippy -D warnings`, Linux `conduit_check_tauri_tray` check, `check-pure-rust-crypto.py`, `validate-release-config.py`, `smoke-test-bundle.py --self-test`, and frontend (`npm run check && npm test && npm run build`) pass with zero errors.
+- Goal ID: 20261126-u4-import-export
+- Outcome: Complete Milestone U4 (`docs/MASTER-PLAN.md` §6.3, §9.2, §9.3 & §10 U4): AirSwitch / ZeroOmega / SwitchyOmega `.bak` import wizard (extracting inline passwords into Vault), CLI `config.toml` import & export for all 3 CLIs (`rusty-conduit`, `rusty-conduit-ssh`, `rusty-conduit-switch`, using `password_env` placeholders and never plaintext secrets), External TOML link mode with live debounced hot-reload, and backup format v2 (sealing Tunnels, Proxies, Profile Library, and vaulted upstream passwords, while importing v1 backups through §6.4 migration).
+- Done when: All Rust workspace tests (including new `conduit-core` AirSwitch/TOML tests, `conduit-runtime` External TOML watcher tests, `src-tauri` v2 backup & import/export tests, and updated `secret_leak_scan`), `clippy -D warnings`, Linux `conduit_check_tauri_tray` check, `check-pure-rust-crypto.py`, `validate-release-config.py`, `smoke-test-bundle.py --self-test`, and frontend (`npm run check && npm test && npm run build`) pass with zero errors.
 - Goal status: completed
 - Goal status meaning: drafting | approved | executing | blocked-on-human | in-review | awaiting-acceptance | completed | abandoned
-- Last completed phase: phase-0006
+- Last completed phase: phase-0005
 
 ## Execution
 - Execution mode: delegated
@@ -18,48 +18,43 @@
 - Repository: yes
 - Strategy: isolated-branch
 - Starting branch: feat/one-gui
-- Work branch: goal/20261126-u3-manage-window-tray
-- Baseline commit: ca16a92be966d2aaf67e3fb47cbe8ff418ce5352
+- Work branch: goal/20261126-u4-import-export
+- Baseline commit: 566f3bd42110e23bbedefb6167a53e5db8a3bf3a
 - Starting upstream at start: origin/feat/one-gui@5ad227c55f4815e91c3354f7736b6c105917bf28
 - Work upstream at start: none
 
 ## Phases
-- [done] phase-0001 — Wire AppController and Tauri commands to TunnelManager and ProxyManager
-- [done] phase-0002 — Update conduit-tray and src-tauri tray bridge for PROXIES (Mode submenu) and TUNNELS sections
-- [done] phase-0003 — Update Svelte UI core layer (types, api, mock, stores, validation, and tests) for v2 Proxies and Tunnels
-- [done] phase-0004 — Build Sidebar, New Proxy wizard, 5-tab Tunnel editor, Profile Library view, and Vault upstream-password UI
-- [done] phase-0005 — Build 7-tab Proxy editor, Proxy header (hot-reload/counters), and Log drawer quick actions
-- [done] phase-0006 — Update secret_leak_scan for v2 and run full low-disk verification suite
+- [done] phase-0001 — Add AirSwitch/ZeroOmega/SwitchyOmega .bak importer and 3-CLI config.toml import/export in conduit-core
+- [done] phase-0002 — Add External TOML link watcher in conduit-runtime and wire import/export/link IPC commands in src-tauri
+- [done] phase-0003 — Bump app backup format to v2 (Tunnels, Proxies, Profile Library, upstream passwords, v1 migration) and update secret_leak_scan
+- [done] phase-0004 — Build Svelte UI for Sidebar Import modal, full ProxyImportExportTab (incl. External TOML link), and v2 BackupSection
+- [done] phase-0005 — Rebuild src-tauri/ui/dist/ and run full low-disk verification suite
 
 ## Handoff
 - Current position: completed
 - Next role: planner
 - Next action: none
-- Last verified evidence: User accepted U3 (#1); squashed into 1 commit on `goal/20261126-u3-manage-window-tray` and merged into `feat/one-gui`. Full verification exit 0 (clippy -D warnings clean, workspace Rust tests + secret_leak_scan 6/6 passed, conduit_check_tauri_tray clean, 3 Python checks OK, svelte-check 0/0, npm test 93/93, vite build ok).
+- Last verified evidence: User accepted U4 (#1); squashed into 1 commit on `goal/20261126-u4-import-export` and merged into `feat/one-gui`. Full verification exit 0 (clippy -D warnings clean, workspace Rust tests + secret_leak_scan 6/6 passed, conduit_check_tauri_tray clean, 3 Python checks OK, svelte-check 0/0, npm test 93/93, vite build ok).
 - Blockers: none
 
 ## Review
 - Reviewed by: planner (primary session)
-- Verification result: Full verification exit 0 (clippy -D warnings clean, workspace Rust tests + secret_leak_scan 6/6 passed, conduit_check_tauri_tray clean, check-pure-rust-crypto/validate-release-config/smoke-test-bundle OK, svelte-check 0/0, npm test 93/93, vite build ok; target 4.5G, 20G free)
-- Diff reviewed: ca16a92be966..0d2858f (55 changed files verified against phases 1–6 Scope: In; 0 scope drift; 22 matching Goal-ID commits, 0 foreign/merge commits)
-- Findings: none (encrypted backup export sealing of v2 Proxies/Tunnels/upstream passwords belongs to Milestone U4 as planned)
+- Verification result: Full verification exit 0 (clippy -D warnings clean, workspace Rust tests incl. conduit-core 133, conduit-runtime 91, gui lib 174, secret_leak_scan 6/6 passed, conduit_check_tauri_tray clean, check-pure-rust-crypto/validate-release-config/smoke-test-bundle OK, svelte-check 0/0, npm test 93/93, vite build ok; target 6.1G, 19G free)
+- Diff reviewed: 566f3bd42110..c95258b (34 changed files verified against phases 1–5 Scope: In; 0 scope drift; 16 matching Goal-ID commits, 0 foreign/merge commits)
+- Findings: none
 
 ## Log
-- created ledger with 6 phases for Milestone U3 (replacing completed U2 ledger `20261126-u2-tunnels-proxies`, preserved in git history)
-- approved Gates A–B; created isolated branch `goal/20261126-u3-manage-window-tray` off `feat/one-gui` (`ca16a92be966`); paused before Gate C for fresh session handoff
-- resumed in fresh planner session (verified clean tree, branch `goal/20261126-u3-manage-window-tray` at `c620b44`, validator 0 warnings); started Gate C and delegated `phase-0001` to executor (`claude --model opus --effort medium`)
-- executor stopped phase-0001 on its Escalate-when trigger: load_or_migrate_app_config breaks 2 v1 reopen tests (see phase-0001 Evidence)
-- planner answered phase-0001 escalation (`SCHEMA_VERSION = conduit_core::CURRENT_SCHEMA_VERSION` = 2) and steered `sub-u3-p1` to continue phase-0001
-- executor completed phase-0001: AppController wired to TunnelManager + ProxyManager with schema-2 stamping and v1 migration on open, 32 v2 IPC commands, v2 event forwarding; Verify exit 0 (155 lib tests, clippy clean)
-- planner verified phase-0001 independently (155/155 tests, clippy clean, scope clean), closed `sub-u3-p1`, and delegated `phase-0002` to `sub-u3-p2` (`claude --model opus --effort medium`)
-- executor completed phase-0002: tray model gains PROXIES (nested Mode submenu, Start/Stop/Restart, socks5h:// copy, View Logs) and TUNNELS (linked/attention labels) sections; ksni + Tauri render nested submenus; tray_bridge builds TrayState from Proxies/Tunnels, listens to Proxy/Tunnel events, StartAll/StopAll/Quit use the v2 calls; Verify exit 0
-- planner verified phase-0002 independently (30+160 tests, tauri-tray check, clippy clean, scope clean), closed `sub-u3-p2`, and delegated `phase-0003` to `sub-u3-p3` (`claude --model opus --effort medium`)
-- executor completed phase-0003: v2 wire types, 30+2 v2 api wrappers + subscribeV2Events, browser-preview mocks for every v2 command, store state/actions/events for Proxies/Tunnels/Profile Library (presets, drafts, hot-reload note, override, Route Tester, Test Upstream, view-logs resolution), proxyErrors/tunnelErrors + 16 tests; Verify exit 0
-- planner verified phase-0003 independently (svelte-check 0/0, 93/93 tests, vite build ok, scope clean), closed `sub-u3-p3`, updated phase-0004/0005/0006 for `src-tauri/ui/dist/`, and delegated `phase-0004` to `sub-u3-p4` (`claude --model opus --effort medium`)
-- executor completed phase-0004: Proxies/Tunnels sidebar with mode pills, New Proxy wizard, 5-tab TunnelEditor via a shared ChainEditor context, Profile Library view, ProxyEditor shell, Vault upstream-password usage + safe delete, App wiring incl. Tunnel host-key modal; Verify exit 0
-- planner verified phase-0004 independently (svelte-check 0/0, 93/93 tests, vite build ok, scope clean), closed `sub-u3-p4`, and delegated `phase-0005` to `sub-u3-p5` (`claude --model opus --effort medium`)
-- executor completed phase-0005: 7-tab ProxyEditor (Routing w/ rule drawer + Route Tester, Profiles w/ vault password + Test Upstream, Listeners & Network, Global Filter, MITM, Import/Export placeholder, Logging & General), Proxy header (gen #N · hot-reloaded, Restart to Apply, counters, override pill, Save (Hot-Reload)), LogDrawer for Proxy/Tunnel/session with filters + quick actions; SessionEditor kept (App.svelte still imports it); Verify exit 0
-- planner verified phase-0005 independently (svelte-check 0/0, 93/93 tests, vite build ok, scope clean), closed `sub-u3-p5`, and delegated `phase-0006` to `sub-u3-p6` (`claude --model opus --effort medium`)
-- executor completed phase-0006: added v2 Proxy/Tunnel/vaulted upstream-password secret-leak scan; full Verify exit 0; rebuilt `src-tauri/ui/dist/`; open question: encrypted export does not seal upstream passwords (secret_count 3)
-- planner completed Gate D review: independent full verification exit 0, 0 scope drift across all 55 changed files, closed `sub-u3-p6`, set Goal status `awaiting-acceptance`
-- user accepted U3 (#1); squashed 23 commits into 1 commit on `goal/20261126-u3-manage-window-tray` and merged into `feat/one-gui`
+- created ledger with 5 phases for Milestone U4 (replacing completed U3 ledger `20261126-u3-manage-window-tray`, preserved in git history)
+- approved Gates A–C; created isolated branch `goal/20261126-u4-import-export` off `feat/one-gui` (`566f3bd42110`)
+- started Gate C and delegated `phase-0001` to `sub-u4-p1` (`claude --model opus --effort medium`)
+- phase-0001 done: added `airswitch_import.rs` + `toml_io.rs` to conduit-core (21 new tests); Verify passed after one clippy fix-up
+- planner verified phase-0001 independently (133/133 tests, clippy clean, PURE_RUST_CRYPTO_OK, scope clean), closed `sub-u4-p1`, and delegated `phase-0002` to `sub-u4-p2` (`claude --model opus --effort medium`)
+- phase-0002 done: added `toml_watcher.rs` + ProxyManager watcher wiring, `controller/import_export.rs`, and 8 U4 IPC commands (tests: runtime 91, gui lib 168); Verify passed with no fix-ups
+- planner verified phase-0002 independently (91+168 tests, clippy clean, scope clean), closed `sub-u4-p2`, and delegated `phase-0003` to `sub-u4-p3` (`claude --model opus --effort medium`)
+- phase-0003 done: backup format v2 in `export.rs` (v2 AADs, v1 import via §6.4 migration, Tunnels/Proxies/Profile Library + upstream password sealing/restoring, plain-import stripping/neutralizing, v2 counts, 6 new tests); `secret_leak_scan` checks `secret_count >= 4` and CLI TOML exports; Verify passed with no fix-ups
+- planner verified phase-0003 independently (174 lib + 6 leak-scan tests, clippy clean, scope clean), closed `sub-u4-p3`, and delegated `phase-0004` to `sub-u4-p4` (`claude --model opus --effort medium`)
+- phase-0004 done: U4 UI — wire types/api/mocks/store helpers, Sidebar `Import…` + ImportModal (.bak + 3-CLI config.toml), full ProxyImportExportTab (External TOML link/unlink/reload, TOML export preview/copy/save, .bak import into Proxy), v2 BackupSection counts; Verify passed with no fix-ups
+- planner verified phase-0004 independently (svelte-check 0/0, 93/93 tests, vite build ok, scope clean), closed `sub-u4-p4`, and delegated `phase-0005` to `sub-u4-p5` (`claude --model opus --effort medium`)
+- phase-0005 done: rebuilt `src-tauri/ui/dist/` (stale hashed assets removed) and full Verify passed with no fix-ups (target 6.1G, 19G free)
+- planner completed Gate D review: independent full verification exit 0, 0 scope drift across all 34 changed files, closed `sub-u4-p5`, set Goal status `awaiting-acceptance`
+- user accepted U4 (#1); squashed 17 commits into 1 commit on `goal/20261126-u4-import-export` and merged into `feat/one-gui`

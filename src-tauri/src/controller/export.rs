@@ -8,26 +8,37 @@
 //! A plain file is unauthenticated, so anyone could have edited it. Importing one therefore
 //! never lets a file attach an existing credential to a new destination: a key, password,
 //! agent key, or MITM CA reference survives only where the same host, port, and user (or, for
-//! a CA, the same session) already hold it.
+//! a CA, the same session or Proxy) already hold it. An upstream proxy password (vaulted, or
+//! read from an environment variable or file) survives only where the same Proxy (or Profile
+//! Library entry) already sends it to the same upstream.
+//!
+//! Format version 2 adds Tunnels, Proxies, the Profile Library, and vaulted upstream
+//! passwords. A version 1 file still imports; its v0.1.0 sessions go through the §6.4
+//! migration into Tunnels and Proxies first.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::future::Future;
 use std::sync::PoisonError;
+use std::task::{Context, Waker};
 
 use conduit_core::{
-    validate, validate_forward_preset, AppConfig, AuthMethod, HopEntry, HostProfile, KeyId,
-    KnownHostsStore, MitmCaId,
-    SecretRef, SessionProfile, VaultCaMeta, VaultKeyMeta,
+    migrate_v1_sessions, validate, validate_forward_preset, validate_proxy, validate_tunnel,
+    AppConfig, AuthMethod, HopEntry, HostProfile, KeyId, KnownHostsStore, LoggingConfig, MitmCaId,
+    OpenSshOptions, Proxy, ProxyId, SecretRef, SessionProfile, SourceMode, Tunnel, TunnelId,
+    UpstreamPasswordSource, UpstreamProfile, VaultCaMeta, VaultKeyMeta,
 };
 use conduit_vault::{
     decrypt_record, derive_master_key, encrypt_record, generate_dek, Argon2Params, Dek, VaultError,
+    UPSTREAM_PASSWORD_RECORD,
 };
+use rusty_conduit_engine::routing::{PROFILE_BLOCK, PROFILE_DIRECT};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
-use super::keys::{write_private_file, KEY_RECORD, PASSWORD_RECORD};
+use super::keys::{require_name, write_private_file, KEY_RECORD, PASSWORD_RECORD};
 use super::mitm_ca::{ca_id_from_record, stored_facts, MITM_CA_RECORD};
 use super::{
     key_id_from_record, secret_ref_from_record, AppController, AppError, SecretInput,
@@ -35,13 +46,17 @@ use super::{
 };
 
 const FORMAT: &str = "rusty-conduit-config";
-const VERSION: u32 = 1;
+/// The format written. Version 1 files (no Tunnels, Proxies, or upstream passwords) still import.
+const VERSION: u32 = 2;
+const VERSION_1: u32 = 1;
 /// Bound into the ciphertext as authenticated data.
 const BUNDLE_RECORD_ID: &[u8] = b"conduit-config-bundle";
-const BUNDLE_RECORD_TYPE: &[u8] = b"config-bundle-v1";
+const BUNDLE_RECORD_TYPE: &[u8] = b"config-bundle-v2";
 /// The payload of an encrypted export without secrets: the config alone. A different AAD
 /// type, so a file edited to claim the other kind fails to decrypt.
-const CONFIG_ONLY_RECORD_TYPE: &[u8] = b"config-only-v1";
+const CONFIG_ONLY_RECORD_TYPE: &[u8] = b"config-only-v2";
+const BUNDLE_RECORD_TYPE_V1: &[u8] = b"config-bundle-v1";
+const CONFIG_ONLY_RECORD_TYPE_V1: &[u8] = b"config-only-v1";
 const SALT_LEN: usize = 16;
 const MAX_IMPORT_BYTES: u64 = 64 * 1024 * 1024;
 /// What an untrusted `openssh.ssh_bin` is reset to.
@@ -92,6 +107,16 @@ fn with_secrets_by_default() -> bool {
     true
 }
 
+/// The AAD types of a format version: `(with secrets, config only)`. The version in the
+/// unencrypted header picks them, so a header edited to claim another version fails to decrypt.
+fn record_types(version: u32) -> (&'static [u8], &'static [u8]) {
+    if version == VERSION_1 {
+        (BUNDLE_RECORD_TYPE_V1, CONFIG_ONLY_RECORD_TYPE_V1)
+    } else {
+        (BUNDLE_RECORD_TYPE, CONFIG_ONLY_RECORD_TYPE)
+    }
+}
+
 /// One vault record inside the encrypted payload. Zeroized on drop.
 #[derive(Serialize, Deserialize)]
 struct BundleSecret {
@@ -124,6 +149,9 @@ pub struct ExportSummary {
     pub host_count: usize,
     pub key_count: usize,
     pub ca_count: usize,
+    pub proxy_count: usize,
+    pub tunnel_count: usize,
+    pub library_profile_count: usize,
     /// Vault records sealed into the bundle. Always `0` for a plain export.
     pub secret_count: usize,
     /// References whose vault record no longer exists, so they could not be included.
@@ -147,6 +175,15 @@ pub struct ImportSummary {
     pub presets_added: usize,
     pub presets_updated: usize,
     pub presets_skipped: usize,
+    pub proxies_added: usize,
+    pub proxies_updated: usize,
+    pub proxies_skipped: usize,
+    pub tunnels_added: usize,
+    pub tunnels_updated: usize,
+    pub tunnels_skipped: usize,
+    pub library_profiles_added: usize,
+    pub library_profiles_updated: usize,
+    pub library_profiles_skipped: usize,
     pub keys_added: usize,
     /// Keys from a key-only backup that the vault already holds.
     pub keys_skipped: usize,
@@ -168,6 +205,24 @@ fn all_hosts(config: &AppConfig) -> impl Iterator<Item = &HostProfile> {
         .hosts
         .iter()
         .chain(config.sessions.iter().flat_map(|s| s.hops.iter().map(|h| &h.host)))
+        .chain(config.tunnels.iter().flat_map(|t| t.hops.iter().map(|h| &h.host)))
+}
+
+/// Every upstream profile: those of each Proxy, then the Profile Library.
+fn all_upstream_profiles(config: &AppConfig) -> impl Iterator<Item = &UpstreamProfile> {
+    config
+        .proxies
+        .iter()
+        .flat_map(|p| p.profiles.iter())
+        .chain(config.profile_library.iter())
+}
+
+/// The vault record of an upstream profile's password, if it has one.
+fn vaulted_password(profile: &UpstreamProfile) -> Option<&SecretRef> {
+    match &profile.password {
+        Some(UpstreamPasswordSource::Vault(secret)) => Some(secret),
+        _ => None,
+    }
 }
 
 /// Every vault record the config refers to.
@@ -181,16 +236,23 @@ fn referenced_records(config: &AppConfig) -> BTreeSet<String> {
         };
     }
     ids.extend(config.mitm_cas.iter().map(|c| c.id.to_string()));
-    for session in &config.sessions {
-        if let Some(ca) = session.mitm.as_ref().and_then(|m| m.ca.as_ref()) {
-            ids.insert(ca.to_string());
-        }
+    let session_cas = config.sessions.iter().filter_map(|s| s.mitm.as_ref());
+    let proxy_cas = config.proxies.iter().filter_map(|p| p.mitm.as_ref());
+    for ca in session_cas.chain(proxy_cas).filter_map(|m| m.ca.as_ref()) {
+        ids.insert(ca.to_string());
     }
+    ids.extend(all_upstream_profiles(config).filter_map(vaulted_password).map(|s| s.to_string()));
     ids
 }
 
-/// Assigns missing ids and validates every imported session and host.
-fn prepare(config: &mut AppConfig) -> Result<(), AppError> {
+/// Assigns missing ids and validates every imported item. A version 1 file, or a config
+/// below the current schema, first has its v0.1.0 sessions migrated into Tunnels and Proxies.
+/// `current_tunnels` are the Tunnels this install already has, which imported Proxies may use.
+fn prepare(
+    config: &mut AppConfig,
+    version: u32,
+    current_tunnels: &[TunnelId],
+) -> Result<(), AppError> {
     if config.schema_version > SCHEMA_VERSION {
         return Err(AppError::Invalid(format!(
             "this export uses config schema {}, newer than this app supports",
@@ -241,6 +303,68 @@ fn prepare(config: &mut AppConfig) -> Result<(), AppError> {
             }
         }
     }
+    if version == VERSION_1 || config.schema_version < SCHEMA_VERSION {
+        migrate_v1_sessions(config);
+    }
+    prepare_v2(config, current_tunnels)
+}
+
+/// Assigns missing ids and validates the imported Tunnels, Proxies, and Profile Library.
+fn prepare_v2(config: &mut AppConfig, current_tunnels: &[TunnelId]) -> Result<(), AppError> {
+    let mut tunnel_ids = HashSet::new();
+    for tunnel in &mut config.tunnels {
+        if tunnel.id.as_uuid().is_nil() {
+            tunnel.id = TunnelId::new();
+        }
+        if !tunnel_ids.insert(tunnel.id) {
+            return Err(AppError::Invalid(format!("duplicate tunnel id {}", tunnel.id)));
+        }
+        tunnel.name = require_name(&tunnel.name)?;
+        let mut hop_ids = HashSet::new();
+        for hop in &mut tunnel.hops {
+            if hop.hop_id.trim().is_empty() {
+                hop.hop_id = Uuid::new_v4().to_string();
+            }
+            if !hop_ids.insert(hop.hop_id.clone()) {
+                return Err(AppError::Invalid(format!("duplicate hop id {:?}", hop.hop_id)));
+            }
+        }
+        // A forward's id keys its live status, so a missing or repeated one gets a new id.
+        let mut forward_ids = HashSet::new();
+        for forward in &mut tunnel.port_forwards {
+            if forward.id.is_nil() || !forward_ids.insert(forward.id) {
+                forward.id = Uuid::new_v4();
+                forward_ids.insert(forward.id);
+            }
+        }
+        validate_tunnel(tunnel)?;
+    }
+    let known: Vec<TunnelId> =
+        tunnel_ids.iter().chain(current_tunnels).copied().collect::<HashSet<_>>().into_iter().collect();
+    let mut proxy_ids = HashSet::new();
+    for proxy in &mut config.proxies {
+        if proxy.id.as_uuid().is_nil() {
+            proxy.id = ProxyId::new();
+        }
+        if !proxy_ids.insert(proxy.id) {
+            return Err(AppError::Invalid(format!("duplicate proxy id {}", proxy.id)));
+        }
+        proxy.name = require_name(&proxy.name)?;
+        validate_proxy(proxy, &known, &[])?;
+    }
+    let mut names = HashSet::new();
+    for profile in &mut config.profile_library {
+        profile.name = require_name(&profile.name)?;
+        if profile.name == PROFILE_DIRECT || profile.name == PROFILE_BLOCK {
+            return Err(AppError::Invalid(format!(
+                "`{}` is a built-in profile name and cannot be used",
+                profile.name
+            )));
+        }
+        if !names.insert(profile.name.clone()) {
+            return Err(AppError::Invalid(format!("duplicate library profile {:?}", profile.name)));
+        }
+    }
     Ok(())
 }
 
@@ -266,6 +390,28 @@ fn strip_hop(hop: &mut HopEntry, trusted: Option<&HopEntry>) -> usize {
     strip_host(&mut hop.host, trusted.map(|t| &t.host))
 }
 
+/// Keeps an upstream password (vaulted, env, or file) only when `trusted` holds a profile of
+/// the same name that already sends that same password to the same upstream.
+fn strip_upstream(profile: &mut UpstreamProfile, trusted: &[UpstreamProfile]) -> usize {
+    if profile.password.is_none() {
+        return 0;
+    }
+    let keep = trusted.iter().any(|t| {
+        t.name == profile.name
+            && t.kind == profile.kind
+            && t.host == profile.host
+            && t.port == profile.port
+            && t.username == profile.username
+            && t.password == profile.password
+    });
+    if keep {
+        0
+    } else {
+        profile.password = None;
+        1
+    }
+}
+
 /// Removes every credential reference a plain file is not entitled to. See the module docs.
 fn strip_untrusted_credentials(incoming: &mut AppConfig, current: &AppConfig) -> usize {
     let mut removed = 0;
@@ -287,33 +433,113 @@ fn strip_untrusted_credentials(incoming: &mut AppConfig, current: &AppConfig) ->
             }
         }
     }
+    for tunnel in &mut incoming.tunnels {
+        let existing = current.tunnels.iter().find(|t| t.id == tunnel.id);
+        for hop in &mut tunnel.hops {
+            let trusted = existing.and_then(|t| t.hops.iter().find(|h| h.hop_id == hop.hop_id));
+            removed += strip_hop(hop, trusted);
+        }
+    }
+    for proxy in &mut incoming.proxies {
+        let existing = current.proxies.iter().find(|p| p.id == proxy.id);
+        if let Some(ca) = proxy.mitm.as_ref().and_then(|m| m.ca.as_ref()) {
+            let keep = existing
+                .and_then(|e| e.mitm.as_ref())
+                .is_some_and(|e| e.ca.as_ref() == Some(ca));
+            if !keep {
+                // A Proxy's MITM needs a CA, so without a trusted one it is switched off.
+                proxy.mitm = None;
+                removed += 1;
+            }
+        }
+        let trusted = existing.map_or(&[][..], |e| e.profiles.as_slice());
+        for profile in &mut proxy.profiles {
+            removed += strip_upstream(profile, trusted);
+        }
+    }
+    for profile in &mut incoming.profile_library {
+        removed += strip_upstream(profile, &current.profile_library);
+    }
     removed
+}
+
+fn neutralize_ssh_bin(openssh: &mut OpenSshOptions, trusted: Option<&OpenSshOptions>) {
+    if trusted.map(|t| t.ssh_bin.as_str()) != Some(openssh.ssh_bin.as_str()) {
+        openssh.ssh_bin = DEFAULT_SSH_BIN.into();
+    }
+}
+
+fn neutralize_logging(logging: &mut LoggingConfig, trusted: Option<&LoggingConfig>) {
+    if trusted.and_then(|l| l.http_access_log.as_ref()) != logging.http_access_log.as_ref() {
+        logging.http_access_log = None;
+    }
+    if trusted.and_then(|l| l.socks_log.as_ref()) != logging.socks_log.as_ref() {
+        logging.socks_log = None;
+    }
 }
 
 /// Resets paths a plain file could use to run a chosen program or overwrite a chosen file,
 /// unless the session with the same id already holds that exact value.
+/// The same goes for a Proxy's External TOML link, which would read a chosen file: it falls
+/// back to the managed config unless the Proxy with the same id already links that file.
 fn neutralize_untrusted_paths(incoming: &mut AppConfig, current: &AppConfig) {
     for session in &mut incoming.sessions {
         let existing = current.sessions.iter().find(|s| s.id == session.id);
-        if existing.map(|e| e.openssh.ssh_bin.as_str()) != Some(session.openssh.ssh_bin.as_str()) {
-            session.openssh.ssh_bin = DEFAULT_SSH_BIN.into();
-        }
-        let logging = existing.map(|e| &e.logging);
-        if logging.and_then(|l| l.http_access_log.as_ref()) != session.logging.http_access_log.as_ref() {
-            session.logging.http_access_log = None;
-        }
-        if logging.and_then(|l| l.socks_log.as_ref()) != session.logging.socks_log.as_ref() {
-            session.logging.socks_log = None;
+        neutralize_ssh_bin(&mut session.openssh, existing.map(|e| &e.openssh));
+        neutralize_logging(&mut session.logging, existing.map(|e| &e.logging));
+    }
+    for tunnel in &mut incoming.tunnels {
+        let existing = current.tunnels.iter().find(|t| t.id == tunnel.id);
+        neutralize_ssh_bin(&mut tunnel.openssh, existing.map(|e| &e.openssh));
+        neutralize_logging(&mut tunnel.logging, existing.map(|e| &e.logging));
+    }
+    for proxy in &mut incoming.proxies {
+        let existing = current.proxies.iter().find(|p| p.id == proxy.id);
+        neutralize_logging(&mut proxy.logging, existing.map(|e| &e.logging));
+        if proxy.source != SourceMode::Managed && existing.map(|e| &e.source) != Some(&proxy.source) {
+            proxy.source = SourceMode::Managed;
         }
     }
 }
 
-/// Merges hosts, forward presets, and sessions into `config`, returning the counts and the sessions it changed.
-fn merge(
-    config: &mut AppConfig,
-    incoming: AppConfig,
+/// What an import changed, to hand to the runtime managers.
+#[derive(Default)]
+struct Changed {
+    sessions: Vec<SessionProfile>,
+    tunnels: Vec<Tunnel>,
+    proxies: Vec<Proxy>,
+}
+
+/// Adds the new items and, with `replace`, overwrites the existing ones. Returns
+/// `(added, updated, skipped, changed)`.
+fn merge_items<T: Clone>(
+    existing: &mut Vec<T>,
+    incoming: Vec<T>,
     replace: bool,
-) -> (ImportSummary, Vec<SessionProfile>) {
+    same: impl Fn(&T, &T) -> bool,
+) -> (usize, usize, usize, Vec<T>) {
+    let (mut added, mut updated, mut skipped, mut changed) = (0, 0, 0, Vec::new());
+    for item in incoming {
+        match existing.iter().position(|e| same(e, &item)) {
+            None => {
+                changed.push(item.clone());
+                existing.push(item);
+                added += 1;
+            }
+            Some(_) if !replace => skipped += 1,
+            Some(index) => {
+                changed.push(item.clone());
+                existing[index] = item;
+                updated += 1;
+            }
+        }
+    }
+    (added, updated, skipped, changed)
+}
+
+/// Merges hosts, forward presets, sessions, Tunnels, Proxies, and the Profile Library into
+/// `config`, returning the counts and what it changed.
+fn merge(config: &mut AppConfig, incoming: AppConfig, replace: bool) -> (ImportSummary, Changed) {
     let mut summary = ImportSummary::default();
     let mut touched = BTreeSet::new();
     for host in incoming.hosts {
@@ -363,13 +589,30 @@ fn merge(
             }
         }
     }
-    let changed = config
+    let sessions = config
         .sessions
         .iter()
         .filter(|s| touched.contains(&s.id))
         .cloned()
         .collect();
-    (summary, changed)
+    let (added, updated, skipped, tunnels) =
+        merge_items(&mut config.tunnels, incoming.tunnels, replace, |a, b| a.id == b.id);
+    (summary.tunnels_added, summary.tunnels_updated, summary.tunnels_skipped) = (added, updated, skipped);
+    let (added, updated, skipped, proxies) =
+        merge_items(&mut config.proxies, incoming.proxies, replace, |a, b| a.id == b.id);
+    (summary.proxies_added, summary.proxies_updated, summary.proxies_skipped) = (added, updated, skipped);
+    let (added, updated, skipped, _) = merge_items(
+        &mut config.profile_library,
+        incoming.profile_library,
+        replace,
+        |a, b| a.name == b.name,
+    );
+    (
+        summary.library_profiles_added,
+        summary.library_profiles_updated,
+        summary.library_profiles_skipped,
+    ) = (added, updated, skipped);
+    (summary, Changed { sessions, tunnels, proxies })
 }
 
 fn bundle_key(passphrase: &[u8], params: &Argon2Params, salt: &[u8]) -> Result<Dek, AppError> {
@@ -396,6 +639,7 @@ fn check_bundle_params(file: &EncryptedExport) -> Result<(), AppError> {
 struct RestoredRecords {
     keys: HashMap<String, KeyId>,
     passwords: HashMap<String, SecretRef>,
+    upstream: HashMap<String, SecretRef>,
     cas: HashMap<String, MitmCaId>,
     new_metas: Vec<VaultKeyMeta>,
     new_ca_metas: Vec<VaultCaMeta>,
@@ -426,6 +670,21 @@ impl RestoredRecords {
         before - auth.len()
     }
 
+    /// Points a vaulted upstream password at its restored record, or drops it.
+    fn remap_upstream(&self, profile: &mut UpstreamProfile) -> usize {
+        let Some(old) = vaulted_password(profile) else { return 0 };
+        match self.upstream.get(&old.to_string()) {
+            Some(new) => {
+                profile.password = Some(UpstreamPasswordSource::Vault(new.clone()));
+                0
+            }
+            None => {
+                profile.password = None;
+                1
+            }
+        }
+    }
+
     /// Points every reference at its restored record and drops any that did not resolve.
     fn remap(&self, config: &mut AppConfig) -> usize {
         let mut removed = 0;
@@ -442,6 +701,29 @@ impl RestoredRecords {
                     removed += usize::from(mitm.ca.is_none());
                 }
             }
+        }
+        for tunnel in &mut config.tunnels {
+            for hop in &mut tunnel.hops {
+                removed += self.remap_auth(&mut hop.host.auth);
+            }
+        }
+        for proxy in &mut config.proxies {
+            if let Some(old) = proxy.mitm.as_ref().and_then(|m| m.ca.clone()) {
+                match (self.cas.get(&old.to_string()), proxy.mitm.as_mut()) {
+                    (Some(new), Some(mitm)) => mitm.ca = Some(new.clone()),
+                    _ => {
+                        // A Proxy's MITM needs a CA, so without one it is switched off.
+                        proxy.mitm = None;
+                        removed += 1;
+                    }
+                }
+            }
+            for profile in &mut proxy.profiles {
+                removed += self.remap_upstream(profile);
+            }
+        }
+        for profile in &mut config.profile_library {
+            removed += self.remap_upstream(profile);
         }
         removed
     }
@@ -465,6 +747,9 @@ impl AppController {
             host_count: config.hosts.len(),
             key_count: config.keys.len(),
             ca_count: config.mitm_cas.len(),
+            proxy_count: config.proxies.len(),
+            tunnel_count: config.tunnels.len(),
+            library_profile_count: config.profile_library.len(),
             secret_count: 0,
             missing_secrets: 0,
         };
@@ -579,7 +864,7 @@ impl AppController {
         if probe.format != FORMAT {
             return Err(not_an_export());
         }
-        if probe.version != VERSION {
+        if probe.version != VERSION && probe.version != VERSION_1 {
             return Err(AppError::Invalid(format!(
                 "unsupported config export version {}",
                 probe.version
@@ -621,7 +906,33 @@ impl AppController {
 
     fn import_plain(&self, data: &[u8], replace: bool) -> Result<ImportSummary, AppError> {
         let file: PlainExport = serde_json::from_slice(data).map_err(|_| not_an_export())?;
-        self.import_without_secrets(file.config, replace)
+        self.import_without_secrets(file.config, file.version, replace)
+    }
+
+    /// Hands what an import changed to the session, Tunnel, and Proxy managers.
+    fn sync_imported(&self, changed: Changed) {
+        self.sync_profiles(changed.sessions);
+        // Tunnels first: a running Proxy's reload looks up the Tunnels it routes through.
+        self.sync_tunnels(changed.tunnels);
+        for proxy in changed.proxies {
+            let manager = self.proxies().clone();
+            let mut task = Box::pin(async move {
+                // A rejected reload keeps the running routing; the import still stands.
+                let _ = manager.upsert_proxy(proxy).await;
+            });
+            // A stopped Proxy is registered at once, without awaiting. A running one goes on
+            // reloading on the runtime, which a running Proxy implies there is.
+            let waker = Waker::noop();
+            if task.as_mut().poll(&mut Context::from_waker(waker)).is_pending() {
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    runtime.spawn(task);
+                }
+            }
+        }
+    }
+
+    fn current_tunnel_ids(&self) -> Vec<TunnelId> {
+        self.config_snapshot().tunnels.iter().map(|t| t.id).collect()
     }
 
     /// Merges a config that came without secrets, from a plain file or an encrypted one: its
@@ -629,9 +940,10 @@ impl AppController {
     fn import_without_secrets(
         &self,
         mut incoming: AppConfig,
+        version: u32,
         replace: bool,
     ) -> Result<ImportSummary, AppError> {
-        prepare(&mut incoming)?;
+        prepare(&mut incoming, version, &self.current_tunnel_ids())?;
         // Key or CA metadata without its vault record would list one that cannot be used.
         incoming.keys.clear();
         incoming.mitm_cas.clear();
@@ -642,7 +954,7 @@ impl AppController {
             summary.credentials_removed += removed;
             Ok((summary, changed))
         })?;
-        self.sync_profiles(changed);
+        self.sync_imported(changed);
         Ok(summary)
     }
 
@@ -662,30 +974,45 @@ impl AppController {
         }
         check_bundle_params(&file)?;
         let key = bundle_key(passphrase.as_bytes(), &file.argon2, &file.salt)?;
+        let (bundle_type, config_only_type) = record_types(file.version);
         if !file.secrets {
-            let plaintext =
-                decrypt_record(&key, BUNDLE_RECORD_ID, CONFIG_ONLY_RECORD_TYPE, &file.payload)?;
+            let plaintext = decrypt_record(&key, BUNDLE_RECORD_ID, config_only_type, &file.payload)?;
             let incoming: AppConfig =
                 serde_json::from_slice(&plaintext).map_err(|_| not_an_export())?;
-            let mut summary = self.import_without_secrets(incoming, replace)?;
+            let mut summary = self.import_without_secrets(incoming, file.version, replace)?;
             summary.encrypted = true;
             return Ok(summary);
         }
-        let plaintext = decrypt_record(&key, BUNDLE_RECORD_ID, BUNDLE_RECORD_TYPE, &file.payload)?;
+        let plaintext = decrypt_record(&key, BUNDLE_RECORD_ID, bundle_type, &file.payload)?;
         let BundlePayload { config: mut incoming, known_hosts, secrets } =
             serde_json::from_slice(&plaintext).map_err(|_| not_an_export())?;
         drop(plaintext);
-        prepare(&mut incoming)?;
+        let current = self.config_snapshot();
+        let current_tunnels: Vec<TunnelId> = current.tunnels.iter().map(|t| t.id).collect();
+        prepare(&mut incoming, file.version, &current_tunnels)?;
 
         // Skipped items must not bring their secrets along.
-        let current = self.config_snapshot();
-        let before = (incoming.sessions.len(), incoming.hosts.len());
+        let before = (
+            incoming.sessions.len(),
+            incoming.hosts.len(),
+            incoming.tunnels.len(),
+            incoming.proxies.len(),
+            incoming.profile_library.len(),
+        );
         if !replace {
             incoming.sessions.retain(|s| !current.sessions.iter().any(|e| e.id == s.id));
             incoming.hosts.retain(|h| !current.hosts.iter().any(|e| e.id == h.id));
+            incoming.tunnels.retain(|t| !current.tunnels.iter().any(|e| e.id == t.id));
+            incoming.proxies.retain(|p| !current.proxies.iter().any(|e| e.id == p.id));
+            incoming
+                .profile_library
+                .retain(|p| !current.profile_library.iter().any(|e| e.name == p.name));
         }
         let sessions_skipped = before.0 - incoming.sessions.len();
         let hosts_skipped = before.1 - incoming.hosts.len();
+        let tunnels_skipped = before.2 - incoming.tunnels.len();
+        let proxies_skipped = before.3 - incoming.proxies.len();
+        let library_skipped = before.4 - incoming.profile_library.len();
 
         let mut restored = RestoredRecords::default();
         let stored = self.restore_records(&incoming, &secrets, &current, &mut restored);
@@ -719,12 +1046,15 @@ impl AppController {
                 return Err(error);
             }
         };
-        self.sync_profiles(changed);
+        self.sync_imported(changed);
 
         summary.encrypted = true;
         summary.with_secrets = true;
         summary.sessions_skipped += sessions_skipped;
         summary.hosts_skipped += hosts_skipped;
+        summary.tunnels_skipped += tunnels_skipped;
+        summary.proxies_skipped += proxies_skipped;
+        summary.library_profiles_skipped += library_skipped;
         summary.keys_added = restored.new_metas.len();
         summary.cas_added = restored.new_ca_metas.len();
         summary.secrets_added =
@@ -735,7 +1065,8 @@ impl AppController {
         Ok(summary)
     }
 
-    /// Stores the bundle's keys and CAs, and the passwords `incoming` still refers to.
+    /// Stores the bundle's keys and CAs, and the hop and upstream passwords `incoming` still
+    /// refers to.
     fn restore_records(
         &self,
         incoming: &AppConfig,
@@ -826,6 +1157,17 @@ impl AppController {
             if let Some(secret) = find(&id, PASSWORD_RECORD) {
                 let reference = self.restore_secret(secret, restored)?;
                 restored.passwords.insert(id, reference);
+            }
+        }
+
+        let upstream: BTreeSet<String> = all_upstream_profiles(incoming)
+            .filter_map(vaulted_password)
+            .map(|s| s.to_string())
+            .collect();
+        for id in upstream {
+            if let Some(secret) = find(&id, UPSTREAM_PASSWORD_RECORD) {
+                let reference = self.restore_secret(secret, restored)?;
+                restored.upstream.insert(id, reference);
             }
         }
         Ok(())
@@ -1399,6 +1741,344 @@ mod tests {
         let error = c.import_config(&path, None, true).unwrap_err();
         assert!(!error.to_string().contains(PASSWORD), "errors must not quote file content");
 
+        assert_eq!(c.config_snapshot(), before);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Format version 2: Tunnels, Proxies, the Profile Library, and upstream passwords.
+    // ---------------------------------------------------------------------------------------
+
+    const UPSTREAM: &str = "export-canary-upstream-5c2e";
+
+    struct SeedV2 {
+        tunnel: TunnelId,
+        proxy: ProxyId,
+        upstream: SecretRef,
+    }
+
+    fn upstream_profile(name: &str, password: Option<UpstreamPasswordSource>) -> UpstreamProfile {
+        UpstreamProfile {
+            name: name.into(),
+            kind: conduit_core::UpstreamKind::Http,
+            host: Some("upstream.example".into()),
+            port: Some(8080),
+            username: Some("corp-user".into()),
+            password,
+            bypass: Vec::new(),
+            color: None,
+        }
+    }
+
+    /// On top of [`seed`]: a Tunnel using the seeded key and password, a Proxy routed through it
+    /// with the seeded CA and a vaulted upstream password, and a library profile using that too.
+    async fn seed_v2(c: &AppController, seeded: &Seed) -> SeedV2 {
+        let upstream = c
+            .set_upstream_password(None, SecretInput::new(UPSTREAM))
+            .await
+            .unwrap()
+            .secret_ref;
+        let vaulted = || Some(UpstreamPasswordSource::Vault(upstream.clone()));
+        let mut tunnel = Tunnel {
+            name: "v2-tunnel".into(),
+            start_mode: conduit_core::TunnelStartMode::Manual { autostart: false },
+            hops: vec![hop(
+                "t-hop-0",
+                22,
+                vec![
+                    AuthMethod::Key { key: seeded.key.id.clone() },
+                    AuthMethod::Password { secret: seeded.password.clone() },
+                ],
+            )],
+            ..Tunnel::default()
+        };
+        tunnel.openssh.ssh_bin = "/opt/trusted/ssh".into();
+        let tunnel = c.upsert_tunnel(tunnel).unwrap();
+        let proxy = Proxy {
+            name: "v2-proxy".into(),
+            listeners: conduit_core::ListenerConfig {
+                http_port: 1,
+                socks_port: 0,
+                ..conduit_core::ListenerConfig::default()
+            },
+            profiles: vec![
+                upstream_profile("corp", vaulted()),
+                UpstreamProfile {
+                    name: "ssh".into(),
+                    kind: conduit_core::UpstreamKind::Tunnel { tunnel_id: tunnel.id },
+                    host: None,
+                    port: None,
+                    username: None,
+                    password: None,
+                    bypass: Vec::new(),
+                    color: None,
+                },
+            ],
+            mitm: Some(MitmConfig { ca: Some(seeded.ca.id.clone()), ..MitmConfig::default() }),
+            ..Proxy::default()
+        };
+        let proxy = c.upsert_proxy(proxy).await.unwrap().profile;
+        c.upsert_library_profile(upstream_profile("shared", vaulted())).unwrap();
+        SeedV2 { tunnel: tunnel.id, proxy: proxy.id, upstream }
+    }
+
+    #[tokio::test]
+    async fn export_v2_bundle_seals_and_restores_tunnels_proxies_and_upstream_passwords() {
+        let source_dir = TempDir::new();
+        let c = unlocked(&source_dir).await;
+        let seeded = seed(&c);
+        let v2 = seed_v2(&c, &seeded).await;
+        let path = source_dir.path().join("v2-bundle.json");
+        let summary = c.export_config(&path, true, pass()).unwrap();
+        assert_eq!(
+            (summary.tunnel_count, summary.proxy_count, summary.library_profile_count),
+            (1, 1, 1)
+        );
+        // Key, hop password, MITM CA, and the upstream password.
+        assert_eq!((summary.secret_count, summary.missing_secrets), (4, 0));
+        let text = fs::read_to_string(&path).unwrap();
+        for secret in [UPSTREAM, PASSWORD, "v2-proxy", "v2-tunnel", "shared"] {
+            assert!(!text.contains(secret), "bundle exposed {secret}");
+        }
+        let header: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(header["version"], json!(2));
+
+        let target_dir = TempDir::new();
+        let t = unlocked(&target_dir).await;
+        let summary = t.import_config(&path, pass(), false).unwrap();
+        assert_eq!((summary.tunnels_added, summary.proxies_added, summary.library_profiles_added), (1, 1, 1));
+        assert_eq!(summary.credentials_removed, 0);
+        // The hop password and the upstream password (shared by the Proxy and the library).
+        assert_eq!((summary.keys_added, summary.cas_added, summary.secrets_added), (1, 1, 2));
+
+        let config = t.config_snapshot();
+        let (key, ca) = (&config.keys[0].id, &config.mitm_cas[0].id);
+        let tunnel = config.tunnels.iter().find(|x| x.id == v2.tunnel).unwrap();
+        assert_eq!(tunnel.openssh.ssh_bin, "/opt/trusted/ssh", "a bundle is trusted");
+        let auth = &tunnel.hops[0].host.auth;
+        assert_eq!(auth[0], AuthMethod::Key { key: key.clone() });
+        let AuthMethod::Password { secret } = &auth[1] else { panic!("hop password lost") };
+        assert_eq!(t.vault_read().get_secret(&secret.to_string()).unwrap().as_slice(), PASSWORD.as_bytes());
+
+        let proxy = config.proxies.iter().find(|x| x.id == v2.proxy).unwrap();
+        assert_eq!(proxy.mitm.as_ref().unwrap().ca.as_ref(), Some(ca));
+        let Some(UpstreamPasswordSource::Vault(upstream)) = &proxy.profiles[0].password else {
+            panic!("upstream password lost")
+        };
+        assert_ne!(*upstream, v2.upstream);
+        assert_eq!(t.record_type(&upstream.to_string()).as_deref(), Some(UPSTREAM_PASSWORD_RECORD));
+        assert_eq!(t.vault_read().get_secret(&upstream.to_string()).unwrap().as_slice(), UPSTREAM.as_bytes());
+        assert_eq!(
+            config.profile_library[0].password,
+            Some(UpstreamPasswordSource::Vault(upstream.clone()))
+        );
+        assert!(t.proxies().snapshot(v2.proxy).is_ok(), "the runtime must know the Proxy");
+        assert!(t.tunnels().snapshot(v2.tunnel).is_ok(), "the runtime must know the Tunnel");
+
+        // Back on the source install: everything is skipped, or replaced without new records.
+        let records = c.vault_read().record_count();
+        let skipped = c.import_config(&path, pass(), false).unwrap();
+        assert_eq!(
+            (skipped.tunnels_skipped, skipped.proxies_skipped, skipped.library_profiles_skipped),
+            (1, 1, 1)
+        );
+        let updated = c.import_config(&path, pass(), true).unwrap();
+        assert_eq!(
+            (updated.tunnels_updated, updated.proxies_updated, updated.library_profiles_updated),
+            (1, 1, 1)
+        );
+        assert_eq!((updated.secrets_added, updated.credentials_removed), (0, 0));
+        assert_eq!(c.vault_read().record_count(), records);
+    }
+
+    #[tokio::test]
+    async fn export_v2_plain_import_carries_no_credentials_to_a_fresh_install() {
+        let source_dir = TempDir::new();
+        let c = unlocked(&source_dir).await;
+        let seeded = seed(&c);
+        let v2 = seed_v2(&c, &seeded).await;
+        let path = source_dir.path().join("v2-plain.json");
+        let summary = c.export_config(&path, false, None).unwrap();
+        assert_eq!((summary.tunnel_count, summary.proxy_count, summary.secret_count), (1, 1, 0));
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("v2-proxy") && !text.contains(UPSTREAM));
+
+        let target_dir = TempDir::new();
+        let t = unlocked(&target_dir).await;
+        let summary = t.import_config(&path, None, false).unwrap();
+        assert_eq!((summary.tunnels_added, summary.proxies_added, summary.library_profiles_added), (1, 1, 1));
+        // The 4 v1 credentials, the Tunnel's key and password, the Proxy's CA and upstream
+        // password, and the library profile's upstream password.
+        assert_eq!(summary.credentials_removed, 9);
+        let config = t.config_snapshot();
+        let tunnel = config.tunnels.iter().find(|x| x.id == v2.tunnel).unwrap();
+        assert!(tunnel.hops[0].host.auth.is_empty());
+        assert_eq!(tunnel.openssh.ssh_bin, "ssh");
+        let proxy = config.proxies.iter().find(|x| x.id == v2.proxy).unwrap();
+        assert_eq!(proxy.mitm, None);
+        assert_eq!(proxy.profiles[0].password, None);
+        assert_eq!(config.profile_library[0].password, None);
+        assert!(t.proxies().snapshot(v2.proxy).is_ok());
+
+        // On the same install every link is already held, so nothing changes.
+        let before = c.config_snapshot();
+        let summary = c.import_config(&path, None, true).unwrap();
+        assert_eq!(summary.credentials_removed, 0);
+        assert_eq!((summary.tunnels_updated, summary.proxies_updated, summary.library_profiles_updated), (1, 1, 1));
+        assert_eq!(c.config_snapshot(), before);
+    }
+
+    #[tokio::test]
+    async fn export_v2_edited_plain_file_cannot_redirect_upstream_passwords_or_paths() {
+        let dir = TempDir::new();
+        let c = unlocked(&dir).await;
+        let seeded = seed(&c);
+        let v2 = seed_v2(&c, &seeded).await;
+        let path = dir.path().join("v2-plain.json");
+        c.export_config(&path, false, None).unwrap();
+        edit_json(&path, |v| {
+            let proxy = &mut v["config"]["proxies"][0];
+            proxy["profiles"][0]["host"] = json!("attacker.example");
+            proxy["source"] = json!({ "external_toml": { "path": "/home/victim/evil.toml", "debounce_ms": 10 } });
+            proxy["logging"]["http_access_log"] = json!("/home/victim/.bashrc");
+            v["config"]["tunnels"][0]["openssh"]["ssh_bin"] = json!("/tmp/evil");
+            v["config"]["tunnels"][0]["logging"]["socks_log"] = json!("/home/victim/.profile");
+            // A new library profile that reads a chosen file, and one borrowing the vault record.
+            let library = v["config"]["profile_library"].as_array_mut().unwrap();
+            let mut file = library[0].clone();
+            file["name"] = json!("exfil");
+            file["password"] = json!({ "file": "/etc/shadow" });
+            let mut borrower = library[0].clone();
+            borrower["name"] = json!("borrower");
+            library.extend([file, borrower]);
+        });
+
+        let summary = c.import_config(&path, None, true).unwrap();
+        assert_eq!(summary.credentials_removed, 3);
+        let config = c.config_snapshot();
+        let proxy = config.proxies.iter().find(|x| x.id == v2.proxy).unwrap();
+        assert_eq!(proxy.profiles[0].host.as_deref(), Some("attacker.example"));
+        assert_eq!(proxy.profiles[0].password, None);
+        assert_eq!(proxy.source, SourceMode::Managed);
+        assert_eq!(proxy.logging.http_access_log, None);
+        assert_eq!(proxy.mitm.as_ref().unwrap().ca.as_ref(), Some(&seeded.ca.id), "unchanged CA stays");
+        let tunnel = config.tunnels.iter().find(|x| x.id == v2.tunnel).unwrap();
+        assert_eq!(tunnel.openssh.ssh_bin, "ssh");
+        assert_eq!(tunnel.logging.socks_log, None);
+        assert_eq!(tunnel.hops[0].host.auth.len(), 2, "an unchanged hop keeps its credentials");
+        let library = |name: &str| config.profile_library.iter().find(|p| p.name == name).unwrap();
+        assert_eq!(library("shared").password, Some(UpstreamPasswordSource::Vault(v2.upstream.clone())));
+        assert_eq!(library("exfil").password, None);
+        assert_eq!(library("borrower").password, None);
+    }
+
+    #[tokio::test]
+    async fn export_v2_invalid_tunnel_or_proxy_changes_nothing() {
+        let dir = TempDir::new();
+        let c = unlocked(&dir).await;
+        let seeded = seed(&c);
+        seed_v2(&c, &seeded).await;
+        let before = c.config_snapshot();
+        let path = dir.path().join("v2-plain.json");
+        c.export_config(&path, false, None).unwrap();
+        let good = fs::read(&path).unwrap();
+
+        edit_json(&path, |v| v["config"]["tunnels"][0]["hops"] = json!([]));
+        assert!(c.import_config(&path, None, true).is_err());
+        fs::write(&path, &good).unwrap();
+        edit_json(&path, |v| {
+            v["config"]["proxies"][0]["listeners"]["http_port"] = json!(0);
+        });
+        assert!(c.import_config(&path, None, true).is_err());
+        fs::write(&path, &good).unwrap();
+        edit_json(&path, |v| {
+            let proxy = v["config"]["proxies"][0].clone();
+            v["config"]["proxies"].as_array_mut().unwrap().push(proxy);
+        });
+        assert!(matches!(c.import_config(&path, None, true), Err(AppError::Invalid(_))));
+        fs::write(&path, &good).unwrap();
+        edit_json(&path, |v| v["config"]["profile_library"][0]["name"] = json!("direct"));
+        assert!(matches!(c.import_config(&path, None, true), Err(AppError::Invalid(_))));
+        assert_eq!(c.config_snapshot(), before);
+    }
+
+    /// A v0.1.0 config document: schema 1, one session, no Tunnels or Proxies.
+    fn v1_config() -> AppConfig {
+        AppConfig {
+            schema_version: 1,
+            sessions: vec![profile("legacy", 22)],
+            ..AppConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn export_v1_plain_backup_imports_through_the_session_migration() {
+        let dir = TempDir::new();
+        let c = unlocked(&dir).await;
+        let path = dir.path().join("v1-plain.json");
+        let file = PlainExport { format: FORMAT.into(), version: 1, encrypted: false, config: v1_config() };
+        fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+
+        let summary = c.import_config(&path, None, false).unwrap();
+        assert_eq!((summary.sessions_added, summary.tunnels_added, summary.proxies_added), (0, 1, 1));
+        let config = c.config_snapshot();
+        assert!(config.sessions.is_empty());
+        let tunnel = config.tunnels.iter().find(|x| x.name == "legacy").unwrap();
+        let proxy = config.proxies.iter().find(|x| x.name == "legacy").unwrap();
+        assert_eq!(conduit_core::proxy_referenced_tunnels(proxy), vec![tunnel.id]);
+        assert_eq!(proxy.listeners.http_port, 1);
+        assert!(c.proxies().snapshot(proxy.id).is_ok());
+    }
+
+    /// Writes an encrypted version 1 file of `payload`, sealed under the v1 AAD type.
+    fn write_v1_encrypted(c: &AppController, path: &Path, secrets: bool, payload: &[u8]) {
+        let params = c.argon();
+        let mut salt = generate_dek().to_bytes();
+        salt.truncate(SALT_LEN);
+        let key = bundle_key(BUNDLE_PASS.as_bytes(), &params, &salt).unwrap();
+        let record_type = if secrets { BUNDLE_RECORD_TYPE_V1 } else { CONFIG_ONLY_RECORD_TYPE_V1 };
+        let file = EncryptedExport {
+            format: FORMAT.into(),
+            version: 1,
+            encrypted: true,
+            secrets,
+            argon2: params,
+            salt,
+            payload: encrypt_record(&key, BUNDLE_RECORD_ID, record_type, payload),
+        };
+        fs::write(path, serde_json::to_vec(&file).unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn export_v1_encrypted_backups_still_import_and_are_bound_to_their_version() {
+        let dir = TempDir::new();
+        let c = unlocked(&dir).await;
+        let config_only = dir.path().join("v1-config-only.json");
+        write_v1_encrypted(&c, &config_only, false, &serde_json::to_vec(&v1_config()).unwrap());
+        let summary = c.import_config(&config_only, pass(), false).unwrap();
+        assert!(summary.encrypted && !summary.with_secrets);
+        assert_eq!((summary.tunnels_added, summary.proxies_added), (1, 1));
+
+        let bundle = dir.path().join("v1-bundle.json");
+        let payload = BundlePayload {
+            config: v1_config(),
+            known_hosts: KnownHostsStore::default(),
+            secrets: Vec::new(),
+        };
+        write_v1_encrypted(&c, &bundle, true, &serde_json::to_vec(&payload).unwrap());
+        let summary = c.import_config(&bundle, pass(), false).unwrap();
+        assert!(summary.encrypted && summary.with_secrets);
+        assert_eq!((summary.tunnels_added, summary.proxies_added), (1, 1));
+        assert!(c.config_snapshot().sessions.is_empty());
+
+        // A v1 payload whose header is edited to claim version 2 fails to decrypt.
+        let before = c.config_snapshot();
+        for path in [&config_only, &bundle] {
+            edit_json(path, |v| v["version"] = json!(2));
+            assert!(matches!(
+                c.import_config(path, pass(), true),
+                Err(AppError::Vault(VaultError::UnlockFailed))
+            ));
+        }
         assert_eq!(c.config_snapshot(), before);
     }
 }

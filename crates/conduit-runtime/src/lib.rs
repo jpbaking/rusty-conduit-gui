@@ -16,6 +16,7 @@ mod reverse;
 pub mod proxy_manager;
 pub(crate) mod runner;
 pub mod state;
+pub mod toml_watcher;
 pub mod tunnel_manager;
 pub mod wake;
 
@@ -26,6 +27,11 @@ pub use manager::{ManagerConfig, RuntimeError, SessionManager};
 pub use proxy_manager::{
     requires_restart, AccessRecordBuffer, ProxyError, ProxyEvent, ProxyManager, ProxySnapshot,
     ProxyState, ProxyTrafficSnapshot, RouteTestResult, RouteTestTarget, UpstreamProbeResult,
+};
+pub use toml_watcher::{
+    clamp_debounce, merge_external_toml, merge_external_toml_text, read_external_toml,
+    spawn_toml_watcher, ExternalTomlMerge, TomlWatchEvent, TomlWatcherHandle, MAX_DEBOUNCE_MS,
+    MIN_DEBOUNCE_MS,
 };
 pub use tunnel_manager::{
     TunnelError, TunnelEvent, TunnelEventReceiver, TunnelManager, TunnelSnapshot,

@@ -4,6 +4,13 @@
 import { ApiError } from "./api";
 import type {
   AccessRecordView,
+  AirSwitchCommitResult,
+  AirSwitchPreview,
+  CliTomlFormat,
+  ImportedProfileSummary,
+  TomlExportResult,
+  TomlImportCommitResult,
+  TomlImportPreview,
   CaView,
   Proxy,
   ProxySaveResult,
@@ -525,6 +532,153 @@ function mockAccessRecords(): AccessRecordView[] {
 
 const NOT_HANDLED = Symbol("not handled");
 
+// ---- U4: import / export samples. No secret is ever returned. ----
+
+const SAMPLE_IMPORTED: ImportedProfileSummary[] = [
+  { name: "office", kind: "http", host: "192.0.2.90", port: 3128, username: "alice", password_extracted: true, password_source: null },
+  { name: "lab-socks", kind: "socks5", host: "198.51.100.20", port: 1080, username: null, password_extracted: false, password_source: null },
+];
+
+const fileStem = (path: unknown) =>
+  String(path ?? "import").split(/[\\/]/).pop()?.replace(/\.[^.]+$/, "") || "import";
+
+const isCliFormat = (value: unknown): value is CliTomlFormat =>
+  value === "rusty-conduit" || value === "rusty-conduit-ssh" || value === "rusty-conduit-switch";
+
+function mockTomlFormat(args?: Record<string, unknown>): { format: CliTomlFormat; detected: boolean } {
+  if (isCliFormat(args?.format)) return { format: args.format, detected: false };
+  return { format: /ssh/i.test(String(args?.path)) ? "rusty-conduit-ssh" : "rusty-conduit-switch", detected: true };
+}
+
+function importedProxy(name: string): Proxy {
+  return {
+    ...blankProxyFields(),
+    id: NIL,
+    name,
+    listeners: { bind: "127.0.0.1", http_port: 3140, socks_port: 1090, max_connections: 4096 },
+    profiles: [
+      { ...upstream("office", { type: "http" }, "192.0.2.90", 8080), username: "alice", password: { vault: crypto.randomUUID() } },
+      upstream("lab-socks", { type: "socks5" }, "198.51.100.20", 1080),
+    ],
+    routing: {
+      default: "direct",
+      resolve_dns: false,
+      rules: [{ name: "office", host_wildcard: "*.office.example", match_all: false, disabled: false, target: "office" }],
+    },
+  };
+}
+
+function setProxySource(args: Record<string, unknown> | undefined, source: Proxy["source"]): ProxySaveResult {
+  const view = findProxy({ id: args?.proxyId });
+  return saveProxy({ ...view.profile, source }, false);
+}
+
+function dispatchU4(command: string, args?: Record<string, unknown>): unknown {
+  switch (command) {
+    case "preview_airswitch_import":
+      return {
+        suggested_name: fileStem(args?.path),
+        profile_count: SAMPLE_IMPORTED.length,
+        rule_count: 1,
+        extracted_password_count: 1,
+        warnings: ["Rule list \"PAC script\" is browser-only and was skipped."],
+        profiles: SAMPLE_IMPORTED,
+      } satisfies AirSwitchPreview;
+    case "commit_airswitch_import": {
+      if (!vault.unlocked) throw new ApiError("vault_locked", "Unlock the vault to store imported passwords.");
+      const target = args?.targetProxyId ? findProxy({ id: args.targetProxyId }).profile : null;
+      const name = String(args?.proxyName ?? "").trim();
+      const fresh = importedProxy(name || fileStem(args?.path));
+      // Into a target: its profiles and routing are replaced; everything else stays.
+      const merged = target
+        ? { ...target, name: name || target.name, profiles: fresh.profiles, routing: fresh.routing }
+        : fresh;
+      const saved = saveProxy(merged, !target);
+      return {
+        proxy: saved.profile,
+        warnings: ["Rule list \"PAC script\" is browser-only and was skipped."],
+        stored_passwords: 1,
+      } satisfies AirSwitchCommitResult;
+    }
+    case "preview_toml_import": {
+      const { format, detected } = mockTomlFormat(args);
+      const ssh = format === "rusty-conduit-ssh";
+      return {
+        format,
+        detected,
+        proxy_name: `${format} import`,
+        tunnel_name: ssh ? `${format} import` : null,
+        profile_count: format === "rusty-conduit" ? 0 : SAMPLE_IMPORTED.length,
+        rule_count: format === "rusty-conduit-switch" ? 1 : 0,
+        extracted_password_count: format === "rusty-conduit-switch" ? 1 : 0,
+        warnings: [],
+        notes: ssh ? ["Pick an SSH key for the Tunnel's hop before starting it."] : [],
+        profiles: format === "rusty-conduit" ? [] : SAMPLE_IMPORTED,
+      } satisfies TomlImportPreview;
+    }
+    case "commit_toml_import": {
+      const { format } = mockTomlFormat(args);
+      const name = String(args?.name ?? "").trim() || `${format} import`;
+      if (format === "rusty-conduit-switch" && !vault.unlocked) {
+        throw new ApiError("vault_locked", "Unlock the vault to store imported passwords.");
+      }
+      let tunnel: Tunnel | null = null;
+      if (format === "rusty-conduit-ssh") {
+        tunnel = sampleTunnel(crypto.randomUUID(), name, "203.0.113.5");
+        tunnels = [...tunnels, { profile: tunnel, snapshot: tunnelSnapshot(tunnel, { state: "stopped" }), used_by: [] }];
+      }
+      const proxy = format === "rusty-conduit" ? { ...blankProxyFields(), id: NIL, name } : importedProxy(name);
+      const saved = saveProxy(proxy, true);
+      return {
+        format,
+        proxy: saved.profile,
+        tunnel,
+        warnings: [],
+        notes: tunnel ? ["Pick an SSH key for the Tunnel's hop before starting it."] : [],
+        stored_passwords: format === "rusty-conduit-switch" ? 1 : 0,
+      } satisfies TomlImportCommitResult;
+    }
+    case "export_proxy_toml": {
+      const view = findProxy({ id: args?.proxyId });
+      const format = isCliFormat(args?.format) ? args.format : "rusty-conduit-switch";
+      const p = view.profile;
+      if (format === "rusty-conduit-ssh" && tunnelIdsOf(p).length === 0) {
+        throw new ApiError("invalid", "rusty-conduit-ssh needs a Proxy that routes through one Tunnel.");
+      }
+      const toml = [
+        `# ${p.name}, exported for ${format}`,
+        "[listen]",
+        `bind = "${p.listeners.bind}"`,
+        `http_port = ${p.listeners.http_port}`,
+        `socks_port = ${p.listeners.socks_port}`,
+        ...p.profiles.flatMap((u) => [
+          "",
+          `[profiles.${JSON.stringify(u.name)}]`,
+          `type = "${u.kind.type}"`,
+          ...(u.password ? [`password_env = "RUSTY_CONDUIT_${u.name.toUpperCase().replace(/\W/g, "_")}_PASSWORD"`] : []),
+        ]),
+      ].join("\n");
+      const notes = p.profiles.some((u) => u.password)
+        ? ["Set the password_env variables before starting the CLI."]
+        : [];
+      return { format, toml, notes, path: (args?.path as string | null) ?? null } satisfies TomlExportResult;
+    }
+    case "link_proxy_external_toml":
+      return setProxySource(args, {
+        external_toml: { path: String(args?.path), debounce_ms: Math.min(Math.max(Number(args?.debounceMs) || 500, 250), 10_000) },
+      });
+    case "unlink_proxy_external_toml":
+      return setProxySource(args, "managed");
+    case "reload_proxy_external_toml": {
+      const view = findProxy({ id: args?.proxyId });
+      if (view.profile.source === "managed") throw new ApiError("invalid", "This Proxy is not linked to a TOML file.");
+      return saveProxy(view.profile, false);
+    }
+    default:
+      return NOT_HANDLED;
+  }
+}
+
 function dispatchV2(command: string, args?: Record<string, unknown>): unknown {
   switch (command) {
     case "list_proxies":
@@ -975,6 +1129,9 @@ function dispatch(command: string, args?: Record<string, unknown>): unknown {
         host_count: hosts.length,
         key_count: keys.length,
         ca_count: cas.length,
+        proxy_count: proxies.length,
+        tunnel_count: tunnels.length,
+        library_profile_count: library.length,
         secret_count: withSecrets ? keys.length + cas.length : 0,
         missing_secrets: 0,
       } satisfies ExportSummary;
@@ -990,6 +1147,15 @@ function dispatch(command: string, args?: Record<string, unknown>): unknown {
         presets_added: 0,
         presets_updated: 0,
         presets_skipped: 0,
+        proxies_added: 0,
+        proxies_updated: 0,
+        proxies_skipped: proxies.length,
+        tunnels_added: 0,
+        tunnels_updated: 0,
+        tunnels_skipped: tunnels.length,
+        library_profiles_added: 0,
+        library_profiles_updated: 0,
+        library_profiles_skipped: library.length,
         hosts_updated: 0,
         hosts_skipped: hosts.length,
         keys_added: 0,
@@ -1010,6 +1176,8 @@ function dispatch(command: string, args?: Record<string, unknown>): unknown {
     default: {
       const handled = dispatchV2(command, args);
       if (handled !== NOT_HANDLED) return handled;
+      const u4 = dispatchU4(command, args);
+      if (u4 !== NOT_HANDLED) return u4;
       throw new ApiError("invalid", `"${command}" is not available in the browser preview.`);
     }
   }

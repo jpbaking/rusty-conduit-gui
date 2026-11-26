@@ -5,6 +5,7 @@
 //! cannot be serialized, and return opaque metadata.
 
 pub mod export;
+pub mod import_export;
 pub mod keys;
 pub mod mitm_ca;
 pub mod parity;

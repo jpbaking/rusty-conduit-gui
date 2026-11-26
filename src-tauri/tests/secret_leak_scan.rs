@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use conduit_core::{
-    AuthMethod, ForwardConfig, HopEntry, HostKeyLookup, HostKeyRecord, HostProfile, KeyId,
+    AuthMethod, CliTomlFormat, ForwardConfig, HopEntry, HostKeyLookup, HostKeyRecord, HostProfile, KeyId,
     KeySource, KnownHostsStore, ListenerConfig, MitmCaId, MitmConfig, Proxy, RouteInbound,
     RouteOneOrMany, RoutingRule, RoutingTablesConfig, SecretRef, SessionProfile, Timestamp, Tunnel,
     UpstreamKind, UpstreamPasswordSource, UpstreamProfile,
@@ -798,12 +798,40 @@ async fn v2_proxies_tunnels_and_upstream_passwords_hold_no_secrets() {
         .controller
         .export_config(&sealed, true, Some(SecretInput::new(EXPORT_PASS)))
         .unwrap();
-    assert!(summary.encrypted && summary.secret_count >= 3, "keys and the MITM CA are sealed");
+    assert!(
+        summary.encrypted && summary.secret_count >= 4,
+        "keys, the MITM CA, and the vaulted upstream password are sealed"
+    );
+    assert_eq!((summary.proxy_count, summary.tunnel_count), (1, 1));
     let sealed_bytes = std::fs::read(&sealed).unwrap();
     assert_clean("v2 encrypted export", &sealed_bytes, &fx.forbidden);
     let parsed: serde_json::Value = serde_json::from_slice(&sealed_bytes).unwrap();
     let payload: Vec<u8> = serde_json::from_value(parsed["payload"].clone()).unwrap();
     assert_clean("v2 encrypted payload", &payload, &fx.forbidden);
+
+    // CLI TOML exports name an environment variable for the upstream password, never the value.
+    // This Proxy has routing rules, so only rusty-conduit-switch can express it; the
+    // rusty-conduit-ssh refusal is scanned too.
+    let mut toml_exports = 0;
+    for format in [CliTomlFormat::RustyConduitSwitch, CliTomlFormat::RustyConduitSsh] {
+        let file = fx.data_dir().join(format!("{}.toml", format.cli_name()));
+        match fx.controller.export_proxy_toml(proxy, format, Some(file.clone())) {
+            Ok(export) => {
+                assert!(export.toml.contains("password_env"), "the TOML names the env var");
+                assert_clean("cli toml export", export.toml.as_bytes(), &fx.forbidden);
+                let notes = serde_json::to_vec(&export.notes).unwrap();
+                assert_clean("cli toml export notes", &notes, &fx.forbidden);
+                assert_clean("cli toml export file", &std::fs::read(&file).unwrap(), &fx.forbidden);
+                toml_exports += 1;
+            }
+            Err(error) => {
+                assert_ne!(format, CliTomlFormat::RustyConduitSwitch, "switch must export");
+                assert_clean("cli toml export error", error.to_string().as_bytes(), &fx.forbidden);
+                assert!(!file.exists(), "a refused export writes nothing");
+            }
+        }
+    }
+    assert!(toml_exports >= 1);
 
     // config.json, known_hosts.json, and the raw vault.bin bytes.
     assert!(assert_tree_clean(&fx.data_dir(), &fx.forbidden) >= 3);
