@@ -14,7 +14,7 @@ permissions:
   contents: read
 
 env:
-  # Cargo.toml pulls rusty-conduit-engine from its git tag (v0.2.0); fetching it with the
+  # Cargo.toml pulls rusty-conduit-engine from its git tag (v0.4.0); fetching it with the
   # git CLI is more reliable on CI runners than Cargo's built-in git client.
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
   TAURI_CLI_VERSION: 2.12.6
