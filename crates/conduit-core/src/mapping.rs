@@ -38,6 +38,8 @@ pub enum MappingError {
     InvalidLogLevel(String),
     #[error("invalid log format: {0}")]
     InvalidLogFormat(String),
+    #[error("profile `{profile}` uses a vaulted password that was not resolved")]
+    MissingUpstreamPassword { profile: String },
 }
 
 /// Engine-facing settings for one session, built by [`to_engine_config`].
@@ -85,7 +87,7 @@ impl EngineConfig {
 }
 
 /// Parse a forward/reverse filter list into `rusty-conduit-engine` [`FilterRule`]s.
-fn parse_rules(scope: &'static str, rules: &[String]) -> Result<Vec<FilterRule>, MappingError> {
+pub(crate) fn parse_rules(scope: &'static str, rules: &[String]) -> Result<Vec<FilterRule>, MappingError> {
     rules
         .iter()
         .map(|r| {
@@ -99,7 +101,7 @@ fn parse_rules(scope: &'static str, rules: &[String]) -> Result<Vec<FilterRule>,
 }
 
 /// Build the mutually exclusive filter: allow rules win, then block rules, else unfiltered.
-fn host_filter(allow: Vec<FilterRule>, block: Vec<FilterRule>) -> Option<HostFilter> {
+pub(crate) fn host_filter(allow: Vec<FilterRule>, block: Vec<FilterRule>) -> Option<HostFilter> {
     if !allow.is_empty() {
         Some(HostFilter::Allow(allow))
     } else if !block.is_empty() {

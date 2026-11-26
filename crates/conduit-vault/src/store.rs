@@ -23,6 +23,10 @@ use crate::crypto::{decrypt_record, encrypt_record, generate_dek, Dek, VaultHead
 use crate::keyring::KeyringBackend;
 use crate::VaultError;
 
+/// Record type of an upstream proxy password (`UpstreamPasswordSource::Vault` in
+/// `conduit-core`). Bound into the record's AAD like every other record type.
+pub const UPSTREAM_PASSWORD_RECORD: &str = "upstream_password";
+
 /// A single encrypted secret record. The ciphertext is base64-encoded for the on-disk JSON form.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
@@ -310,6 +314,27 @@ impl Vault {
             .find(|r| r.id == id)
             .ok_or_else(|| VaultError::SecretNotFound {
                 ref_id: id.to_string(),
+            })?;
+        record.decrypt(dek)
+    }
+
+    /// Store an upstream proxy password as an [`UPSTREAM_PASSWORD_RECORD`], returning its id.
+    /// Requires the vault to be unlocked.
+    pub fn put_upstream_password(&mut self, password: &[u8]) -> Result<String, VaultError> {
+        self.put_secret(UPSTREAM_PASSWORD_RECORD, password)
+    }
+
+    /// Retrieve an upstream proxy password. A record of any other type is reported as
+    /// [`VaultError::SecretNotFound`], so a key or SSH password cannot be read through this
+    /// path. Requires the vault to be unlocked.
+    pub fn get_upstream_password(&self, ref_id: &str) -> Result<Zeroizing<Vec<u8>>, VaultError> {
+        let dek = self.dek.as_ref().ok_or(VaultError::Locked)?;
+        let record = self
+            .records
+            .iter()
+            .find(|r| r.id == ref_id && r.r#type == UPSTREAM_PASSWORD_RECORD)
+            .ok_or_else(|| VaultError::SecretNotFound {
+                ref_id: ref_id.to_string(),
             })?;
         record.decrypt(dek)
     }
@@ -628,6 +653,54 @@ mod tests {
         assert!(vault.rekey(&wrong, new, header).is_err());
         assert_eq!(fs::read(&path).unwrap(), before);
         assert_eq!(&*vault.get_secret(&id).unwrap(), b"alpha");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn upstream_password_round_trips_as_its_own_record_type() {
+        let path = tmp_vault("upstream-roundtrip");
+        let mut vault = Vault::create_with_password(&path, b"pw", Argon2Params::FAST).unwrap();
+        let id = vault.put_upstream_password(b"proxy-pw").unwrap();
+        assert_eq!(&vault.get_upstream_password(&id).unwrap()[..], b"proxy-pw");
+        let meta = vault.list_keys();
+        assert_eq!(meta.len(), 1);
+        assert_eq!(meta[0].r#type, UPSTREAM_PASSWORD_RECORD);
+
+        // Survives a save / reopen / unlock cycle.
+        drop(vault);
+        let mut reopened = Vault::open_locked(&path).unwrap();
+        reopened.unlock_with_password(b"pw").unwrap();
+        assert_eq!(&reopened.get_upstream_password(&id).unwrap()[..], b"proxy-pw");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn upstream_password_refused_while_locked() {
+        let path = tmp_vault("upstream-locked");
+        let mut vault = Vault::create_with_password(&path, b"pw", Argon2Params::FAST).unwrap();
+        let id = vault.put_upstream_password(b"proxy-pw").unwrap();
+        vault.lock();
+        assert!(matches!(vault.get_upstream_password(&id), Err(VaultError::Locked)));
+        assert!(matches!(vault.put_upstream_password(b"x"), Err(VaultError::Locked)));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn upstream_password_rejects_other_record_types() {
+        let path = tmp_vault("upstream-wrong-type");
+        let mut vault = Vault::create_with_password(&path, b"pw", Argon2Params::FAST).unwrap();
+        let ssh_pw = vault.put_secret("password", b"ssh-pw").unwrap();
+        let key = vault.put_secret("key", b"private").unwrap();
+        for id in [&ssh_pw, &key] {
+            assert!(matches!(
+                vault.get_upstream_password(id),
+                Err(VaultError::SecretNotFound { .. })
+            ));
+        }
+        assert!(matches!(
+            vault.get_upstream_password("no-such-id"),
+            Err(VaultError::SecretNotFound { .. })
+        ));
         let _ = fs::remove_file(&path);
     }
 }

@@ -48,11 +48,11 @@ use crate::reverse::{ReverseForward, ReverseProxy};
 use crate::state::{HostKeyPrompt, ListenerInfo, SessionState, StateCell};
 
 /// Queued inbound reverse channels per connection.
-const REVERSE_CHANNEL_CAPACITY: usize = 64;
+pub(crate) const REVERSE_CHANNEL_CAPACITY: usize = 64;
 /// Backstop for noticing a dead chain if no disconnect event arrives.
-const LIVENESS_POLL: Duration = Duration::from_secs(1);
+pub(crate) const LIVENESS_POLL: Duration = Duration::from_secs(1);
 /// A session has two forward ports, so a third pick is always different.
-const SOCKS_PORT_ATTEMPTS: usize = 3;
+pub(crate) const SOCKS_PORT_ATTEMPTS: usize = 3;
 /// The API-only `external` engine profile that carries all forward traffic through the SSH
 /// tunnel. Never shown in logs (routing fields are disabled).
 const TUNNEL_PROFILE: &str = "ssh-tunnel";
@@ -167,7 +167,7 @@ pub(crate) async fn run_session(
     cell.set(final_state);
 }
 
-fn halt_state(error: LinkError) -> SessionState {
+pub(crate) fn halt_state(error: LinkError) -> SessionState {
     match error {
         LinkError::Locked => SessionState::Locked,
         LinkError::Attention(reason) => SessionState::NeedsAttention { reason },
@@ -180,7 +180,7 @@ fn halt_state(error: LinkError) -> SessionState {
     }
 }
 
-fn describe(state: &SessionState) -> String {
+pub(crate) fn describe(state: &SessionState) -> String {
     match state {
         SessionState::NeedsAttention { reason } => format!("needs attention: {reason}"),
         SessionState::Failed { reason } => format!("failed: {reason}"),
@@ -196,7 +196,7 @@ enum ConnectionEnd {
 }
 
 /// The reconnect loop. Returns the terminal state; the caller performs the shutdown.
-async fn supervise(
+pub(crate) async fn supervise(
     link: &mut dyn Link,
     cell: &StateCell,
     control: &mut mpsc::UnboundedReceiver<Control>,
@@ -423,7 +423,7 @@ fn is_network_failure(detail: &str) -> bool {
         .any(|needle| detail.contains(needle))
 }
 
-fn classify_reverse(error: ReverseError) -> LinkError {
+pub(crate) fn classify_reverse(error: ReverseError) -> LinkError {
     match error {
         ReverseError::Duplicate(_) => LinkError::Fatal(error.to_string()),
         ReverseError::Request { .. } => LinkError::Transient {
@@ -433,7 +433,7 @@ fn classify_reverse(error: ReverseError) -> LinkError {
     }
 }
 
-fn vault_error(error: VaultError) -> LinkError {
+pub(crate) fn vault_error(error: VaultError) -> LinkError {
     match error {
         VaultError::Locked => LinkError::Locked,
         other => LinkError::Attention(format!("cannot read vault secret: {other}")),
@@ -548,7 +548,7 @@ impl Engine for DefaultEngine {
 
 /// Access-log settings: no `rule` / `profile` / `upstream` fields (there is no user-visible
 /// routing); each record is tagged with its `direction` by the logger clones.
-fn access_log_config(cfg: &EngineConfig) -> AccessLogConfig {
+pub(crate) fn access_log_config(cfg: &EngineConfig) -> AccessLogConfig {
     AccessLogConfig::new(
         cfg.log_level,
         cfg.log_format,
@@ -891,7 +891,7 @@ impl RusshLink {
 ///
 /// `forwards` and `bound` start in the same order, because the relay binds all or nothing. The
 /// role comes from the configured ports, since one port serving both is multiplexed.
-fn remote_listener_info(
+pub(crate) fn remote_listener_info(
     cfg: &conduit_core::ReverseConfig,
     forwards: &[ReverseForward],
     bound: &[(String, u32)],
@@ -1053,7 +1053,7 @@ impl Link for RusshLink {
 }
 
 /// Maps an `ssh` failure to what the supervisor must do.
-fn classify_openssh(error: OpenSshError) -> LinkError {
+pub(crate) fn classify_openssh(error: OpenSshError) -> LinkError {
     match error {
         // Never retried: these could lock an account or bypass host-key trust. Every hop was
         // pinned before `ssh` started, so an "unknown" key here is a trust failure too.
@@ -1080,7 +1080,7 @@ fn is_setup_failure(kind: std::io::ErrorKind) -> bool {
 /// When a hop cannot be written to `known_hosts`, returns a copy of `store` for the host-key
 /// probe. A pin without a usable public key is marked unapproved there, so a matching key
 /// prompts (and records the key) while a different key is still a hard "changed" stop.
-fn probe_store(store: &KnownHostsStore, profile: &SessionProfile) -> Option<KnownHostsStore> {
+pub(crate) fn probe_store(store: &KnownHostsStore, profile: &SessionProfile) -> Option<KnownHostsStore> {
     let mut scratch = store.clone();
     let mut incomplete = false;
     for hop in &profile.hops {
@@ -1106,7 +1106,7 @@ fn probe_store(store: &KnownHostsStore, profile: &SessionProfile) -> Option<Know
 }
 
 /// Builds the supervisor's hop list from the vault. Each hop's keys go in its own scoped agent.
-fn supervisor_hops(
+pub(crate) fn supervisor_hops(
     profile: &SessionProfile,
     vault: &Vault,
     logs: &LogRingBuffer,

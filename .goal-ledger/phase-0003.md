@@ -1,61 +1,58 @@
-# phase-0003 — Port conduit-runtime and src-tauri, remove rusty-conduit-ssh
+# phase-0003 — Build TunnelManager in conduit-runtime
 
 - Status: done
 - Owner: executor
 - Depends on: phase-0002
-- Goal: Port `conduit-runtime` (engine `Server`-backed `ReverseProxy` with direct egress, in-memory `MitmState::from_pem_bytes`, delete `mitm_ca_file.rs`, `RoutingState` external tunnel profile, `OpenSshDialer`) and `src-tauri` onto `rusty-conduit-engine`, and remove `rusty-conduit-ssh` from workspace `Cargo.toml`.
-- Done when: `rusty-conduit-ssh` is gone from `Cargo.toml`, `crates/`, and `src-tauri/src/` (except intentional U0 migration/legacy constants), and all Rust workspace clippy, tests, `secret_leak_scan`, and Linux tray compile check pass.
-- Pattern to follow: `../rusty-conduit-ssh/src/reverse.rs:32-144` (engine `Server` reverse proxy with direct egress) and `../rusty-conduit-ssh/src/lib.rs:52-89` (`forward_routing` + `access_log_config`)
+- Goal: Implement `TunnelManager` in `conduit-runtime` to supervise `conduit_core::Tunnel` lifecycles, expose live `Arc<dyn UpstreamDialer>` handles for Proxies, run `-R` reverse proxies and `-L`/`-R` port forwards, and report bound reverse listeners.
+- Done when: `TunnelManager` is exported from `conduit-runtime`, passes unit and loopback SSH tests (including `NotConnected` dial errors while stopped/reconnecting, reverse proxy, port forwards, host-key approval, and wake recycle), and existing `SessionManager` tests remain green.
+- Pattern to follow: `crates/conduit-runtime/src/manager.rs:120-250`, `crates/conduit-runtime/src/runner.rs:553-1010` (`RusshLink`, `OpenSshLink`), `crates/conduit-runtime/src/state.rs:28-191`
 
 ## Context
-- Keep the v1 data model: each `SessionProfile` maps via `conduit_core::to_engine_config` to one forward engine `Server` (routing every request to external profile `"ssh-tunnel"` backed by `StatsDialer(base)`, with `cfg.forward_filter` enforced by the router — no `FilteredDialer`) plus an optional direct-egress `ReverseProxy` `Server`.
-- Delete `crates/conduit-runtime/src/mitm_ca_file.rs` and remove `mod mitm_ca_file;` from `crates/conduit-runtime/src/lib.rs`. In `runner.rs`, read the MITM CA PEM bytes from the vault into `Option<Zeroizing<Vec<u8>>>` and pass them directly to `MitmState::from_pem_bytes(&pem, &pem, &cfg.mitm_options)` (for both forward and reverse MITM states; no temp files ever written).
-- Create `crates/conduit-runtime/src/reverse.rs` (declared `mod reverse;` in `lib.rs`):
-  - `pub(crate) struct ReverseForward { pub remote: SocketAddr, pub local: SocketAddr }` with `pub(crate) fn spec(&self) -> String` (format `ssh -R` spec, bracketing IPv6 addresses, e.g. `127.0.0.1:8080:127.0.0.1:50000` or `[::1]:8080:127.0.0.1:50000`) and `pub(crate) fn to_remote_forward(&self) -> RemoteForward`.
-  - `ReverseProxy::start(cfg: &EngineConfig, mitm_ca_pem: Option<&[u8]>, access: &AccessLogger, logger: &Logger) -> Result<Option<Self>, String>`: builds `RoutingInput` with `filter: None`, `mitm_enabled: cfg.mitm_enabled`, `keepalive: cfg.keepalive`, `connect_timeout: DEFAULT_CONNECT_TIMEOUT`, and `DialerOptions { filter: cfg.reverse_filter.clone().map(Arc::new), .. }` (so direct egress checks both hostname and locally resolved IPs), optional `MitmState::from_pem_bytes`, `AccessLogger` tagged with `ProxyDirection::Reverse` and `with_routing_fields(false)`, `EngineHandlers::from_routing` + optional `.with_mitm(...)`, `Server::bind` on ephemeral loopback ports (`127.0.0.1:0`) with `.with_max_connections(cfg.reverse_max_connections)` and `.with_tcp_keepalive(cfg.keepalive)`.
-- In `runner.rs`: build `AccessLogConfig::new(cfg.log_level, cfg.log_format, cfg.http_access_log.clone(), cfg.socks_log.clone()).with_routing_fields(false)`; tag forward access logger with `.with_direction(ProxyDirection::Forward)`; wire `OpenSshLink` with `conduit_openssh::{OpenSshDialer, TunnelState}`.
-- In `src-tauri/src/controller/mitm_ca.rs` and `src-tauri/src/controller/parity.rs`: switch `rusty_conduit_ssh` imports to `rusty_conduit_engine`.
-- Remove `rusty-conduit-ssh` from root `Cargo.toml` `[workspace.dependencies]`.
+- Keep existing `SessionManager` and `runner.rs` completely intact and working so `src-tauri` stays green until U3.
+- Create `crates/conduit-runtime/src/tunnel_manager.rs` (and export `TunnelManager`, `TunnelSnapshot`, `TunnelRuntimeEvent` or extend `RuntimeEvent` carefully without breaking existing `src-tauri` matches — prefer a dedicated `TunnelEvent` / `TunnelManager` API or additive methods so `src-tauri` needs zero changes in U2!).
+- Key design of `TunnelManager`:
+  - Owns `HashMap<TunnelId, Arc<TunnelSlot>>`, `SharedVault`, `Arc<RwLock<KnownHostsStore>>`, `ManagerConfig`, and a broadcast `TunnelEvent` bus (`StateChanged { tunnel_id, state }`, `KnownHostsChanged { tunnel_id, hop_id, host, port }`).
+  - Each `TunnelSlot` owns a persistent `Arc<dyn UpstreamDialer>` created at registration time (a `StatsDialer` wrapping a `SwitchableDialer` that holds either a `RusshDialer` or an `OpenSshDialer` depending on `tunnel.engine`, swapped when `tunnel.engine` changes or on connect/disconnect).
+  - **Critical for failover:** `TunnelManager::dialer(&self, id: TunnelId) -> Option<Arc<dyn UpstreamDialer>>` returns that persistent dialer handle. While the tunnel is `Stopped`, `Starting`, `Reconnecting`, `Locked`, `NeedsAttention`, or `Failed`, calling `connect()` on the dialer returns `DialError::NotConnected { kind: io::ErrorKind::NotConnected, .. }.into_io()` immediately, so an engine `FailoverDialer` (`["bastion", "direct"]`) falls through cleanly!
+  - Reuses existing `conduit-ssh` (`connect_chain`, `RusshDialer`, `ReverseRelay`, `StatsDialer`, `HostKeyVerifier`), `conduit-openssh` (`OpenSshSupervisor`, `OpenSshDialer`, `TunnelState`), `crate::reverse::ReverseProxy`, `crate::port_forward::LocalForwards`, `crate::backoff::Backoff`, and `crate::logs::LogRingBuffer`.
+  - Runs the same lockout-safe supervisor loop as `runner.rs`: never auto-retries `AuthFailed`, `HostKeyChanged`, `Locked`, or `InvalidProfile`; supports `approve_host_key`, `reject_host_key`, `on_system_wake`, `start`, `stop`, `restart`, `stop_all`, `snapshot`, `snapshots`, `logs`, `upsert_tunnel`, `remove_tunnel`.
+  - Tracks bound local reverse-proxy listeners (`reverse_listeners(&self) -> Vec<SocketAddr>`) so `ProxyManager` can include them in cross-Proxy self-loop checks.
+  - Supports Linked reference counting: `acquire_linked(&self, id: TunnelId, holder: ProxyId)` (increments linked holders; starts the tunnel if `start_mode == TunnelStartMode::Linked`) and `release_linked(&self, id: TunnelId, holder: ProxyId)` (removes holder; stops the tunnel if `start_mode == TunnelStartMode::Linked` and no holders remain).
 - Always use `CARGO_NET_GIT_FETCH_WITH_CLI=true` when running cargo commands.
 
 ## Scope
-- In: `Cargo.toml`, `Cargo.lock`, `crates/conduit-runtime/Cargo.toml`, `crates/conduit-runtime/src/lib.rs`, `crates/conduit-runtime/src/mitm_ca_file.rs` (delete), `crates/conduit-runtime/src/reverse.rs` (create), `crates/conduit-runtime/src/runner.rs`, `crates/conduit-runtime/src/port_forward.rs`, `crates/conduit-runtime/src/logs.rs`, `crates/conduit-runtime/tests/e2e_runtime.rs`, `src-tauri/Cargo.toml`, `src-tauri/src/controller/mitm_ca.rs`, `src-tauri/src/controller/parity.rs`
-- Out: `crates/conduit-core/`, `crates/conduit-ssh/`, `crates/conduit-openssh/`, `crates/conduit-tray/`, `crates/conduit-vault/`, `src-tauri/src/migration.rs`, `src-tauri/ui/`, `.github/`, `scripts/`, `docs/`
+- In: `crates/conduit-runtime/src/lib.rs`, `crates/conduit-runtime/src/tunnel_manager.rs` (create), `crates/conduit-runtime/src/runner.rs` (only if making shared helper functions `pub(crate)`), `crates/conduit-runtime/src/reverse.rs` (only if adding a `local_listeners(&self) -> Vec<SocketAddr>` getter)
+- Out: `crates/conduit-core/`, `crates/conduit-ssh/`, `crates/conduit-openssh/`, `crates/conduit-vault/`, `crates/conduit-tray/`, `src-tauri/`
 
 ## Sub-tasks
-1. [done] Switch `crates/conduit-runtime/Cargo.toml` and `src-tauri/Cargo.toml` from `rusty-conduit-ssh` to `rusty-conduit-engine = { workspace = true }`, and remove `rusty-conduit-ssh` from root `Cargo.toml` `[workspace.dependencies]` — done when: no `Cargo.toml` in the workspace references `rusty-conduit-ssh`.
-2. [done] Delete `crates/conduit-runtime/src/mitm_ca_file.rs`, remove `mod mitm_ca_file;` from `crates/conduit-runtime/src/lib.rs`, and create `crates/conduit-runtime/src/reverse.rs` implementing `ReverseProxy` on `rusty_conduit_engine::server::Server` with direct egress, `DialerOptions.filter`, in-memory `MitmState::from_pem_bytes`, and unit tests — done when: `mitm_ca_file.rs` is deleted and `reverse.rs` compiles and tests direct-egress filtering & listen plans.
-3. [done] Port `crates/conduit-runtime/src/runner.rs`, `crates/conduit-runtime/src/port_forward.rs`, `crates/conduit-runtime/src/logs.rs`, and `crates/conduit-runtime/tests/e2e_runtime.rs` to `rusty_conduit_engine`, `conduit_core::to_engine_config`, `MitmState::from_pem_bytes`, `crate::reverse::ReverseProxy`, and `conduit_openssh::{OpenSshDialer, TunnelState}` — done when: `CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test -p conduit-runtime` passes all unit and E2E tests.
-4. [done] Port `src-tauri/src/controller/mitm_ca.rs` and `src-tauri/src/controller/parity.rs` imports to `rusty_conduit_engine` — done when: `src-tauri` compiles and passes all tests including `secret_leak_scan` and `conduit_check_tauri_tray`.
-5. [done] Run `## Verify` and record observed results in `## Evidence` — done when: every command in `## Verify` exits 0.
-6. [done] Fix-up: `## Verify` clippy failed with `wrong_self_convention` on `ReverseForward::to_remote_forward(&self)` because the struct derived `Copy`; drop `Copy` from the derive to keep the specified `&self` signature — done when: `cargo clippy --workspace --all-targets -- -D warnings` passes.
+1. [done] Add `pub(crate) fn local_listeners(&self) -> Vec<SocketAddr>` to `ReverseProxy` in `crates/conduit-runtime/src/reverse.rs` and expose shared classify/resolve helpers in `runner.rs` as `pub(crate)` without altering `SessionManager` behavior — done when: existing `conduit-runtime` tests compile and pass unchanged.
+2. [done] Create `crates/conduit-runtime/src/tunnel_manager.rs` implementing `TunnelManager`, `TunnelSnapshot`, `TunnelEvent`, `SwitchableDialer` (always returning `DialError::NotConnected` when down/reconnecting), full `russh` + `OpenSSH` supervision, `-R` reverse proxy + `-L`/`-R` port forwards, `approve_host_key`/`reject_host_key`, `on_system_wake`, `reverse_listeners()`, and `acquire_linked`/`release_linked` — done when: `tunnel_manager.rs` compiles with zero warnings.
+3. [done] Export `TunnelManager`, `TunnelSnapshot`, and `TunnelEvent` from `crates/conduit-runtime/src/lib.rs` and add unit & loopback SSH tests in `tunnel_manager.rs` verifying: (a) dialer returns `NotConnected` while stopped and succeeds once connected, (b) `Linked` acquire/release starts and stops the tunnel cleanly, (c) `Manual` tunnel is not stopped on `release_linked`, (d) host-key approval flow, (e) auth failure halts without retry — done when: `cargo test -p conduit-runtime` passes all existing and new tests.
+4. [done] Run `## Verify` and record observed results in `## Evidence` — done when: `## Verify` exits 0.
+5. [done] Fix-up: replace `result.err().expect(..)` in the `assert_not_connected` test helper with a `let Err(..) else panic!` (clippy `err_expect` under `-D warnings`; `UpstreamStream` has no `Debug`, so `expect_err` is not usable) — done when: `## Verify` exits 0.
 
 ## Verify
 ```sh
-CARGO_NET_GIT_FETCH_WITH_CLI=true cargo clippy --workspace --all-targets -- -D warnings && CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test --workspace && CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test -p rusty-conduit-gui --test secret_leak_scan && CARGO_NET_GIT_FETCH_WITH_CLI=true RUSTFLAGS="--cfg conduit_check_tauri_tray" cargo check -p rusty-conduit-gui --tests --features tauri/tray-icon && ! git grep -n "rusty_conduit_ssh" -- crates/ src-tauri/ && ! git grep -n "rusty-conduit-ssh" -- Cargo.toml crates/*/Cargo.toml src-tauri/Cargo.toml
+CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test -p conduit-runtime && CARGO_NET_GIT_FETCH_WITH_CLI=true cargo clippy -p conduit-runtime --all-targets -- -D warnings
 ```
 
 ## Escalate when
-- `e2e_runtime.rs` MITM or reverse proxy or OpenSSH E2E tests fail due to behavioral differences in `rusty-conduit-engine` `v0.2.0` → stop, set Status: needs-human — reason: report the exact failing test and assertion diff
-- `check-pure-rust-crypto.py` or `secret_leak_scan` flags a new crate or dependency issue → stop, set Status: needs-human — reason: report the exact scan failure
+- `runner.rs` helpers cannot be reused cleanly without changing `SessionManager` public API → stop, set Status: needs-human — reason: describe the conflict
 
 ## Log
 - (append-only, one line per event)
-- sub-task 1: switched conduit-runtime and src-tauri Cargo.toml to `rusty-conduit-engine = { workspace = true }`; removed `rusty-conduit-ssh` from root `[workspace.dependencies]`
-- sub-task 2: deleted `mitm_ca_file.rs`, swapped `mod mitm_ca_file;` for `mod reverse;`, created `reverse.rs` (`ReverseForward` with `spec`/`to_remote_forward`, `reverse_listen_plan`, `reverse_routing` with `DialerOptions.filter`, `ReverseProxy::start` with in-memory `MitmState::from_pem_bytes`) plus 4 unit tests
-- sub-task 3: ported `runner.rs` (`to_engine_config`, `forward_routing` to external `ssh-tunnel` profile over `StatsDialer`, no `FilteredDialer`, `access_log_config` with routing fields off, Forward/Reverse direction tags, CA PEM held as `Zeroizing<Vec<u8>>` and passed to `from_pem_bytes`, `OpenSshDialer`/`TunnelState`), `port_forward.rs`, `logs.rs`, and the `e2e_runtime.rs` comment
-- sub-task 4: switched `src-tauri/src/controller/mitm_ca.rs` (`mitm::ca::{CaError, CaMaterial}`) and `parity.rs` (`filter::{FilterRule, HostFilter}`) imports to `rusty_conduit_engine`
-- sub-task 5: first `## Verify` run failed at clippy (`wrong_self_convention` in `reverse.rs`); added fix-up sub-task 6
-- sub-task 6: removed `Copy` from `ReverseForward` derive; clippy clean
-- sub-task 5: re-ran `## Verify` → exit 0
+- began phase (commit 9672ca7)
+- sub-task 1: added `ReverseProxy::local_listeners()` (reverse.rs); made runner.rs helpers `pub(crate)` (supervise, halt_state, describe, classify_reverse, vault_error, access_log_config, remote_listener_info, classify_openssh, probe_store, supervisor_hops, REVERSE_CHANNEL_CAPACITY, LIVENESS_POLL, SOCKS_PORT_ATTEMPTS); no signature or behavior change
+- sub-task 2: created tunnel_manager.rs: TunnelManager, TunnelSnapshot, TunnelEvent (+TunnelEventReceiver, TunnelError), SwitchableDialer gated on `Connected` behind a persistent StatsDialer, RusshTunnelLink/OpenSshTunnelLink reusing runner `supervise`, reverse proxy + -L/-R forwards, host-key approve/reject, on_system_wake, reverse_listeners, acquire_linked/release_linked; shared runner helpers take a hop-only `SessionProfile` shim so their signatures stay unchanged
+- sub-task 3: exported TunnelManager/TunnelSnapshot/TunnelEvent/TunnelEventReceiver/TunnelError from lib.rs; added 7 scripted + 4 loopback russh tests (loopback server included via `#[path]` from conduit-ssh/tests/common)
+- sub-task 4: first Verify run failed on clippy `err_expect` in a test helper; appended fix-up sub-task 5, fixed, Verify exit 0
+- extra check: `cargo check -p rusty-conduit-gui` clean with zero src-tauri changes
 
 ## Evidence
 - (append-only: command → observed result)
-- `git grep -n "rusty-conduit-ssh" -- Cargo.toml crates/*/Cargo.toml src-tauri/Cargo.toml` → no matches (rc=1)
-- `cargo test -p conduit-runtime --lib reverse` → 4 passed (spec_brackets_ipv6_and_maps_to_remote_forward, reverse_plan_uses_ephemeral_loopback, start_binds_loopback_listeners_and_reports_forwards, reverse_filter_checks_resolved_ips_for_hostnames)
-- `CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test -p conduit-runtime` → lib 63 passed, e2e_runtime 9 passed, openssh_e2e 9 passed, 0 failed
-- `git grep -n rusty_conduit_ssh -- crates/ src-tauri/` → no matches; `cargo build -p rusty-conduit-gui --all-targets` → exit 0, no warnings
-- `## Verify` run 1 → FAILED at clippy: `error: methods with the following characteristics: (to_* and self type is Copy) usually take self by value` (conduit-runtime lib)
-- `cargo clippy -p conduit-runtime --all-targets -- -D warnings` (after fix-up 6) → Finished, no warnings
-- `## Verify` run 2 → VERIFY_RC=0: clippy OK; `cargo test --workspace` all pass (conduit-core 69, conduit-openssh 57+6, conduit-runtime 63+9+9, conduit-ssh 58+12, conduit-tray 23+1, conduit-vault 41 (1 ignored)+6, rusty-conduit-gui 132 + secret_leak_scan 5); secret_leak_scan 5 passed; tray check OK; both `git grep` guards empty
-- extra: `grep -c rusty-conduit-ssh Cargo.lock` → 0; `python3 scripts/check-pure-rust-crypto.py` → PURE_RUST_CRYPTO_OK
+- sub-task 1: `CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test -p conduit-runtime` → lib 63 passed, e2e_runtime 9 passed, openssh_e2e 9 passed, 0 failed (only warning: `local_listeners` unused, consumed in sub-task 2); `crates/conduit-runtime/src/reverse.rs:171`
+- sub-task 2: `CARGO_NET_GIT_FETCH_WITH_CLI=true cargo clippy -p conduit-runtime` → no warnings, no errors; `crates/conduit-runtime/src/tunnel_manager.rs:202` (SwitchableDialer), `:915` (TunnelManager), `:1002` (dialer), `:1102`/`:1117` (acquire/release_linked), `:1195` (on_system_wake), `:1216` (reverse_listeners)
+- sub-task 3: `CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test -p conduit-runtime --lib tunnel_manager` → 11 passed, 0 failed (dialer_is_persistent_and_refuses_while_not_connected, linked_acquire_and_release_start_and_stop_the_tunnel, disabled_linked_tunnel_is_not_started_by_a_holder, manual_tunnel_is_not_started_or_stopped_by_holders, system_wake_recycles_connected_tunnels_once, invalid_tunnel_is_refused_before_start, tunnel_event_serializes_with_tunnel_id, loopback_dialer_refuses_while_stopped_and_carries_traffic_when_connected, loopback_host_key_approval_pins_and_connects, loopback_auth_failure_halts_without_retry, loopback_reverse_proxy_and_port_forwards_run_and_report_listeners); `crates/conduit-runtime/src/lib.rs:25`
+- sub-task 4 (first run): `## Verify` → tests all pass; clippy error `called .err().expect() on a Result value` at tunnel_manager.rs test helper → exit 101
+- sub-task 5 / Verify: `CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test -p conduit-runtime && CARGO_NET_GIT_FETCH_WITH_CLI=true cargo clippy -p conduit-runtime --all-targets -- -D warnings` → EXIT=0; lib 74 passed, e2e_runtime 9 passed, openssh_e2e 9 passed, doc 0; clippy clean
+- extra: `CARGO_NET_GIT_FETCH_WITH_CLI=true cargo check -p rusty-conduit-gui` → Finished, no warnings/errors

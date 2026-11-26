@@ -859,6 +859,15 @@ pub struct AppConfig {
     /// Set once the built-in presets were added, so deleting one is not undone on next start.
     #[serde(default)]
     pub forward_presets_seeded: bool,
+    /// v2 SSH tunnels (U2). Empty in v1 documents.
+    #[serde(default)]
+    pub tunnels: Vec<crate::v2_model::Tunnel>,
+    /// v2 proxies (U2). Empty in v1 documents.
+    #[serde(default)]
+    pub proxies: Vec<crate::v2_model::Proxy>,
+    /// Shared upstream profiles any Proxy can reference.
+    #[serde(default)]
+    pub profile_library: Vec<crate::v2_model::UpstreamProfile>,
 }
 
 impl AppConfig {
@@ -1048,5 +1057,32 @@ mod tests {
         assert_eq!(hop.hop_id, "target");
         let saved = serde_json::to_string(&hop).unwrap();
         assert!(!saved.contains("agent_forward"), "{saved}");
+    }
+
+    #[test]
+    fn v1_app_config_loads_with_empty_v2_collections() {
+        let json = r#"{
+            "schema_version": 1,
+            "sessions": [{
+                "name": "legacy",
+                "hops": [],
+                "forward": { "enabled": true, "http_port": 3128, "socks_port": 1080 },
+                "reverse": {}
+            }],
+            "hosts": [],
+            "keys": [],
+            "mitm_cas": [],
+            "forward_presets": [],
+            "forward_presets_seeded": true
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.sessions.len(), 1);
+        assert_eq!(config.sessions[0].name, "legacy");
+        assert!(config.tunnels.is_empty());
+        assert!(config.proxies.is_empty());
+        assert!(config.profile_library.is_empty());
+        let reloaded: AppConfig =
+            serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert_eq!(reloaded, config);
     }
 }

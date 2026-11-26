@@ -182,6 +182,25 @@ fn binds_overlap(a: IpAddr, b: IpAddr) -> bool {
 
 /// What makes forward `index` unusable, given the rest of the profile.
 fn port_forward_problem(profile: &SessionProfile, index: usize, forward: &PortForward) -> Option<String> {
+    port_forward_problem_in(
+        &profile.port_forwards,
+        index,
+        forward,
+        Some((profile.forward.bind, profile.forward.effective_ports())),
+        (profile.reverse.reverse_bind, profile.reverse.effective_ports()),
+    )
+}
+
+/// What makes `forwards[index]` unusable. `local_proxy` / `remote_proxy` are the `(bind,
+/// (http, socks))` listeners a forward in that direction must not collide with; a `Tunnel`
+/// has no local proxy, so it passes `None`.
+pub(crate) fn port_forward_problem_in(
+    forwards: &[PortForward],
+    index: usize,
+    forward: &PortForward,
+    local_proxy: Option<(IpAddr, (u16, u16))>,
+    remote_proxy: (IpAddr, (u16, u16)),
+) -> Option<String> {
     if forward.port == 0 {
         return Some("choose a listen port from 1 to 65535".into());
     }
@@ -194,16 +213,16 @@ fn port_forward_problem(profile: &SessionProfile, index: usize, forward: &PortFo
     if !forward.enabled {
         return None;
     }
-    let (proxy_bind, (http, socks), side) = match forward.direction {
-        ForwardDirection::Local => (profile.forward.bind, profile.forward.effective_ports(), "forward"),
-        ForwardDirection::Remote => {
-            (profile.reverse.reverse_bind, profile.reverse.effective_ports(), "reverse")
-        }
+    let proxy = match forward.direction {
+        ForwardDirection::Local => local_proxy.map(|p| (p, "forward")),
+        ForwardDirection::Remote => Some((remote_proxy, "reverse")),
     };
-    if binds_overlap(forward.bind, proxy_bind) && [http, socks].contains(&forward.port) {
-        return Some(format!("port {} is already used by the {side} proxy", forward.port));
+    if let Some(((proxy_bind, (http, socks)), side)) = proxy {
+        if binds_overlap(forward.bind, proxy_bind) && [http, socks].contains(&forward.port) {
+            return Some(format!("port {} is already used by the {side} proxy", forward.port));
+        }
     }
-    let earlier = profile.port_forwards[..index].iter().any(|other| {
+    let earlier = forwards[..index].iter().any(|other| {
         other.enabled
             && other.direction == forward.direction
             && other.port == forward.port
@@ -245,7 +264,7 @@ fn denied_option(text: &str) -> Option<&'static str> {
 /// Every token is checked as a possible option, so the value after a separate `-o` is caught
 /// without tracking position. Short flags are walked like getopt, so `-Fconfig`, `-i/path`,
 /// and clusters such as `-vA` or `-voProxyCommand=x` all match.
-fn denylisted_flag(token: &str) -> Option<&'static str> {
+pub(crate) fn denylisted_flag(token: &str) -> Option<&'static str> {
     let undashed = token
         .strip_prefix("--")
         .or_else(|| token.strip_prefix('-'))
@@ -275,28 +294,37 @@ fn denylisted_flag(token: &str) -> Option<&'static str> {
 /// Mirror of the TCP keepalive range checks in `Config::validate` (Linux kernel limits).
 fn tcp_keepalive(profile: &SessionProfile) -> Result<(), ValidateError> {
     let t = &profile.tunnel;
-    if t.tcp_keepalive.is_zero() {
+    keepalive_problem(t.tcp_keepalive, t.tcp_keepalive_interval, t.tcp_keepalive_retries)
+}
+
+/// TCP keepalive range checks (interval / retries only while keepalive is on).
+pub(crate) fn keepalive_problem(
+    idle: Duration,
+    interval: Duration,
+    retries: u32,
+) -> Result<(), ValidateError> {
+    if idle.is_zero() {
         return Ok(());
     }
     let range = Duration::from_secs(1)..=MAX_TCP_KEEPALIVE_DURATION;
     let max = MAX_TCP_KEEPALIVE_DURATION.as_secs();
     let fmt = |d: Duration| humantime::format_duration(d).to_string();
-    if !range.contains(&t.tcp_keepalive) {
+    if !range.contains(&idle) {
         return Err(ValidateError::InvalidKeepalive(format!(
             "--tcp-keepalive must be 0 (disabled) or between 1s and {max}s (got {})",
-            fmt(t.tcp_keepalive)
+            fmt(idle)
         )));
     }
-    if !range.contains(&t.tcp_keepalive_interval) {
+    if !range.contains(&interval) {
         return Err(ValidateError::InvalidKeepalive(format!(
             "--tcp-keepalive-interval must be between 1s and {max}s (got {})",
-            fmt(t.tcp_keepalive_interval)
+            fmt(interval)
         )));
     }
-    if !(1..=MAX_TCP_KEEPALIVE_RETRIES).contains(&t.tcp_keepalive_retries) {
+    if !(1..=MAX_TCP_KEEPALIVE_RETRIES).contains(&retries) {
         return Err(ValidateError::InvalidKeepalive(format!(
             "--tcp-keepalive-retries must be between 1 and {MAX_TCP_KEEPALIVE_RETRIES} (got {})",
-            t.tcp_keepalive_retries
+            retries
         )));
     }
     Ok(())

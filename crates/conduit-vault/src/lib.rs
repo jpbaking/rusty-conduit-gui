@@ -21,7 +21,7 @@ pub use keys::{
     KeyGenAlgorithm, KeyInfo,
 };
 pub use keyring::{KeyringBackend, MemoryKeyringBackend, OsKeyringBackend};
-pub use store::{Record, Vault};
+pub use store::{Record, Vault, UPSTREAM_PASSWORD_RECORD};
 
 use std::path::PathBuf;
 

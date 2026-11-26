@@ -1,50 +1,70 @@
-# phase-0004 — Update CI/release workflows, validate-release-config.py, docs/TODO.md, and run full verification
+# phase-0004 — Build ProxyManager in conduit-runtime (hot-reload, overrides, Route Tester, Test Upstream, counters)
 
 - Status: done
 - Owner: executor
 - Depends on: phase-0003
-- Goal: Update CI/release workflows and `scripts/validate-release-config.py` to check out `rusty-conduit-engine` (`v0.2.0`), clear the resolved MITM CA loader items in `docs/TODO.md`, and verify the entire local CI suite passes cleanly.
-- Done when: CI/release workflows and `validate-release-config.py` reference `rusty-conduit-engine` (`v0.2.0`), `docs/TODO.md` has the two resolved CA items cleared, and the full verification suite (Rust, Python, Frontend) exits 0.
-- Pattern to follow: `.github/workflows/ci.yml:13-17`, `.github/workflows/ci.yml:68-75`, `.github/workflows/release.yml:16-20`, `.github/workflows/release.yml:94-101`, `scripts/validate-release-config.py:221-225`
+- Goal: Implement `ProxyManager` in `conduit-runtime` wired to `TunnelManager`, supporting zero-downtime `ArcSwap` hot-reload, tray overrides, Linked tunnel lifecycle, Route Tester, Test Upstream probe, per-rule/profile counters, and structured `AccessRecord` log sink.
+- Done when: `ProxyManager` and its types are exported from `conduit-runtime`, pass unit tests and `clippy -D warnings`, and existing `SessionManager` tests remain green.
+- Pattern to follow: `docs/MASTER-PLAN.md:134-164`, `../rusty-conduit-engine/src/routing.rs:687-1080` (`RoutingState`, `SharedRouting`, `RoutingCounters`), `../rusty-conduit-engine/src/router/mod.rs:40-460` (`ParsedTarget`, `RouteRequest`, `Router`)
 
 ## Context
-- `.github/workflows/ci.yml` and `.github/workflows/release.yml` currently set `UPSTREAM_REPO` to `jpbaking/rusty-conduit-ssh`, `UPSTREAM_REF` to `v1.3.0`, and check out to `path: rusty-conduit-ssh`. Update both to `jpbaking/rusty-conduit-engine`, `v0.2.0`, and `path: rusty-conduit-engine` (including the step name and comment).
-- `scripts/validate-release-config.py:223` checks `if not {"rusty-conduit-gui", "rusty-conduit-ssh"} <= paths:` — update `"rusty-conduit-ssh"` to `"rusty-conduit-engine"`.
-- Both MITM CA loader items in `docs/TODO.md` (explicit EC curve parameters for P-256/P-384 and clear error/hint for PBES2 HMAC-SHA1 PRF `1.2.840.113549.2.7`) are resolved in `rusty-conduit-engine` `v0.2.0` (`src/mitm/ca.rs`). Clear those resolved items from `docs/TODO.md` (keep `docs/TODO.md` clean with a brief note or empty TODO list).
-- Do NOT touch intentional U0 migration/legacy constants (`src-tauri/src/migration.rs`, `src-tauri/windows/nsis-hooks.nsh`, `TRAY_ID` in `linux_ksni.rs` / `tray_tauri.rs`).
+- Create `crates/conduit-runtime/src/proxy_manager.rs` (exported from `crates/conduit-runtime/src/lib.rs`).
+- `ProxyState` enum (`#[serde(tag = "state", rename_all = "snake_case")]`): `Stopped`, `Starting`, `Running { override_profile: Option<String>, config_generation: u64, restart_required: bool }`, `Reloading`, `Locked`, `NeedsAttention { reason: String }`, `Stopping`.
+- `ProxySnapshot`: `id: ProxyId`, `name: String`, `enabled: bool`, `state: ProxyState`, `listeners: Vec<ListenerInfo>`, `config_generation: u64`, `override_profile: Option<String>`, `restart_required: bool`, `profile_counters: BTreeMap<String, TrafficSnapshot>`, `rule_counters: BTreeMap<String, TrafficSnapshot>` (using a serde-serializable mirror `ProxyTrafficSnapshot { active, bytes_in, bytes_out, hits }` since engine's `TrafficSnapshot` may not derive `Serialize`), `referenced_tunnels: Vec<TunnelId>`.
+- `ProxyManager` holds `Arc<TunnelManager>`, `SharedVault`, `ManagerConfig`, `HashMap<ProxyId, Arc<ProxySlot>>`, and a `ProxyEvent` broadcast bus (`StateChanged { proxy_id, state }`, `Reloaded { proxy_id, config_generation }`, `OverrideChanged { proxy_id, override_profile }`).
+- **Start flow (`start(id)`):**
+  1. Validate `proxy` via `validate_proxy(&proxy, &known_tunnels, &other_listeners)` where `other_listeners` collects all bound listeners of other running Proxies plus `tunnels.reverse_listeners()` (and also check listener port conflicts against other running Proxies).
+  2. Check vault: if any profile has `UpstreamPasswordSource::Vault(_)` or `proxy.mitm` has a CA and vault is locked → transition to `ProxyState::Locked` and return `Err(ProxyError::VaultLocked)`.
+  3. Resolve vaulted upstream passwords into `BTreeMap<String, Zeroizing<String>>` and optional MITM CA PEM bytes into `Option<Zeroizing<Vec<u8>>>`.
+  4. Build `RoutingInput` via `proxy_to_routing_input(&proxy, &passwords, &other_listeners)`, attach every referenced Tunnel's dialer (`tunnels.dialer(tid)`) via `DialerOptions::with_external(profile.name, dialer)`, compile `RoutingState::from_input` → `SharedRouting` (`Arc<ArcSwap<RoutingState>>`).
+  5. Build `MitmState::from_pem_bytes` if MITM enabled.
+  6. Acquire Linked Tunnels (`tunnels.acquire_linked(tid, proxy.id)`) staggered if multiple, then bind `Server::from_options(&proxy_server_options(&proxy), handlers, logger)` with `.with_runtime(Arc::clone(&shared_routing))` so client TCP keepalive also hot-reloads! Spawn `server.run()` and optional MITM cert reaper.
+  7. Support an optional `AccessRecordSink` (or bounded ring buffer of structured `AccessRecord` entries per Proxy) alongside `LogRingBuffer`.
+- **Zero-downtime hot-reload (`upsert_proxy(proxy)` / `reload(id)`):**
+  - Compare running baseline config vs updated `Proxy`: changes to `listeners` (`bind`, `http_port`, `socks_port`, `max_connections`), `mitm` (on/off, CA, TTL, cache max, `socks_block_web`), or `logging` sinks set `restart_required = true` (do not rebind listeners).
+  - Compile the next `RoutingState` (re-resolving vaulted passwords, attaching referenced tunnel dialers, checking cross-Proxy + reverse-listener self-loops), preserving existing `RoutingCounters` via `.with_counters(prev.counters().clone())` and setting `.with_generation(next_gen)`.
+  - On success: update saved `compiled_routing`, atomically `shared_routing.store(Arc::new(next_state))` (unless a tray override is currently active, in which case keep the saved state updated and re-apply override if profile still exists or clear override), reconcile `acquire_linked` / `release_linked` for added/removed tunnel refs, and emit `Reloaded`.
+  - On failure: keep current `RoutingState` untouched and return `Err(ProxyError::...)`.
+- **Tray overrides (`set_override(id, override_profile: Option<String>)`):**
+  - `Some(profile_name)` (e.g. `"direct"` or any configured profile name): build a temporary rule-less `RoutingState` whose default target is `OneOrMany::One(profile_name)` using the current proxy's profiles/external dialers/keepalive/timeout/filter and preserving `RoutingCounters`, then `shared_routing.store(...)`.
+  - `None` (*Auto Switch*): restore the saved compiled `RoutingState` via `shared_routing.store(...)`.
+- **Route Tester (`test_route(proxy: &Proxy, raw_target: &str, inbound: RouteInbound) -> Result<RouteTestResult, ProxyError>`):**
+  - Parses `raw_target` with `rusty_conduit_engine::router::ParsedTarget::parse(raw_target)`, builds `RoutingInput` (using dummy placeholder passwords so vault isn't needed for route testing) + `Router::from_input`, evaluates `RouteRequest`, and returns `RouteTestResult { table, matched_rule, blocked_by_filter, filter_reason, targets: Vec<RouteTestTarget { profile, redacted_upstream, bypassed }> }`.
+- **Test Upstream (`test_upstream(&self, proxy: &Proxy, profile_name: &str, host: &str, port: u16, timeout: Duration) -> Result<UpstreamProbeResult, ProxyError>`):**
+  - Resolves vaulted password (if needed) or Tunnel dialer from `TunnelManager`, dials `host:port` through that profile's `UpstreamDialer`, and returns `UpstreamProbeResult { ok: bool, elapsed_ms: u64, redacted_upstream: String, error: Option<String> }` (never leaking passwords).
 - Always use `CARGO_NET_GIT_FETCH_WITH_CLI=true` when running cargo commands.
 
 ## Scope
-- In: `.github/workflows/ci.yml`, `.github/workflows/release.yml`, `scripts/validate-release-config.py`, `docs/TODO.md`
-- Out: `Cargo.toml`, `crates/`, `src-tauri/`, `docs/MASTER-PLAN.md`, `docs/RELEASING.md`
+- In: `crates/conduit-runtime/Cargo.toml` (only if `arc-swap` is needed directly), `crates/conduit-runtime/src/lib.rs`, `crates/conduit-runtime/src/proxy_manager.rs` (create), `Cargo.lock`
+- Out: `Cargo.toml`, `crates/conduit-core/`, `crates/conduit-ssh/`, `crates/conduit-openssh/`, `crates/conduit-vault/`, `crates/conduit-tray/`, `src-tauri/`
 
 ## Sub-tasks
-1. [done] Update `.github/workflows/ci.yml` and `.github/workflows/release.yml` (`UPSTREAM_REPO` → `jpbaking/rusty-conduit-engine`, `UPSTREAM_REF` → `v0.2.0`, checkout step name/comment/path → `rusty-conduit-engine`) and update `scripts/validate-release-config.py` line 223 to check `rusty-conduit-engine` — done when: `python3 scripts/validate-release-config.py` prints `RELEASE_CONFIG_OK`.
-2. [done] Clear the two resolved MITM CA loader items in `docs/TODO.md` — done when: `docs/TODO.md` no longer lists the two resolved `rusty-conduit-ssh` CA loader TODO checkboxes.
-3. [done] Run the complete `## Verify` command (Rust clippy + tests + `secret_leak_scan` + Linux tray check + `check-pure-rust-crypto.py` + `validate-release-config.py` + `smoke-test-bundle.py --self-test` + frontend `npm run check && npm test && npm run build`) and record observed results in `## Evidence` — done when: every check exits 0.
+1. [done] Create `crates/conduit-runtime/src/proxy_manager.rs` with `ProxyState`, `ProxySnapshot`, `ProxyTrafficSnapshot`, `ProxyEvent`, `ProxyError`, `RouteTestResult`, `UpstreamProbeResult`, and `ProxyManager` lifecycle (`upsert_proxy`, `remove_proxy`, `start`, `stop`, `restart`, `stop_all`, `snapshot`, `snapshots`, `logs`, Linked tunnel acquire/release) — done when: `proxy_manager.rs` compiles cleanly.
+2. [done] Implement `reload` (with `restart_required` classification and `RoutingCounters` preservation), `set_override` (swap temporary rule-less `RoutingState` and restore saved state), `test_route` (`ParsedTarget` + `Router`), and `test_upstream` (dial probe with timing and redacted errors) in `proxy_manager.rs` — done when: all methods compile with zero warnings.
+3. [done] Export `ProxyManager` and its public types from `crates/conduit-runtime/src/lib.rs` and add unit tests in `proxy_manager.rs` covering `test_route`, `test_upstream`, `restart_required` detection, and `ProxyState` serialization — done when: `cargo test -p conduit-runtime` passes.
+4. [done] Run `## Verify` and record observed results in `## Evidence` — done when: `## Verify` exits 0.
 
 ## Verify
 ```sh
-CARGO_NET_GIT_FETCH_WITH_CLI=true cargo clippy --workspace --all-targets -- -D warnings && CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test --workspace && CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test -p rusty-conduit-gui --test secret_leak_scan && CARGO_NET_GIT_FETCH_WITH_CLI=true RUSTFLAGS="--cfg conduit_check_tauri_tray" cargo check -p rusty-conduit-gui --tests --features tauri/tray-icon && python3 scripts/check-pure-rust-crypto.py && python3 scripts/validate-release-config.py && python3 scripts/smoke-test-bundle.py --self-test && (cd src-tauri/ui && npm run check && npm test && npm run build)
+CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test -p conduit-runtime && CARGO_NET_GIT_FETCH_WITH_CLI=true cargo clippy -p conduit-runtime --all-targets -- -D warnings
 ```
 
 ## Escalate when
-- `check-pure-rust-crypto.py` or `smoke-test-bundle.py --self-test` or any frontend check fails → stop, set Status: needs-human — reason: report the exact failing check and output
+- `arc-swap` is not re-exported by `rusty-conduit-engine` and needs to be added to root `Cargo.toml` → stop, set Status: needs-human — reason: confirm adding `arc-swap = "1"` to `[workspace.dependencies]`
+- Any `rusty_conduit_engine::router::ParsedTarget` or `RouteDecision` field differs from expected → stop, set Status: needs-human — reason: document the exact field mismatch
 
 ## Log
 - (append-only, one line per event)
-- sub-task 1: ci.yml/release.yml UPSTREAM_REPO → jpbaking/rusty-conduit-engine, UPSTREAM_REF → v0.2.0, checkout comment/name/path → rusty-conduit-engine; validate-release-config.py:223 → "rusty-conduit-engine"
-- sub-task 2: replaced docs/TODO.md with "No open items" plus a note that both MITM CA loader issues are resolved in rusty-conduit-engine v0.2.0
-- sub-task 3: ran full ## Verify; every check exited 0
+- sub-task 1: created `crates/conduit-runtime/src/proxy_manager.rs` (ProxyState, ProxySnapshot, ProxyTrafficSnapshot, ProxyEvent, ProxyError, RouteTestResult/RouteTestTarget, UpstreamProbeResult, AccessRecordBuffer, ProxyManager upsert/remove/start/stop/restart/stop_all/snapshot(s)/logs, staggered Linked acquire + release) and declared `pub mod proxy_manager` in lib.rs; no Cargo.toml change needed (`SharedRouting` methods `store`/`load_full` are inherent, `RoutingState::shared()` builds it)
+- sub-task 2: implemented in the same file `reload` (restart_required via `requires_restart`, counters via `with_counters`, `with_generation`, tunnel acquire/release reconcile, override re-apply/clear), `set_override` (rule-less state sharing saved dialers/counters), `test_route` (ParsedTarget + Router + RouteRequest, placeholder passwords), `test_upstream` (dialer_for_profile, timing, redacted errors)
+
+- sub-task 3: exported `ProxyManager`, `ProxyError`, `ProxyEvent`, `ProxySnapshot`, `ProxyState`, `ProxyTrafficSnapshot`, `RouteTestResult`, `RouteTestTarget`, `UpstreamProbeResult`, `AccessRecordBuffer`, `requires_restart` from lib.rs; added 12 unit tests (state serialization, restart_required, test_route rule/bypass/filter/vault/tunnel/bad targets, test_upstream direct/refused/unknown/tunnel-down/vault-locked, Locked and NeedsAttention starts, port conflict, CONNECT counters, hot reload + rejected reload, override swap/keep/clear/restore, Linked acquire/release)
+
+- sub-task 4: ran `## Verify`; both commands passed with no fix-ups needed
 
 ## Evidence
 - (append-only: command → observed result)
-- `python3 scripts/validate-release-config.py` → RELEASE_CONFIG_OK
-- `grep -rn "rusty-conduit-ssh\|v1.3.0" .github scripts/validate-release-config.py docs/TODO.md` → no matches
-- `cargo clippy --workspace --all-targets -- -D warnings` → Finished, rc=0
-- `cargo test --workspace` → 23 test-result lines, 491 passed, 0 failed, rc=0
-- `cargo test -p rusty-conduit-gui --test secret_leak_scan` → 5 passed; 0 failed, rc=0
-- `RUSTFLAGS="--cfg conduit_check_tauri_tray" cargo check -p rusty-conduit-gui --tests --features tauri/tray-icon` → Finished, rc=0
-- `python3 scripts/check-pure-rust-crypto.py` → PURE_RUST_CRYPTO_OK
-- `python3 scripts/smoke-test-bundle.py --self-test` → SMOKE_TEST_SELF_TEST_OK
-- `npm run check` → 188 FILES 0 ERRORS 0 WARNINGS; `npm test` → rc=0, 0 cancelled; `npm run build` → built in 2.42s, rc=0
+- sub-task 1: `CARGO_NET_GIT_FETCH_WITH_CLI=true cargo build -p conduit-runtime` → `Finished dev profile`, exit 0
+- sub-task 2: `touch proxy_manager.rs && cargo build -p conduit-runtime 2>&1 | grep -c '^warning'` → `0`; build `Finished`
+- sub-task 3: `cargo test -p conduit-runtime --lib proxy_manager` → 12 passed; `cargo test -p conduit-runtime` → lib 86 passed, e2e_runtime 9 passed, openssh_e2e 9 passed, doctests 0; exit 0
+- sub-task 4 / Verify: `CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test -p conduit-runtime && CARGO_NET_GIT_FETCH_WITH_CLI=true cargo clippy -p conduit-runtime --all-targets -- -D warnings` → tests 86+9+9 passed; clippy `Finished dev profile` with no warnings; exit 0

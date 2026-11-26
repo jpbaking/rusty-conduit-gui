@@ -167,6 +167,11 @@ impl ReverseProxy {
         }))
     }
 
+    /// The loopback addresses the reverse proxy listens on, on this machine.
+    pub(crate) fn local_listeners(&self) -> Vec<SocketAddr> {
+        self.forwards.iter().map(|forward| forward.local).collect()
+    }
+
     /// The remote forwards for the bound listeners.
     pub(crate) fn forwards(&self) -> &[ReverseForward] {
         &self.forwards
