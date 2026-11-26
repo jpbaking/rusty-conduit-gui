@@ -1,6 +1,6 @@
 //! Headless U2 integration tests: `TunnelManager` and `ProxyManager` driving real `russh`
 //! Tunnels and the embedded proxy engine against in-process SSH servers, echo origins, and a
-//! minimal upstream HTTP `CONNECT` proxy, all on loopback (`docs/MASTER-PLAN.md` §10 U2).
+//! minimal upstream HTTP `CONNECT` proxy, all on loopback.
 //!
 //! The process runs with `HOME` set to an empty temp directory, so nothing touches `~/.ssh`.
 

@@ -1,7 +1,6 @@
 # TODO
 
-No open items.
-
-The two MITM CA loading issues found with LibreSSL-made CA files (EC keys with explicit curve
-parameters, and PBES2 PKCS#8 with the HMAC-SHA1 PRF) are resolved in `rusty-conduit-engine`
-`v0.2.0` (`src/mitm/ca.rs`).
+- **Code signing.** Releases are ad-hoc signed on macOS and unsigned on Windows unless the
+  signing secrets in [RELEASING.md](RELEASING.md#4-signing-and-notarization) are set, so
+  Gatekeeper and SmartScreen warn users. Decide whether to get an Apple Developer ID and a
+  Windows Authenticode certificate.

@@ -1,7 +1,7 @@
 # Rusty Conduit GUI — UI-agnostic Rust workspace.
 #
 # All connection, vault, and session orchestration logic lives in these crates so the
-# Tauri/Svelte frontend stays a thin adapter. See docs/MASTER-PLAN.md.
+# Tauri/Svelte frontend stays a thin adapter.
 [workspace]
 resolver = "2"
 members = [

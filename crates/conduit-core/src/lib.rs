@@ -4,8 +4,6 @@
 //! (Tauri v2 + Svelte 5) stay thin adapters. Models are validated ([`validate`]) and then
 //! mapped ([`to_engine_config`]) into an [`EngineConfig`] for `rusty_conduit_engine` at
 //! session start.
-//!
-//! See `docs/MASTER-PLAN.md` section 7 for the full data model.
 
 mod airswitch_import;
 mod known_hosts_import;

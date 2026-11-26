@@ -192,7 +192,7 @@ Automated checks confirm that the installers exist, contain both binaries, and (
 
 ## 8. Upgrading from v0.1.0 (`rusty-conduit-ssh-gui`)
 
-`v0.2.0` renames the app from **Rusty Conduit (SSH)** (`rusty-conduit-ssh-gui`) to **Rusty Conduit GUI** (`rusty-conduit-gui`). The installers handle the switch (MASTER-PLAN §3.3):
+`v0.2.0` renames the app from **Rusty Conduit (SSH)** (`rusty-conduit-ssh-gui`) to **Rusty Conduit GUI** (`rusty-conduit-gui`). The installers handle the switch:
 
 | Platform | What happens |
 | --- | --- |

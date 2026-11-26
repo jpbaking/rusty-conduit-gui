@@ -2,7 +2,7 @@
 //!
 //! This module only parses text it is handed. It never opens a file, and nothing in the app
 //! reads `~/.ssh/known_hosts` automatically: the caller passes the content of a file the user
-//! chose explicitly (`docs/MASTER-PLAN.md` §1.4, §5.4).
+//! chose explicitly.
 
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use base64::Engine as _;

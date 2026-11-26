@@ -39,7 +39,7 @@ PACKAGE_COMMANDS = (
     "scripts/smoke-test-bundle.py",
 )
 RELEASE_COMMANDS = ("SHA256SUMS.txt", "gh release create", "--draft")
-# MASTER-PLAN §3.3: v0.2.0 (rusty-conduit-gui) replaces v0.1.0 (rusty-conduit-ssh-gui).
+# v0.2.0 (rusty-conduit-gui) replaces v0.1.0 (rusty-conduit-ssh-gui).
 LEGACY_PACKAGE = "rusty-conduit-ssh-gui"
 LEGACY_UPGRADE_FIELDS = {"deb": ("replaces", "conflicts"), "rpm": ("obsoletes", "conflicts")}
 LEGACY_UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Rusty Conduit (SSH)"

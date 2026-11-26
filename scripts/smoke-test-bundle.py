@@ -15,7 +15,7 @@ MAIN = "rusty-conduit-gui"
 WORKER = "conduit-worker"
 MAC_ARCHES = {"x86_64", "arm64"}
 CHECKSUMS = "SHA256SUMS.txt"
-# MASTER-PLAN §3.3: v0.2.0 (rusty-conduit-gui) replaces v0.1.0 (rusty-conduit-ssh-gui).
+# v0.2.0 (rusty-conduit-gui) replaces v0.1.0 (rusty-conduit-ssh-gui).
 LEGACY_PACKAGE = "rusty-conduit-ssh-gui"
 DEB_UPGRADE_FIELDS = ("Replaces", "Conflicts")
 RPM_UPGRADE_FIELDS = ("obsoletes", "conflicts")

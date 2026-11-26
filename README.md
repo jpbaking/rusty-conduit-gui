@@ -78,8 +78,8 @@ Launching the app while it is already running opens the existing window, unless 
 
 ## Documentation
 
-- [`docs/MASTER-PLAN.md`](docs/MASTER-PLAN.md): architecture and delivery plan
 - [`docs/RELEASING.md`](docs/RELEASING.md): cutting releases, building installers, signing, and smoke tests
+- [`docs/TODO.md`](docs/TODO.md): open items
 
 ## License
 

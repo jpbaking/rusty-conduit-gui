@@ -8,8 +8,6 @@
 //! The routing types mirror `rusty_conduit_engine::routing` (`RuleConfig`, `RoutingTableConfig`,
 //! `RoutingConfig`) field for field, but add `Serialize` so they can be stored in `config.json`.
 //! The v1 types stay in place until U3 switches the runtime and UI over.
-//!
-//! See `docs/MASTER-PLAN.md` section 8.2.
 
 use std::net::IpAddr;
 use std::path::PathBuf;

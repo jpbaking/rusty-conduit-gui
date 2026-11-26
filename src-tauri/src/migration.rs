@@ -1,5 +1,5 @@
 //! One-time upgrade migration from `Rusty Conduit (SSH)` (`io.github.rusty-conduit-ssh-gui`)
-//! to `Rusty Conduit GUI` (`io.github.rusty-conduit-gui`). See `docs/MASTER-PLAN.md` §3.3.
+//! to `Rusty Conduit GUI` (`io.github.rusty-conduit-gui`).
 
 use std::fmt;
 use std::fs;
