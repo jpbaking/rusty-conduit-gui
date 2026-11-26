@@ -393,14 +393,6 @@ pub fn validate(profile: &SessionProfile) -> Result<(), ValidateError> {
     // TCP keepalive ranges (interval / retries are only checked while keepalive is on).
     tcp_keepalive(profile)?;
 
-    // Forward and reverse filters are each mutually exclusive allow/block.
-    if !profile.forward.allow.is_empty() && !profile.forward.block.is_empty() {
-        return Err(ValidateError::ConflictingFilter { scope: "forward" });
-    }
-    if !profile.reverse.reverse_allow.is_empty() && !profile.reverse.reverse_block.is_empty() {
-        return Err(ValidateError::ConflictingFilter { scope: "reverse" });
-    }
-
     // Every filter rule must parse as a `rusty-conduit-engine` `FilterRule`.
     for rule in &profile.forward.allow {
         if let Err(message) = FilterRule::from_str(rule) {
@@ -711,14 +703,11 @@ mod tests {
     }
 
     #[test]
-    fn conflicting_forward_filters_are_rejected() {
+    fn combined_forward_filters_are_allowed() {
         let mut p = forward_profile();
-        p.forward.allow = vec!["example.com".into()];
-        p.forward.block = vec!["10.0.0.0/8".into()];
-        assert!(matches!(
-            validate(&p),
-            Err(ValidateError::ConflictingFilter { scope: "forward" })
-        ));
+        p.forward.allow = vec!["test.domain.net".into()];
+        p.forward.block = vec!["*.domain.net".into()];
+        assert!(validate(&p).is_ok());
     }
 
     #[test]

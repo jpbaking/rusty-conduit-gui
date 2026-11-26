@@ -276,6 +276,7 @@ impl AccessRecordBuffer {
 pub fn requires_restart(running: &Proxy, saved: &Proxy) -> bool {
     running.listeners != saved.listeners
         || running.mitm != saved.mitm
+        || running.socks_block_web != saved.socks_block_web
         || running.logging != saved.logging
 }
 
@@ -855,8 +856,10 @@ impl ProxyManager {
             logger.clone(),
         );
         if let Some(m) = &mitm {
-            let block_web = proxy.mitm.as_ref().is_some_and(|c| c.socks_block_web);
-            handlers = handlers.with_mitm(Arc::new(m.interceptor.clone()), block_web);
+            handlers = handlers.with_mitm(Arc::new(m.interceptor.clone()), false);
+        }
+        if proxy.socks_block_web || proxy.mitm.as_ref().is_some_and(|c| c.socks_block_web) {
+            handlers = handlers.with_socks_block_web();
         }
         let handlers: Arc<dyn ProtocolHandlers> = Arc::new(handlers);
         let server = match Server::from_options(&server_options, handlers, logger.clone()).await {

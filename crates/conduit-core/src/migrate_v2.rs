@@ -66,12 +66,14 @@ fn migrate_session(session: &SessionProfile) -> (Tunnel, Option<Proxy>) {
     }
 
     let forward = &session.forward;
-    let filter = if !forward.allow.is_empty() {
-        GlobalFilterConfig::Allow(forward.allow.clone())
-    } else if !forward.block.is_empty() {
-        GlobalFilterConfig::Block(forward.block.clone())
-    } else {
-        GlobalFilterConfig::Off
+    let filter = match (forward.allow.is_empty(), forward.block.is_empty()) {
+        (true, true) => GlobalFilterConfig::Off,
+        (false, true) => GlobalFilterConfig::Allow(forward.allow.clone()),
+        (true, false) => GlobalFilterConfig::Block(forward.block.clone()),
+        (false, false) => GlobalFilterConfig::BlockExcept {
+            block: forward.block.clone(),
+            allow: forward.allow.clone(),
+        },
     };
     let proxy = Proxy {
         id: ProxyId::new(),
@@ -106,6 +108,7 @@ fn migrate_session(session: &SessionProfile) -> (Tunnel, Option<Proxy>) {
             ..RoutingTablesConfig::default()
         },
         filter,
+        socks_block_web: session.mitm.as_ref().is_some_and(|m| m.socks_block_web),
         mitm: session.mitm.clone(),
         logging: session.logging.clone(),
     };
@@ -283,14 +286,20 @@ mod tests {
     }
 
     #[test]
-    fn allow_filter_wins_and_switched_off_ports_are_dropped() {
+    fn allow_and_block_combine_into_block_except_and_switched_off_ports_are_dropped() {
         let mut s = forward_session();
         s.forward.allow = vec!["ok.example".into()];
         s.forward.socks_port = 0;
         let mut config = AppConfig { sessions: vec![s], ..AppConfig::default() };
         migrate_v1_sessions(&mut config);
         let proxy = &config.proxies[0];
-        assert_eq!(proxy.filter, GlobalFilterConfig::Allow(vec!["ok.example".into()]));
+        assert_eq!(
+            proxy.filter,
+            GlobalFilterConfig::BlockExcept {
+                block: vec!["ads.example".into()],
+                allow: vec!["ok.example".into()],
+            }
+        );
         assert_eq!((proxy.listeners.http_port, proxy.listeners.socks_port), (3129, 0));
     }
 

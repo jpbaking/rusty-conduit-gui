@@ -100,15 +100,9 @@ pub(crate) fn parse_rules(scope: &'static str, rules: &[String]) -> Result<Vec<F
         .collect()
 }
 
-/// Build the mutually exclusive filter: allow rules win, then block rules, else unfiltered.
+/// Build a destination filter: allowlist, blocklist, or blocklist with allowlist exceptions.
 pub(crate) fn host_filter(allow: Vec<FilterRule>, block: Vec<FilterRule>) -> Option<HostFilter> {
-    if !allow.is_empty() {
-        Some(HostFilter::Allow(allow))
-    } else if !block.is_empty() {
-        Some(HostFilter::Block(block))
-    } else {
-        None
-    }
+    HostFilter::from_lists(allow, block)
 }
 
 /// Map a validated [`SessionProfile`] into an [`EngineConfig`].

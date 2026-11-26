@@ -746,10 +746,10 @@ impl ProxyStack {
         let mut handlers =
             EngineHandlers::from_routing(Arc::clone(&self.routing), access, self.logger.clone());
         if let Some(m) = &self.mitm {
-            handlers = handlers.with_mitm(
-                Arc::new(m.interceptor.clone()),
-                self.cfg.socks_block_web_in_mitm,
-            );
+            handlers = handlers.with_mitm(Arc::new(m.interceptor.clone()), false);
+        }
+        if self.cfg.socks_block_web_in_mitm {
+            handlers = handlers.with_socks_block_web();
         }
         let handlers: Arc<dyn ProtocolHandlers> = Arc::new(handlers);
         let server = Server::from_options(&self.cfg.forward_server, handlers, self.logger.clone())

@@ -376,15 +376,15 @@ describe("sessionErrors", () => {
     assert.equal(errors["forwards:e:port"], undefined);
   });
 
-  test("rejects an allowlist and blocklist together", () => {
+  test("allows an allowlist and blocklist together and still checks each rule", () => {
     const profile = validProfile();
-    profile.forward.allow = ["10.0.0.0/8"];
-    profile.forward.block = ["example.com"];
+    profile.forward.allow = ["test.domain.net"];
+    profile.forward.block = ["*.domain.net"];
     profile.reverse.reverse_allow = ["*.example.com"];
     profile.reverse.reverse_block = ["10.0.0.0/33"];
     const errors = sessionErrors(profile);
-    assert.equal(errors["filters.forward.conflict"], "Use an allowlist or a blocklist, not both.");
-    assert.equal(errors["filters.reverse.conflict"], "Use an allowlist or a blocklist, not both.");
+    assert.equal(errors["filters.forward.conflict"], undefined);
+    assert.equal(errors["filters.reverse.conflict"], undefined);
     assert.equal(errors["filters.reverse.block:0"], 'CIDR prefix exceeds /32 in "10.0.0.0/33".');
   });
 
@@ -520,6 +520,7 @@ function validProxy(): Proxy {
       rules: [{ host_wildcard: "*.corp.example", match_all: false, disabled: false, target: ["corp", "direct"] }],
     },
     filter: "off",
+    socks_block_web: false,
     mitm: null,
     logging: { level: "INFO", format: "text", http_access_log: null, socks_log: null },
   };
@@ -548,8 +549,8 @@ describe("tunnelErrors", () => {
 
   test("checks reverse filters", () => {
     const t = validTunnel();
-    const both = { ...t.reverse, reverse_allow: ["a.example"], reverse_block: ["b.example"] };
-    assert.ok(tunnelErrors({ ...t, reverse: both })["filters.reverse.conflict"]);
+    const both = { ...t.reverse, reverse_allow: ["test.domain.net"], reverse_block: ["*.domain.net"] };
+    assert.deepEqual(tunnelErrors({ ...t, reverse: both }), {});
     const bad = { ...t.reverse, reverse_block: [""] };
     assert.ok(tunnelErrors({ ...t, reverse: bad })["filters.reverse.block:0"]);
   });

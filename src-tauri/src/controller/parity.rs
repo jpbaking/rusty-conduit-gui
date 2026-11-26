@@ -39,12 +39,13 @@ pub struct PortConflictReport {
     pub conflicts: Vec<PortConflict>,
 }
 
-/// Whether the tested rules form an allowlist or a blocklist.
+/// Whether the tested rules form an allowlist, a blocklist, or a blocklist with allowlist exceptions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum FilterMode {
     Allow,
     Block,
+    BlockExcept,
 }
 
 /// A rule that failed to parse.
@@ -82,13 +83,34 @@ fn binds_overlap(a: IpAddr, b: IpAddr) -> bool {
 }
 
 /// Tests `target` the way the engine does: an empty rule list means no filter is active.
-pub fn test_filter_rules(mode: FilterMode, rules: &[String], target: &str) -> FilterTestResult {
+///
+/// For [`FilterMode::BlockExcept`], `rules` are the blocklist rules and `allow_rules` are the
+/// allowlist exceptions.
+pub fn test_filter_rules(
+    mode: FilterMode,
+    rules: &[String],
+    allow_rules: Option<&[String]>,
+    target: &str,
+) -> FilterTestResult {
     let mut parsed = Vec::with_capacity(rules.len());
     let mut rule_errors = Vec::new();
     for (index, rule) in rules.iter().enumerate() {
         match FilterRule::from_str(rule) {
             Ok(rule) => parsed.push(rule),
             Err(message) => rule_errors.push(RuleError { index, rule: rule.clone(), message }),
+        }
+    }
+    let mut parsed_allow = Vec::new();
+    if let Some(extra) = allow_rules {
+        for (offset, rule) in extra.iter().enumerate() {
+            match FilterRule::from_str(rule) {
+                Ok(rule) => parsed_allow.push(rule),
+                Err(message) => rule_errors.push(RuleError {
+                    index: rules.len() + offset,
+                    rule: rule.clone(),
+                    message,
+                }),
+            }
         }
     }
     let invalid = |reason: String, rule_errors| FilterTestResult {
@@ -105,23 +127,31 @@ pub fn test_filter_rules(mode: FilterMode, rules: &[String], target: &str) -> Fi
     if target.is_empty() {
         return invalid("enter an IP address or domain to test".into(), rule_errors);
     }
-    if parsed.is_empty() {
+    let filter = match mode {
+        FilterMode::Allow => HostFilter::from_lists(parsed, Vec::new()),
+        FilterMode::Block => HostFilter::from_lists(Vec::new(), parsed),
+        FilterMode::BlockExcept => HostFilter::from_lists(parsed_allow, parsed),
+    };
+    let Some(filter) = filter else {
         return FilterTestResult {
             valid: true,
             allowed: Some(true),
             reason: "no rules are set, so every destination is allowed".into(),
             rule_errors,
         };
-    }
-    let filter = match mode {
-        FilterMode::Allow => HostFilter::Allow(parsed),
-        FilterMode::Block => HostFilter::Block(parsed),
     };
     let (allowed, reason) = match filter.check_host(target) {
         Ok(()) => {
-            let reason = match mode {
-                FilterMode::Allow => format!("destination {target} is in the allowlist"),
-                FilterMode::Block => format!("destination {target} is not in the blocklist"),
+            let reason = match &filter {
+                HostFilter::Allow(_) => format!("destination {target} is in the allowlist"),
+                HostFilter::Block(_) => format!("destination {target} is not in the blocklist"),
+                HostFilter::BlockExcept { .. } => {
+                    if HostFilter::Allow(filter.allow_rules().to_vec()).check_host(target).is_ok() {
+                        format!("destination {target} is allowed by an allowlist exception")
+                    } else {
+                        format!("destination {target} is not in the blocklist")
+                    }
+                }
             };
             (true, reason)
         }
@@ -432,17 +462,32 @@ mod tests {
     #[test]
     fn parity_filter_allow_and_block_modes() {
         let list = rules(&["10.0.0.0/8", "*.example.com"]);
-        let check = |mode, target| test_filter_rules(mode, &list, target).allowed;
+        let check = |mode, target| test_filter_rules(mode, &list, None, target).allowed;
         assert_eq!(check(FilterMode::Allow, "10.1.2.3"), Some(true));
         assert_eq!(check(FilterMode::Allow, "api.example.com"), Some(true));
         assert_eq!(check(FilterMode::Allow, "example.com"), Some(false));
         assert_eq!(check(FilterMode::Block, "10.1.2.3"), Some(false));
         assert_eq!(check(FilterMode::Block, "8.8.8.8"), Some(true));
+
+        let block = rules(&["*.domain.net"]);
+        let allow = rules(&["test.domain.net"]);
+        assert_eq!(
+            test_filter_rules(FilterMode::BlockExcept, &block, Some(&allow), "test.domain.net").allowed,
+            Some(true)
+        );
+        assert_eq!(
+            test_filter_rules(FilterMode::BlockExcept, &block, Some(&allow), "other.domain.net").allowed,
+            Some(false)
+        );
+        assert_eq!(
+            test_filter_rules(FilterMode::BlockExcept, &block, Some(&allow), "example.org").allowed,
+            Some(true)
+        );
     }
 
     #[test]
     fn parity_filter_reports_every_bad_rule_with_its_index() {
-        let result = test_filter_rules(FilterMode::Allow, &rules(&["ok.example", "10.0.0.0/99", "a*b"]), "x");
+        let result = test_filter_rules(FilterMode::Allow, &rules(&["ok.example", "10.0.0.0/99", "a*b"]), None, "x");
         assert!(!result.valid);
         assert_eq!(result.allowed, None);
         let indexes: Vec<usize> = result.rule_errors.iter().map(|e| e.index).collect();
@@ -451,10 +496,10 @@ mod tests {
 
     #[test]
     fn parity_filter_empty_rules_and_empty_target() {
-        let none = test_filter_rules(FilterMode::Allow, &[], "anything.example");
+        let none = test_filter_rules(FilterMode::Allow, &[], None, "anything.example");
         assert!(none.valid);
         assert_eq!(none.allowed, Some(true));
-        let blank = test_filter_rules(FilterMode::Block, &rules(&["a.example"]), "  ");
+        let blank = test_filter_rules(FilterMode::Block, &rules(&["a.example"]), None, "  ");
         assert!(!blank.valid);
         assert_eq!(blank.allowed, None);
     }

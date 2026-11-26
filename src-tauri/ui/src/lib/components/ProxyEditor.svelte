@@ -170,11 +170,19 @@
 
   function filterLists(filter: GlobalFilterConfig): { allow: string[]; block: string[] } {
     if (filter === "off") return { allow: [], block: [] };
+    if ("block_except" in filter) return { allow: filter.block_except.allow, block: filter.block_except.block };
     return "allow" in filter ? { allow: filter.allow, block: [] } : { allow: [], block: filter.block };
   }
 
   function setFilter(allow: string[], block: string[]) {
-    const filter: GlobalFilterConfig = allow.length > 0 ? { allow } : block.length > 0 ? { block } : "off";
+    const filter: GlobalFilterConfig =
+      allow.length > 0 && block.length > 0
+        ? { block_except: { block, allow } }
+        : allow.length > 0
+          ? { allow }
+          : block.length > 0
+            ? { block }
+            : "off";
     store.updateProxyDraft((p) => ({ ...p, filter }));
   }
 </script>
@@ -340,8 +348,15 @@
         <MitmTab
           target={{
             mitm: proxy.mitm,
+            socksBlockWeb: proxy.socks_block_web || (proxy.mitm?.socks_block_web ?? false),
             errors,
             set: (mitm) => store.updateProxyDraft((p) => ({ ...p, mitm })),
+            setSocksBlockWeb: (socks_block_web) =>
+              store.updateProxyDraft((p) => ({
+                ...p,
+                socks_block_web,
+                mitm: p.mitm ? { ...p.mitm, socks_block_web } : null,
+              })),
           }}
         />
       </div>

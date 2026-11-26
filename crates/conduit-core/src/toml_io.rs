@@ -260,6 +260,8 @@ struct ConduitFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     block: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    socks_block_web: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     mitm: Option<MitmFile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     logging: Option<LoggingFile>,
@@ -350,6 +352,8 @@ struct SshFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     block: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    socks_block_web: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     ssh: Option<SshSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reverse: Option<ReverseSection>,
@@ -429,6 +433,8 @@ struct SwitchFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     http_port: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    socks_block_web: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     socks_port: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     watch_config: Option<bool>,
@@ -492,17 +498,14 @@ fn format_duration(d: Duration) -> String {
 }
 
 fn filter_of(
-    cli: &'static str,
+    _cli: &'static str,
     allow: Option<Vec<String>>,
     block: Option<Vec<String>>,
 ) -> Result<GlobalFilterConfig, TomlImportError> {
     let allow = allow.filter(|a| !a.is_empty());
     let block = block.filter(|b| !b.is_empty());
     match (allow, block) {
-        (Some(_), Some(_)) => Err(TomlImportError::Invalid {
-            cli,
-            message: "`allow` and `block` cannot both be set".into(),
-        }),
+        (Some(allow), Some(block)) => Ok(GlobalFilterConfig::BlockExcept { block, allow }),
         (Some(a), None) => Ok(GlobalFilterConfig::Allow(a)),
         (None, Some(b)) => Ok(GlobalFilterConfig::Block(b)),
         (None, None) => Ok(GlobalFilterConfig::Off),
@@ -514,6 +517,9 @@ fn filter_to_file(filter: &GlobalFilterConfig) -> (Option<Vec<String>>, Option<V
         GlobalFilterConfig::Off => (None, None),
         GlobalFilterConfig::Allow(a) => (Some(a.clone()), None),
         GlobalFilterConfig::Block(b) => (None, Some(b.clone())),
+        GlobalFilterConfig::BlockExcept { block, allow } => {
+            (Some(allow.clone()), Some(block.clone()))
+        }
     }
 }
 
@@ -662,11 +668,14 @@ pub fn import_rusty_conduit_toml(
     const CLI: &str = "rusty-conduit";
     let f: ConduitFile = parse_file(CLI, toml_str)?;
     let mut warnings = Vec::new();
+    let socks_block_web =
+        f.socks_block_web.or(f.mitm.as_ref().and_then(|m| m.socks_block_web)).unwrap_or(false);
     let proxy = Proxy {
         name: name.to_string(),
         listeners: listeners_of(f.bind, f.http_port, f.socks_port, f.max_connections),
         network: network_of(CLI, &None, &f.tcp_keepalive, &f.tcp_keepalive_interval, f.tcp_keepalive_retries)?,
         filter: filter_of(CLI, f.allow, f.block)?,
+        socks_block_web,
         mitm: mitm_of(f.mitm, &mut warnings),
         logging: logging_of(f.logging),
         ..Proxy::default()
@@ -707,6 +716,9 @@ pub fn export_rusty_conduit_toml(proxy: &Proxy) -> Result<TomlExport, TomlExport
         tcp_keepalive_retries: Some(n.tcp_keepalive_retries),
         allow,
         block,
+        socks_block_web: (proxy.socks_block_web
+            || proxy.mitm.as_ref().is_some_and(|m| m.socks_block_web))
+            .then_some(true),
         mitm: proxy.mitm.as_ref().map(|m| mitm_to_file(m, &mut notes)),
         logging: Some(logging_to_file(&proxy.logging)),
     };
@@ -870,12 +882,6 @@ pub fn import_rusty_conduit_ssh_toml(
         reverse_allow: r.allow.unwrap_or_default(),
         reverse_block: r.block.unwrap_or_default(),
     };
-    if !reverse.reverse_allow.is_empty() && !reverse.reverse_block.is_empty() {
-        return Err(TomlImportError::Invalid {
-            cli: CLI,
-            message: "`[reverse] allow` and `block` cannot both be set".into(),
-        });
-    }
 
     let od = OpenSshOptions::default();
     let openssh = OpenSshOptions {
@@ -906,6 +912,8 @@ pub fn import_rusty_conduit_ssh_toml(
 
     let listeners = listeners_of(f.bind, f.http_port, f.socks_port, f.max_connections);
     let filter = filter_of(CLI, f.allow, f.block)?;
+    let socks_block_web =
+        f.socks_block_web.or(f.mitm.as_ref().and_then(|m| m.socks_block_web)).unwrap_or(false);
     let mitm = mitm_of(f.mitm, &mut warnings);
     let proxy = if listeners.http_port == 0 && listeners.socks_port == 0 {
         if !filter_is_off(&filter) || mitm.is_some() {
@@ -938,6 +946,7 @@ pub fn import_rusty_conduit_ssh_toml(
                 ..RoutingTablesConfig::default()
             },
             filter,
+            socks_block_web,
             mitm,
             logging,
             ..Proxy::default()
@@ -1099,6 +1108,9 @@ pub fn export_rusty_conduit_ssh_toml(
         tcp_keepalive_retries: Some(n.tcp_keepalive_retries),
         allow,
         block,
+        socks_block_web: (proxy.socks_block_web
+            || proxy.mitm.as_ref().is_some_and(|m| m.socks_block_web))
+            .then_some(true),
         ssh: Some(ssh),
         reverse,
         mitm: proxy.mitm.as_ref().map(|m| mitm_to_file(m, &mut notes)),
@@ -1173,6 +1185,8 @@ pub fn import_rusty_conduit_switch_toml(
     let network = network_of(CLI, &f.connect_timeout, &ka.idle, &ka.interval, ka.retries)?;
     let filter = f.filter.unwrap_or_default();
     let filter = filter_of(CLI, filter.allow, filter.block)?;
+    let socks_block_web =
+        f.socks_block_web.or(f.mitm.as_ref().and_then(|m| m.socks_block_web)).unwrap_or(false);
     let mitm = mitm_of(f.mitm.map(MitmFile::from), &mut warnings);
 
     let mut aliases = BTreeMap::new();
@@ -1249,6 +1263,7 @@ pub fn import_rusty_conduit_switch_toml(
         profiles,
         routing,
         filter,
+        socks_block_web,
         mitm,
         logging: logging_of(f.logging),
         ..Proxy::default()
@@ -1368,6 +1383,9 @@ pub fn export_rusty_conduit_switch_toml(
             retries: Some(n.tcp_keepalive_retries),
         }),
         filter,
+        socks_block_web: (proxy.socks_block_web
+            || proxy.mitm.as_ref().is_some_and(|m| m.socks_block_web))
+            .then_some(true),
         mitm: proxy.mitm.as_ref().map(|m| SwitchMitmFile::from(mitm_to_file(m, &mut notes))),
         logging: Some(logging_to_file(&proxy.logging)),
         profiles,
@@ -1573,8 +1591,14 @@ inherit = true
     fn toml_io_rejects_bad_rusty_conduit_files() {
         let unknown = import_rusty_conduit_toml("bogus = 1", "x").unwrap_err();
         assert!(matches!(unknown, TomlImportError::Parse { .. }), "{unknown}");
-        let both = import_rusty_conduit_toml("allow = [\"a\"]\nblock = [\"b\"]", "x").unwrap_err();
-        assert!(matches!(both, TomlImportError::Invalid { .. }));
+        let both = import_rusty_conduit_toml("allow = [\"test.domain.net\"]\nblock = [\"*.domain.net\"]", "x").unwrap();
+        assert_eq!(
+            both.proxy.filter,
+            GlobalFilterConfig::BlockExcept {
+                block: vec!["*.domain.net".into()],
+                allow: vec!["test.domain.net".into()],
+            }
+        );
         let dur = import_rusty_conduit_toml("tcp_keepalive = \"soon\"", "x").unwrap_err();
         assert!(dur.to_string().contains("tcp_keepalive"));
     }

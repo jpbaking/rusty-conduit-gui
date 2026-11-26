@@ -126,10 +126,10 @@ impl ReverseProxy {
             .with_routing_fields(false);
         let mut handlers = EngineHandlers::from_routing(routing, access, logger.clone());
         if let Some(m) = &mitm {
-            handlers = handlers.with_mitm(
-                Arc::new(m.interceptor.clone()),
-                cfg.socks_block_web_in_mitm,
-            );
+            handlers = handlers.with_mitm(Arc::new(m.interceptor.clone()), false);
+        }
+        if cfg.socks_block_web_in_mitm {
+            handlers = handlers.with_socks_block_web();
         }
         let handlers: Arc<dyn ProtocolHandlers> = Arc::new(handlers);
         let server = Server::bind(reverse_listen_plan(cfg), handlers, logger.clone())

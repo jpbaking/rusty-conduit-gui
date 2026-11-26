@@ -380,6 +380,7 @@ function blankProxyFields(): Omit<Proxy, "id" | "name"> {
     profiles: [],
     routing: { default: "direct", resolve_dns: false, rules: [] },
     filter: "off",
+    socks_block_web: false,
     mitm: null,
     logging: { level: "INFO", format: "text", http_access_log: null, socks_log: null },
   };

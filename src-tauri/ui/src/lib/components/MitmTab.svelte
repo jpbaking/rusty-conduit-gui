@@ -12,8 +12,10 @@
   /** What a Proxy editor hands in. Without it, the selected session's MITM is edited. */
   interface MitmTarget {
     mitm: MitmConfig | null;
+    socksBlockWeb?: boolean;
     errors: FieldErrors;
     set: (mitm: MitmConfig | null) => void;
+    setSocksBlockWeb?: (enabled: boolean) => void;
   }
 
   interface Props {
@@ -25,10 +27,19 @@
   const uid = $props.id();
   const mitm = $derived(target ? target.mitm : (store.draft as SessionProfile).mitm);
   const errors = $derived(target ? target.errors : store.draftErrors);
+  const socksBlockWeb = $derived(target?.socksBlockWeb ?? mitm?.socks_block_web ?? false);
 
   function update(edit: (mitm: MitmConfig | null) => MitmConfig | null) {
     if (target) target.set(edit(target.mitm));
     else store.updateDraft((p) => ({ ...p, mitm: edit(p.mitm) }));
+  }
+
+  function updateSocksBlockWeb(enabled: boolean) {
+    if (target?.setSocksBlockWeb) {
+      target.setSocksBlockWeb(enabled);
+    } else if (mitm) {
+      setMitm({ socks_block_web: enabled });
+    }
   }
   const selected = $derived(mitm?.ca ? (store.cas.find((ca) => ca.id === mitm.ca) ?? null) : null);
   const expiry = $derived(selected ? caExpiry(selected.not_after) : null);
@@ -141,16 +152,21 @@
         onValue={(cert_cache_max_entries) => setMitm({ cert_cache_max_entries })}
       />
     </div>
+  </section>
+{/if}
 
+{#if target?.setSocksBlockWeb || mitm}
+  <section class="card" aria-labelledby={`${uid}-socks-web`}>
+    <h2 id={`${uid}-socks-web`}>SOCKS web blocking</h2>
     <label class="check">
       <input
         type="checkbox"
-        checked={mitm.socks_block_web}
-        onchange={(e) => setMitm({ socks_block_web: e.currentTarget.checked })}
+        checked={socksBlockWeb}
+        onchange={(e) => updateSocksBlockWeb(e.currentTarget.checked)}
       />
-      Block web ports over SOCKS <small class="muted">so web traffic must use the MITM HTTP proxy</small>
+      Block HTTP/HTTPS traffic over SOCKS
+      <small class="muted">rejects plaintext HTTP and HTTPS over SOCKS4/5, with or without MITM enabled</small>
     </label>
-
   </section>
 {/if}
 

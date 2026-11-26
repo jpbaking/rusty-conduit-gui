@@ -123,9 +123,6 @@ pub fn validate_tunnel(tunnel: &Tunnel) -> Result<(), ValidateError> {
     keepalive_problem(k.tcp_keepalive, k.tcp_keepalive_interval, k.tcp_keepalive_retries)?;
 
     let r = &tunnel.reverse;
-    if !r.reverse_allow.is_empty() && !r.reverse_block.is_empty() {
-        return Err(ValidateError::ConflictingFilter { scope: "reverse" });
-    }
     let invalid = |scope, rule, message| ValidateError::InvalidFilterRule { scope, rule, message };
     filter_rules("reverse_allow", &r.reverse_allow, invalid)?;
     filter_rules("reverse_block", &r.reverse_block, invalid)?;
@@ -181,6 +178,10 @@ pub fn validate_proxy(
         GlobalFilterConfig::Off => {}
         GlobalFilterConfig::Allow(rules) => filter_rules("filter_allow", rules, invalid)?,
         GlobalFilterConfig::Block(rules) => filter_rules("filter_block", rules, invalid)?,
+        GlobalFilterConfig::BlockExcept { block, allow } => {
+            filter_rules("filter_allow", allow, invalid)?;
+            filter_rules("filter_block", block, invalid)?;
+        }
     }
 
     match logging_problem(&proxy.logging) {
@@ -302,12 +303,9 @@ mod tests {
     #[test]
     fn tunnel_reverse_filters() {
         let mut t = tunnel();
-        t.reverse.reverse_allow = vec!["a.example".into()];
-        t.reverse.reverse_block = vec!["b.example".into()];
-        assert!(matches!(
-            validate_tunnel(&t),
-            Err(ValidateError::ConflictingFilter { scope: "reverse" })
-        ));
+        t.reverse.reverse_allow = vec!["test.domain.net".into()];
+        t.reverse.reverse_block = vec!["*.domain.net".into()];
+        validate_tunnel(&t).unwrap();
         t.reverse.reverse_allow.clear();
         t.reverse.reverse_block = vec!["".into()];
         assert!(matches!(

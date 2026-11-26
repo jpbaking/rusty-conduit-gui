@@ -135,6 +135,7 @@ function blankProxy(name: string, httpPort: number, socksPort: number): Proxy {
     profiles: [],
     routing: { default: "direct", resolve_dns: false, rules: [] },
     filter: "off",
+    socks_block_web: false,
     mitm: null,
     logging: { ...DEFAULT_LOGGING },
   };

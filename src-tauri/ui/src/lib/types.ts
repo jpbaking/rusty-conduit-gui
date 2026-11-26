@@ -391,7 +391,7 @@ export interface PortConflictReport {
   conflicts: PortConflict[];
 }
 
-export type FilterMode = "allow" | "block";
+export type FilterMode = "allow" | "block" | "block_except";
 
 export interface RuleError {
   index: number;
@@ -652,7 +652,11 @@ export interface NetworkConfig {
   tcp_keepalive_retries: number;
 }
 
-export type GlobalFilterConfig = "off" | { allow: string[] } | { block: string[] };
+export type GlobalFilterConfig =
+  | "off"
+  | { allow: string[] }
+  | { block: string[] }
+  | { block_except: { block: string[]; allow: string[] } };
 
 /** Where an upstream password comes from. Never the password itself. */
 export type UpstreamPasswordSource = { vault: SecretRef } | { env: string } | { file: string };
@@ -744,6 +748,7 @@ export interface Proxy {
   profiles: UpstreamProfile[];
   routing: RoutingTablesConfig;
   filter: GlobalFilterConfig;
+  socks_block_web: boolean;
   mitm: MitmConfig | null;
   logging: LoggingConfig;
 }

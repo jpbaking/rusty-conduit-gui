@@ -359,9 +359,10 @@ pub async fn check_port_conflicts(
 pub async fn test_filter_rules(
     mode: FilterMode,
     rules: Vec<String>,
+    allow_rules: Option<Vec<String>>,
     target: String,
 ) -> CmdResult<FilterTestResult> {
-    Ok(parity::test_filter_rules(mode, &rules, &target))
+    Ok(parity::test_filter_rules(mode, &rules, allow_rules.as_deref(), &target))
 }
 
 /// Runs `<ssh_bin> -V`, which can take seconds, on the blocking pool.

@@ -226,8 +226,16 @@ pub fn routing_config(r: &RoutingTablesConfig) -> RoutingConfig {
 pub fn global_filter(filter: &GlobalFilterConfig) -> Result<Option<HostFilter>, MappingError> {
     Ok(match filter {
         GlobalFilterConfig::Off => None,
-        GlobalFilterConfig::Allow(rules) => Some(HostFilter::Allow(parse_rules("filter", rules)?)),
-        GlobalFilterConfig::Block(rules) => Some(HostFilter::Block(parse_rules("filter", rules)?)),
+        GlobalFilterConfig::Allow(rules) => {
+            HostFilter::from_lists(parse_rules("filter", rules)?, Vec::new())
+        }
+        GlobalFilterConfig::Block(rules) => {
+            HostFilter::from_lists(Vec::new(), parse_rules("filter", rules)?)
+        }
+        GlobalFilterConfig::BlockExcept { block, allow } => HostFilter::from_lists(
+            parse_rules("filter_allow", allow)?,
+            parse_rules("filter_block", block)?,
+        ),
     })
 }
 

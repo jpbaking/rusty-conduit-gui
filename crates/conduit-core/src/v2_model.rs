@@ -293,6 +293,12 @@ pub enum GlobalFilterConfig {
     Off,
     Allow(Vec<String>),
     Block(Vec<String>),
+    BlockExcept {
+        #[serde(default)]
+        block: Vec<String>,
+        #[serde(default)]
+        allow: Vec<String>,
+    },
 }
 
 /// Where an upstream proxy's password comes from. Never stored inline.
@@ -541,6 +547,9 @@ pub struct Proxy {
     pub routing: RoutingTablesConfig,
     #[serde(default)]
     pub filter: GlobalFilterConfig,
+    /// Block HTTP/HTTPS traffic over SOCKS4/4a/5 (works with or without MITM).
+    #[serde(default)]
+    pub socks_block_web: bool,
     #[serde(default)]
     pub mitm: Option<MitmConfig>,
     #[serde(default)]
@@ -560,6 +569,7 @@ impl Default for Proxy {
             profiles: Vec::new(),
             routing: RoutingTablesConfig::default(),
             filter: GlobalFilterConfig::default(),
+            socks_block_web: false,
             mitm: None,
             logging: LoggingConfig::default(),
         }

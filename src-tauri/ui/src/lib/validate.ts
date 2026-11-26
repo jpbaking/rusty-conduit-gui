@@ -231,9 +231,6 @@ function filterErrors(
   allow: readonly string[],
   block: readonly string[],
 ): void {
-  if (allow.length > 0 && block.length > 0) {
-    errors[`filters.${scope}.conflict`] = "Use an allowlist or a blocklist, not both.";
-  }
   for (const [list, rules] of [["allow", allow], ["block", block]] as const) {
     rules.forEach((rule, index) => {
       const problem = filterRuleError(rule);
@@ -551,11 +548,21 @@ export function proxyErrors(proxy: Proxy, knownTunnels: readonly TunnelId[]): Fi
   );
 
   if (proxy.filter !== "off") {
-    const [list, rules] = "allow" in proxy.filter ? ["allow", proxy.filter.allow] : ["block", proxy.filter.block];
-    rules.forEach((rule, index) => {
-      const problem = filterRuleError(rule);
-      if (problem) errors[`filter.${list}:${index}`] = problem;
-    });
+    const pairs: [string, readonly string[]][] =
+      "allow" in proxy.filter
+        ? [["allow", proxy.filter.allow]]
+        : "block" in proxy.filter
+          ? [["block", proxy.filter.block]]
+          : [
+              ["block", proxy.filter.block_except.block],
+              ["allow", proxy.filter.block_except.allow],
+            ];
+    for (const [list, rules] of pairs) {
+      rules.forEach((rule, index) => {
+        const problem = filterRuleError(rule);
+        if (problem) errors[`filter.${list}:${index}`] = problem;
+      });
+    }
   }
 
   loggingErrors(errors, proxy.logging);

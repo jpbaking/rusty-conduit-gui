@@ -3,7 +3,7 @@
   import type { FilterTestResult } from "../types";
   import { filterRuleError, type FieldErrors } from "../validate";
 
-  type Mode = "off" | "allow" | "block";
+  type Mode = "off" | "allow" | "block" | "block_except";
 
   interface Props {
     title: string;
@@ -24,21 +24,33 @@
     { value: "off", label: "Disabled" },
     { value: "allow", label: "Allowlist" },
     { value: "block", label: "Blocklist" },
+    { value: "block_except", label: "Blocklist + Exceptions" },
   ];
 
   const uid = $props.id();
 
-  /** Which mode to show while both lists are empty. */
+  /** Which mode to show while one or both lists are empty. */
   let picked = $state<Mode>("off");
   /** Rules cleared by a mode switch, so switching back in this editor restores them. */
   let stash: { allow: string[]; block: string[] } = { allow: [], block: [] };
 
-  const mode = $derived<Mode>(allow.length > 0 ? "allow" : block.length > 0 ? "block" : picked);
+  const mode = $derived<Mode>(
+    allow.length > 0 && block.length > 0
+      ? "block_except"
+      : picked === "block_except" && (allow.length > 0 || block.length > 0)
+        ? "block_except"
+        : allow.length > 0
+          ? "allow"
+          : block.length > 0
+            ? "block"
+            : picked,
+  );
   const rules = $derived(mode === "allow" ? allow : mode === "block" ? block : []);
-  const conflict = $derived(errors[`${prefix}conflict`]);
 
   let ruleText = $state("");
   let ruleError = $state<string | null>(null);
+  let exceptionText = $state("");
+  let exceptionError = $state<string | null>(null);
   let bulkText = $state("");
   let bulkNote = $state<string | null>(null);
   let target = $state("");
@@ -49,47 +61,65 @@
 
   const ruleKey = (rule: string) => rule.trim().toLowerCase();
 
-  function setRules(next: string[]) {
-    if (mode === "allow") onChange(next, block);
-    else if (mode === "block") onChange(allow, next);
+  function setRules(list: "allow" | "block", next: string[]) {
+    if (list === "allow") onChange(next, block);
+    else onChange(allow, next);
   }
 
   function setMode(next: Mode) {
     stash = {
-      allow: allow.length > 0 || mode === "allow" ? allow : stash.allow,
-      block: block.length > 0 || mode === "block" ? block : stash.block,
+      allow: allow.length > 0 || mode === "allow" || mode === "block_except" ? allow : stash.allow,
+      block: block.length > 0 || mode === "block" || mode === "block_except" ? block : stash.block,
     };
     picked = next;
     ruleError = null;
+    exceptionError = null;
     bulkNote = null;
     if (next === "off") onChange([], []);
     else if (next === "allow") onChange(allow.length > 0 ? allow : stash.allow, []);
-    else onChange([], block.length > 0 ? block : stash.block);
+    else if (next === "block") onChange([], block.length > 0 ? block : stash.block);
+    else onChange(allow.length > 0 ? allow : stash.allow, block.length > 0 ? block : stash.block);
   }
 
-  function addRule(event: SubmitEvent) {
+  function addRuleTo(list: "allow" | "block", event: SubmitEvent) {
     event.preventDefault();
-    const rule = ruleText.trim();
+    const isException = mode === "block_except" && list === "allow";
+    const rule = (isException ? exceptionText : ruleText).trim();
     if (!rule) return;
-    ruleError = filterRuleError(rule);
-    if (ruleError) return;
-    if (rules.some((existing) => ruleKey(existing) === ruleKey(rule))) {
-      ruleError = "That rule is already in the list.";
+    const problem = filterRuleError(rule);
+    if (problem) {
+      if (isException) exceptionError = problem;
+      else ruleError = problem;
+      return;
+    }
+    const existingList = list === "allow" ? allow : block;
+    if (existingList.some((existing) => ruleKey(existing) === ruleKey(rule))) {
+      const dup = "That rule is already in the list.";
+      if (isException) exceptionError = dup;
+      else ruleError = dup;
       return;
     }
     picked = mode;
-    setRules([...rules, rule]);
-    ruleText = "";
+    setRules(list, [...existingList, rule]);
+    if (isException) {
+      exceptionText = "";
+      exceptionError = null;
+    } else {
+      ruleText = "";
+      ruleError = null;
+    }
   }
 
-  function removeRule(index: number) {
+  function removeRuleFrom(list: "allow" | "block", index: number) {
     // Keeps the mode selected when the last rule is removed.
     picked = mode;
-    setRules(rules.filter((_, i) => i !== index));
+    const existingList = list === "allow" ? allow : block;
+    setRules(list, existingList.filter((_, i) => i !== index));
   }
 
-  function importBulk() {
-    const seen = new Set(rules.map(ruleKey));
+  function importBulk(list: "allow" | "block") {
+    const existingList = list === "allow" ? allow : block;
+    const seen = new Set(existingList.map(ruleKey));
     const added: string[] = [];
     const rejected: string[] = [];
     let duplicates = 0;
@@ -105,7 +135,7 @@
     }
     if (added.length > 0) {
       picked = mode;
-      setRules([...rules, ...added]);
+      setRules(list, [...existingList, ...added]);
     }
     // Rejected rules stay in the box so they can be corrected.
     bulkText = rejected.join("\n");
@@ -121,7 +151,10 @@
     result = null;
     testError = null;
     try {
-      const outcome = await api.testFilterRules(mode === "block" ? "block" : "allow", rules, target);
+      const outcome =
+        mode === "block_except"
+          ? await api.testFilterRules("block_except", block, target, allow)
+          : await api.testFilterRules(mode === "block" ? "block" : "allow", rules, target);
       if (run === testRun) result = outcome;
     } catch (error) {
       if (run === testRun) testError = errorMessage(error);
@@ -133,7 +166,8 @@
   // A result only describes the exact rules and host it was run with.
   $effect(() => {
     void mode;
-    void rules;
+    void allow;
+    void block;
     void target;
     testRun += 1;
     testing = false;
@@ -153,13 +187,73 @@
     {/each}
   </div>
 
-  {#if conflict}
-    <p class="field-error">{conflict} Pick the mode to keep. The other list is cleared.</p>
-  {/if}
-
   {#if mode === "off"}
     <p class="muted">No filter. Every destination is allowed.</p>
+  {:else if mode === "block_except"}
+    <p class="muted">
+      Destinations in the blocklist are blocked unless they match an exception in the allowlist
+      (for example, block <code>*.domain.net</code> and allow <code>test.domain.net</code>).
+    </p>
+
+    <h3>Blocklist</h3>
+    {#if block.length > 0}
+      <ul class="rule-list" aria-label={`${title} blocklist rules`}>
+        {#each block as rule, index (`${index}:${rule}`)}
+          {@const problem = errors[`${prefix}block:${index}`]}
+          <li class="rule-chip" class:bad={!!problem} title={problem}>
+            {rule}
+            <button type="button" aria-label={`Remove ${rule}`} onclick={() => removeRuleFrom("block", index)}>×</button>
+          </li>
+        {/each}
+      </ul>
+      {#each block as _rule, index (index)}
+        {@const problem = errors[`${prefix}block:${index}`]}
+        {#if problem}<span class="field-error">{problem}</span>{/if}
+      {/each}
+    {/if}
+    <form class="inline-form" onsubmit={(e) => addRuleTo("block", e)}>
+      <input
+        bind:value={ruleText}
+        spellcheck="false"
+        placeholder="Block IP, CIDR, example.com, or *.example.com"
+        aria-label={`Add ${title} blocklist rule`}
+        aria-invalid={!!ruleError}
+        oninput={() => (ruleError = null)}
+      />
+      <button type="submit" disabled={!ruleText.trim()}>Add block rule</button>
+    </form>
+    {#if ruleError}<span class="field-error" role="alert">{ruleError}</span>{/if}
+
+    <h3>Allowlist exceptions</h3>
+    {#if allow.length > 0}
+      <ul class="rule-list" aria-label={`${title} allowlist exception rules`}>
+        {#each allow as rule, index (`${index}:${rule}`)}
+          {@const problem = errors[`${prefix}allow:${index}`]}
+          <li class="rule-chip" class:bad={!!problem} title={problem}>
+            {rule}
+            <button type="button" aria-label={`Remove ${rule}`} onclick={() => removeRuleFrom("allow", index)}>×</button>
+          </li>
+        {/each}
+      </ul>
+      {#each allow as _rule, index (index)}
+        {@const problem = errors[`${prefix}allow:${index}`]}
+        {#if problem}<span class="field-error">{problem}</span>{/if}
+      {/each}
+    {/if}
+    <form class="inline-form" onsubmit={(e) => addRuleTo("allow", e)}>
+      <input
+        bind:value={exceptionText}
+        spellcheck="false"
+        placeholder="Allow exception, e.g. test.domain.net"
+        aria-label={`Add ${title} allowlist exception`}
+        aria-invalid={!!exceptionError}
+        oninput={() => (exceptionError = null)}
+      />
+      <button type="submit" disabled={!exceptionText.trim()}>Add exception</button>
+    </form>
+    {#if exceptionError}<span class="field-error" role="alert">{exceptionError}</span>{/if}
   {:else}
+    {@const activeList = mode === "allow" ? "allow" : "block"}
     <p class="muted">
       {mode === "allow" ? "Only these destinations are allowed." : "These destinations are blocked."}
       {#if rules.length === 0}An empty list means no filter is active.{/if}
@@ -171,7 +265,7 @@
           {@const problem = errors[`${prefix}${mode}:${index}`]}
           <li class="rule-chip" class:bad={!!problem} title={problem}>
             {rule}
-            <button type="button" aria-label={`Remove ${rule}`} onclick={() => removeRule(index)}>×</button>
+            <button type="button" aria-label={`Remove ${rule}`} onclick={() => removeRuleFrom(activeList, index)}>×</button>
           </li>
         {/each}
       </ul>
@@ -181,7 +275,7 @@
       {/each}
     {/if}
 
-    <form class="inline-form" onsubmit={addRule}>
+    <form class="inline-form" onsubmit={(e) => addRuleTo(activeList, e)}>
       <input
         bind:value={ruleText}
         spellcheck="false"
@@ -199,7 +293,7 @@
       <textarea class="code-text" bind:value={bulkText} spellcheck="false"></textarea>
     </label>
     <div class="inline-form">
-      <button type="button" disabled={!bulkText.trim()} onclick={importBulk}>Import rules</button>
+      <button type="button" disabled={!bulkText.trim()} onclick={() => importBulk(activeList)}>Import rules</button>
       {#if bulkNote}<span class="muted" role="status">{bulkNote}</span>{/if}
     </div>
   {/if}

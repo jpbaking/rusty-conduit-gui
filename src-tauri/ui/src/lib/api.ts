@@ -185,8 +185,13 @@ export const api = {
   // Session-editor helpers.
   checkPortConflicts: (sessionId: Uuid | null, bind: string, httpPort: number, socksPort: number) =>
     call<PortConflictReport>("check_port_conflicts", { sessionId, bind, httpPort, socksPort }),
-  testFilterRules: (mode: FilterMode, rules: string[], target: string) =>
-    call<FilterTestResult>("test_filter_rules", { mode, rules, target }),
+  testFilterRules: (mode: FilterMode, rules: string[], target: string, allowRules?: string[]) =>
+    call<FilterTestResult>("test_filter_rules", {
+      mode,
+      rules,
+      ...(allowRules !== undefined ? { allowRules } : {}),
+      target,
+    }),
   checkOpensshBinary: (sshBin?: string) =>
     call<OpenSshBinaryInfo>("check_openssh_binary", { sshBin: sshBin ?? null }),
 
