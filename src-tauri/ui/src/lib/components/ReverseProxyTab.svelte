@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { store } from "../stores.svelte";
+  import { chainEditor } from "./JumpChainBuilder.svelte";
   import type { ReverseConfig, SessionProfile } from "../types";
   import { PortMux, shareablePort } from "../portMux.svelte";
   import { isIpAddress, isLoopback } from "../validate";
@@ -11,12 +11,13 @@
   const DEFAULT_REVERSE_PORT = 8888;
 
   const uid = $props.id();
-  const reverse = $derived((store.draft as SessionProfile).reverse);
-  const forwardCap = $derived((store.draft as SessionProfile).forward.max_connections);
-  const forwardEnabled = $derived((store.draft as SessionProfile).forward.enabled);
-  const portForwardOn = $derived((store.draft as SessionProfile).port_forwards.some((f) => f.enabled));
-  const capError = $derived(store.draftErrors["reverse.max_connections"]);
-  const errors = $derived(store.draftErrors);
+  const ed = chainEditor();
+  const reverse = $derived((ed.draft as SessionProfile).reverse);
+  const forwardCap = $derived((ed.draft as SessionProfile).forward.max_connections);
+  const forwardEnabled = $derived((ed.draft as SessionProfile).forward.enabled);
+  const portForwardOn = $derived((ed.draft as SessionProfile).port_forwards.some((f) => f.enabled));
+  const capError = $derived(ed.draftErrors["reverse.max_connections"]);
+  const errors = $derived(ed.draftErrors);
   const reverseOn = $derived(
     reverse.enabled && (reverse.reverse_http_port !== 0 || reverse.reverse_socks_port !== 0),
   );
@@ -28,7 +29,7 @@
   const canShare = $derived(shareablePort(ports()) !== null);
 
   function setReverse(patch: Partial<ReverseConfig>) {
-    store.updateDraft((profile) => ({ ...profile, reverse: { ...profile.reverse, ...patch } }));
+    ed.updateDraft((profile) => ({ ...profile, reverse: { ...profile.reverse, ...patch } }));
   }
 
   /** Turning on with no ports set fills in a shared port, so the proxy has a listener. */
@@ -94,7 +95,9 @@
         />
       {/if}
     </div>
-    <div class="field cap" title="HTTP and SOCKS connections count together. Leave empty to use the Forward limit.">
+    <div class="field cap" title={ed.isTunnel
+      ? "HTTP and SOCKS connections count together. Leave empty for the default limit."
+      : "HTTP and SOCKS connections count together. Leave empty to use the Forward limit."}>
       <label class="field">
         Max connections
         <input
@@ -103,7 +106,11 @@
           value={reverse.reverse_max_connections === null || Number.isNaN(reverse.reverse_max_connections)
             ? ""
             : reverse.reverse_max_connections}
-          placeholder={Number.isSafeInteger(forwardCap) ? `${forwardCap} (Forward)` : "Same as Forward"}
+          placeholder={ed.isTunnel
+            ? "Default"
+            : Number.isSafeInteger(forwardCap)
+              ? `${forwardCap} (Forward)`
+              : "Same as Forward"}
           aria-invalid={!!capError}
           aria-describedby={capError ? `${uid}-cap-error` : `${uid}-cap-hint`}
           oninput={(e) => {

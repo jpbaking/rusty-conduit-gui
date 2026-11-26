@@ -4,8 +4,10 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
+use conduit_runtime::{ProxyEvent, TunnelEvent, TunnelEventReceiver};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, Runtime, WebviewUrl, WebviewWindowBuilder, Window, WindowEvent};
+use tokio::sync::broadcast::{self, error::RecvError};
 use uuid::Uuid;
 
 /// The window label. `capabilities/default.json` grants permissions to this label.
@@ -13,6 +15,60 @@ pub const MAIN_WINDOW: &str = "main";
 pub const EVENT_RUNTIME: &str = "runtime-event";
 pub const EVENT_RUNTIME_LAGGED: &str = "runtime-lagged";
 pub const EVENT_TRAY_STATUS: &str = "tray-status";
+pub const EVENT_PROXY_STATE: &str = "proxy-state-changed";
+pub const EVENT_PROXY_RELOADED: &str = "proxy-reloaded";
+pub const EVENT_PROXY_OVERRIDE: &str = "proxy-override-changed";
+pub const EVENT_TUNNEL_STATE: &str = "tunnel-state-changed";
+
+/// The WebView event a Proxy event is sent as. The payload is the event itself.
+pub fn proxy_event_name(event: &ProxyEvent) -> &'static str {
+    match event {
+        ProxyEvent::StateChanged { .. } => EVENT_PROXY_STATE,
+        ProxyEvent::Reloaded { .. } => EVENT_PROXY_RELOADED,
+        ProxyEvent::OverrideChanged { .. } => EVENT_PROXY_OVERRIDE,
+    }
+}
+
+/// The WebView event a Tunnel event is sent as, if any. Pin changes only concern the
+/// `known_hosts.json` autosave.
+pub fn tunnel_event_name(event: &TunnelEvent) -> Option<&'static str> {
+    match event {
+        TunnelEvent::StateChanged { .. } => Some(EVENT_TUNNEL_STATE),
+        TunnelEvent::KnownHostsChanged { .. } => None,
+    }
+}
+
+/// Forwards Proxy events to the Manage Window until the manager closes. With no window open
+/// this does nothing. A lag tells the UI to reload its state.
+pub async fn forward_proxy_events<R: Runtime>(app: AppHandle<R>, mut events: broadcast::Receiver<ProxyEvent>) {
+    loop {
+        let sent = match events.recv().await {
+            Ok(event) => app.emit_to(MAIN_WINDOW, proxy_event_name(&event), event),
+            Err(RecvError::Lagged(_)) => app.emit_to(MAIN_WINDOW, EVENT_RUNTIME_LAGGED, ()),
+            Err(RecvError::Closed) => return,
+        };
+        if let Err(error) = sent {
+            eprintln!("could not forward a proxy event: {error}");
+        }
+    }
+}
+
+/// Forwards Tunnel state changes to the Manage Window until the manager closes.
+pub async fn forward_tunnel_events<R: Runtime>(app: AppHandle<R>, mut events: TunnelEventReceiver) {
+    loop {
+        let sent = match events.recv().await {
+            Ok(event) => match tunnel_event_name(&event) {
+                Some(name) => app.emit_to(MAIN_WINDOW, name, event),
+                None => Ok(()),
+            },
+            Err(RecvError::Lagged(_)) => app.emit_to(MAIN_WINDOW, EVENT_RUNTIME_LAGGED, ()),
+            Err(RecvError::Closed) => return,
+        };
+        if let Err(error) = sent {
+            eprintln!("could not forward a tunnel event: {error}");
+        }
+    }
+}
 
 /// Undelivered UI events kept for the next window. The oldest are dropped past this.
 const MAX_PENDING_EVENTS: usize = 16;
@@ -337,6 +393,28 @@ mod tests {
         let logs = UiEvent::ViewLogs { session_id: id };
         assert_eq!(serde_json::to_value(&logs).unwrap()["event"], logs.name());
         assert_eq!(logs.payload(), json!({ "session_id": id }));
+    }
+
+    #[test]
+    fn window_v2_event_names_match_the_wire_format() {
+        use conduit_core::{ProxyId, TunnelId};
+        use conduit_runtime::{ProxyState, SessionState};
+        let proxy_id = ProxyId::new();
+        let state = ProxyEvent::StateChanged { proxy_id, state: ProxyState::Stopped };
+        assert_eq!(proxy_event_name(&state), "proxy-state-changed");
+        assert_eq!(serde_json::to_value(&state).unwrap()["event"], "state_changed");
+        let reloaded = ProxyEvent::Reloaded { proxy_id, config_generation: 2 };
+        assert_eq!(proxy_event_name(&reloaded), "proxy-reloaded");
+        let forced = ProxyEvent::OverrideChanged { proxy_id, override_profile: Some("direct".into()) };
+        assert_eq!(proxy_event_name(&forced), "proxy-override-changed");
+        assert_eq!(serde_json::to_value(&forced).unwrap()["override_profile"], "direct");
+
+        let tunnel_id = TunnelId::new();
+        let changed = TunnelEvent::StateChanged { tunnel_id, state: SessionState::Stopped };
+        assert_eq!(tunnel_event_name(&changed), Some("tunnel-state-changed"));
+        assert_eq!(serde_json::to_value(&changed).unwrap()["tunnel_id"], json!(tunnel_id));
+        let pinned = TunnelEvent::KnownHostsChanged { tunnel_id, hop_id: "h".into(), host: "x".into(), port: 22 };
+        assert_eq!(tunnel_event_name(&pinned), None);
     }
 
     #[test]

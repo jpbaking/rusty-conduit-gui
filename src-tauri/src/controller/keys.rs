@@ -4,9 +4,10 @@ use std::fs;
 use std::path::Path;
 
 use conduit_core::{
-    AppConfig, AuthMethod, KeyId, KeySource, SecretRef, SessionProfile, Timestamp, VaultKeyMeta,
+    AppConfig, AuthMethod, KeyId, KeySource, Proxy, SecretRef, SessionProfile, Timestamp, Tunnel,
+    UpstreamPasswordSource, UpstreamProfile, VaultKeyMeta,
 };
-use conduit_vault::{BackupKey, KeyGenAlgorithm, KeyInfo, VaultError};
+use conduit_vault::{BackupKey, KeyGenAlgorithm, KeyInfo, VaultError, UPSTREAM_PASSWORD_RECORD};
 use russh::keys::ssh_key::LineEnding;
 use russh::keys::PrivateKey;
 use serde::{Deserialize, Serialize};
@@ -23,18 +24,93 @@ pub(super) const PASSWORD_RECORD: &str = "password";
 /// they are deleted on unlock.
 pub(super) const RETIRED_PASSPHRASE_RECORD: &str = "passphrase";
 
-/// A host or session that references a key or secret.
+/// A host, session, Tunnel, or Proxy that references a key, secret, CA, or Tunnel.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct UsageRef {
     pub id: Uuid,
     pub name: String,
 }
 
-/// Everything referencing a key or secret.
+/// Everything referencing a key, secret, CA, or Tunnel.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Usage {
     pub hosts: Vec<UsageRef>,
     pub sessions: Vec<UsageRef>,
+    pub tunnels: Vec<UsageRef>,
+    pub proxies: Vec<UsageRef>,
+    /// Names of Profile Library entries.
+    pub library_profiles: Vec<String>,
+}
+
+impl Usage {
+    /// How many things reference the item.
+    pub fn count(&self) -> usize {
+        self.hosts.len()
+            + self.sessions.len()
+            + self.tunnels.len()
+            + self.proxies.len()
+            + self.library_profiles.len()
+    }
+}
+
+pub(super) fn tunnel_ref(tunnel: &Tunnel) -> UsageRef {
+    UsageRef { id: tunnel.id.as_uuid(), name: tunnel.name.clone() }
+}
+
+pub(super) fn proxy_ref(proxy: &Proxy) -> UsageRef {
+    UsageRef { id: proxy.id.as_uuid(), name: proxy.name.clone() }
+}
+
+/// Every Proxy and Profile Library entry with an upstream profile matching `uses`.
+fn profile_usage(config: &AppConfig, uses: impl Fn(&UpstreamProfile) -> bool) -> Usage {
+    Usage {
+        proxies: config
+            .proxies
+            .iter()
+            .filter(|p| p.profiles.iter().any(&uses))
+            .map(proxy_ref)
+            .collect(),
+        library_profiles: config
+            .profile_library
+            .iter()
+            .filter(|p| uses(p))
+            .map(|p| p.name.clone())
+            .collect(),
+        ..Usage::default()
+    }
+}
+
+fn uses_upstream_password(profile: &UpstreamProfile, secret: &SecretRef) -> bool {
+    matches!(&profile.password, Some(UpstreamPasswordSource::Vault(s)) if s == secret)
+}
+
+/// Applies `edit` to every Proxy profile and Profile Library entry, returning the Proxies it
+/// changed.
+pub(super) fn edit_upstream_profiles(
+    config: &mut AppConfig,
+    edit: impl Fn(&mut UpstreamProfile),
+) -> Vec<Proxy> {
+    for profile in &mut config.profile_library {
+        edit(profile);
+    }
+    let mut changed = Vec::new();
+    for proxy in &mut config.proxies {
+        let before = proxy.profiles.clone();
+        for profile in &mut proxy.profiles {
+            edit(profile);
+        }
+        if proxy.profiles != before {
+            changed.push(proxy.clone());
+        }
+    }
+    changed
+}
+
+/// Sessions and Tunnels whose hop auth an edit changed.
+#[derive(Default)]
+pub(super) struct AuthChanges {
+    sessions: Vec<SessionProfile>,
+    tunnels: Vec<Tunnel>,
 }
 
 /// A vault key with its "Used by N" indicator. Contains no private material.
@@ -77,7 +153,13 @@ fn usage_of(config: &AppConfig, uses: impl Fn(&AuthMethod) -> bool) -> Usage {
         .filter(|s| s.hops.iter().any(|hop| hop.host.auth.iter().any(&uses)))
         .map(|s| UsageRef { id: s.id, name: s.name.clone() })
         .collect();
-    Usage { hosts, sessions }
+    let tunnels = config
+        .tunnels
+        .iter()
+        .filter(|t| t.hops.iter().any(|hop| hop.host.auth.iter().any(&uses)))
+        .map(tunnel_ref)
+        .collect();
+    Usage { hosts, sessions, tunnels, ..Usage::default() }
 }
 
 fn key_usage(config: &AppConfig, id: &KeyId) -> Usage {
@@ -85,22 +167,34 @@ fn key_usage(config: &AppConfig, id: &KeyId) -> Usage {
 }
 
 fn secret_usage(config: &AppConfig, secret: &SecretRef) -> Usage {
-    usage_of(config, |m| matches!(m, AuthMethod::Password { secret: s } if s == secret))
+    let hops = usage_of(config, |m| matches!(m, AuthMethod::Password { secret: s } if s == secret));
+    let upstream = profile_usage(config, |p| uses_upstream_password(p, secret));
+    Usage { proxies: upstream.proxies, library_profiles: upstream.library_profiles, ..hops }
 }
 
-/// Applies `edit` to every host's and hop's auth list, returning the sessions it changed.
-fn edit_auth(config: &mut AppConfig, edit: impl Fn(&mut Vec<AuthMethod>)) -> Vec<SessionProfile> {
+/// Applies `edit` to every host's and hop's auth list, returning the sessions and Tunnels it
+/// changed.
+fn edit_auth(config: &mut AppConfig, edit: impl Fn(&mut Vec<AuthMethod>)) -> AuthChanges {
     for host in &mut config.hosts {
         edit(&mut host.auth);
     }
-    let mut changed = Vec::new();
+    let mut changed = AuthChanges::default();
     for session in &mut config.sessions {
         let before = session.hops.clone();
         for hop in &mut session.hops {
             edit(&mut hop.host.auth);
         }
         if session.hops != before {
-            changed.push(session.clone());
+            changed.sessions.push(session.clone());
+        }
+    }
+    for tunnel in &mut config.tunnels {
+        let before = tunnel.hops.clone();
+        for hop in &mut tunnel.hops {
+            edit(&mut hop.host.auth);
+        }
+        if tunnel.hops != before {
+            changed.tunnels.push(tunnel.clone());
         }
     }
     changed
@@ -152,6 +246,11 @@ pub(super) fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), AppErr
 }
 
 impl AppController {
+    fn sync_auth_changes(&self, changed: AuthChanges) {
+        self.sync_profiles(changed.sessions);
+        self.sync_tunnels(changed.tunnels);
+    }
+
     /// Stores a normalized key and records its metadata. Rolls the vault back if saving fails.
     fn store_key(
         &self,
@@ -251,11 +350,7 @@ impl AppController {
             .iter()
             .map(|meta| {
                 let usage = key_usage(&config, &meta.id);
-                KeyView {
-                    meta: meta.clone(),
-                    used_by: usage.hosts.len() + usage.sessions.len(),
-                    usage,
-                }
+                KeyView { meta: meta.clone(), used_by: usage.count(), usage }
             })
             .collect()
     }
@@ -268,7 +363,7 @@ impl AppController {
             return Err(AppError::NotFound { kind: "key", id: id.to_string() });
         }
         let usage = key_usage(&config, id);
-        let used_by = usage.hosts.len() + usage.sessions.len();
+        let used_by = usage.count();
         if !usage_is_empty(&usage) && !force {
             return Ok(DeleteResult { deleted: false, used_by, usage });
         }
@@ -281,7 +376,7 @@ impl AppController {
                 auth.retain(|m| !matches!(m, AuthMethod::Key { key } if key == id));
             }))
         })?;
-        self.sync_profiles(changed);
+        self.sync_auth_changes(changed);
         // The config no longer names this record, so a missing record is already the goal.
         match self.vault_write().delete_secret(&id.to_string()) {
             Ok(()) | Err(VaultError::SecretNotFound { .. }) => {}
@@ -334,15 +429,83 @@ impl AppController {
                     return Err(error);
                 }
             };
-            self.sync_profiles(changed);
+            self.sync_auth_changes(changed);
             self.vault_write().delete_secret(&old.to_string())?;
         }
         Ok(SecretMeta { secret_ref, has_secret: true })
     }
 
-    /// Deletes a password. Same `force` contract as [`Self::delete_key`]. Key and CA records
-    /// are refused, because they must go through `delete_key` and `delete_mitm_ca`.
-    pub fn delete_secret(&self, secret: &SecretRef, force: bool) -> Result<DeleteResult, AppError> {
+    /// Stores an upstream proxy password. With `existing`, rotates it: every Proxy profile and
+    /// Profile Library entry moves to the new record, running Proxies reload with it, and the
+    /// old record is destroyed.
+    pub async fn set_upstream_password(
+        &self,
+        existing: Option<SecretRef>,
+        password: SecretInput,
+    ) -> Result<SecretMeta, AppError> {
+        password.require_non_empty("password")?;
+        if let Some(old) = &existing {
+            if self.record_type(&old.to_string()).as_deref() != Some(UPSTREAM_PASSWORD_RECORD) {
+                return Err(AppError::NotFound { kind: "upstream password", id: old.to_string() });
+            }
+        }
+        let record = self.vault_write().put_upstream_password(password.as_bytes())?;
+        drop(password);
+        let secret_ref = secret_ref_from_record(&record)?;
+        let Some(old) = existing else {
+            return Ok(SecretMeta { secret_ref, has_secret: true });
+        };
+        let replacement = secret_ref.clone();
+        let moved = self.mutate_config(|config| {
+            Ok(edit_upstream_profiles(config, |profile| {
+                if uses_upstream_password(profile, &old) {
+                    profile.password = Some(UpstreamPasswordSource::Vault(replacement.clone()));
+                }
+            }))
+        });
+        let changed = match moved {
+            Ok(changed) => changed,
+            Err(error) => {
+                let _ = self.vault_write().delete_secret(&record);
+                return Err(error);
+            }
+        };
+        for proxy in changed {
+            // The saved config already names the new record; a rejected reload keeps the
+            // running state, which still holds the old password in memory until restarted.
+            if let Err(error) = self.proxies().upsert_proxy(proxy).await {
+                eprintln!("a proxy did not reload after its password changed: {error}");
+            }
+        }
+        self.vault_write().delete_secret(&old.to_string())?;
+        Ok(SecretMeta { secret_ref, has_secret: true })
+    }
+
+    /// Deletes a password: a hop password or an upstream proxy password. Same `force` contract
+    /// as [`Self::delete_key`]; forcing also stops running Proxies that used it, since they hold
+    /// it in memory. Key and CA records are refused, because they must go through `delete_key`
+    /// and `delete_mitm_ca`.
+    pub async fn delete_secret(&self, secret: &SecretRef, force: bool) -> Result<DeleteResult, AppError> {
+        let controller = self.clone();
+        let target = secret.clone();
+        let (outcome, proxies) =
+            super::run_blocking(move || controller.detach_secret(&target, force)).await?;
+        if !outcome.deleted {
+            return Ok(outcome);
+        }
+        self.stop_and_sync_proxies(proxies).await?;
+        let controller = self.clone();
+        let record = secret.to_string();
+        super::run_blocking(move || Ok(controller.vault_write().delete_secret(&record)?)).await?;
+        Ok(outcome)
+    }
+
+    /// The config half of [`Self::delete_secret`]: drops every reference to the secret.
+    fn detach_secret(
+        &self,
+        secret: &SecretRef,
+        force: bool,
+    ) -> Result<(DeleteResult, Vec<Proxy>), AppError> {
         match self.record_type(&secret.to_string()).as_deref() {
             None => return Err(AppError::NotFound { kind: "secret", id: secret.to_string() }),
             Some(KEY_RECORD) => {
@@ -354,21 +517,26 @@ impl AppController {
             Some(_) => {}
         }
         let usage = secret_usage(&self.config_snapshot(), secret);
-        let used_by = usage.hosts.len() + usage.sessions.len();
+        let used_by = usage.count();
         if !usage_is_empty(&usage) && !force {
-            return Ok(DeleteResult { deleted: false, used_by, usage });
+            return Ok((DeleteResult { deleted: false, used_by, usage }, Vec::new()));
         }
         if !self.vault_read().is_unlocked() {
             return Err(VaultError::Locked.into());
         }
-        let changed = self.mutate_config(|config| {
-            Ok(edit_auth(config, |auth| {
+        let (changed, proxies) = self.mutate_config(|config| {
+            let changed = edit_auth(config, |auth| {
                 auth.retain(|m| !matches!(m, AuthMethod::Password { secret: s } if s == secret));
-            }))
+            });
+            let proxies = edit_upstream_profiles(config, |profile| {
+                if uses_upstream_password(profile, secret) {
+                    profile.password = None;
+                }
+            });
+            Ok((changed, proxies))
         })?;
-        self.sync_profiles(changed);
-        self.vault_write().delete_secret(&secret.to_string())?;
-        Ok(DeleteResult { deleted: true, used_by, usage })
+        self.sync_auth_changes(changed);
+        Ok((DeleteResult { deleted: true, used_by, usage }, proxies))
     }
 
     /// Stores the keys of a key-only backup, returning how many were added and skipped.
@@ -627,21 +795,21 @@ mod tests {
         s.hops[0].host.auth = vec![AuthMethod::Password { secret: meta.secret_ref.clone() }];
         c.upsert_session(s).unwrap();
 
-        let refused = c.delete_secret(&meta.secret_ref, false).unwrap();
+        let refused = c.delete_secret(&meta.secret_ref, false).await.unwrap();
         assert!(!refused.deleted);
         assert_eq!(refused.usage.sessions[0].name, "pw");
 
-        assert!(c.delete_secret(&meta.secret_ref, true).unwrap().deleted);
+        assert!(c.delete_secret(&meta.secret_ref, true).await.unwrap().deleted);
         assert_eq!(c.vault_read().record_count(), 0);
         assert!(c.config_snapshot().sessions[0].hops[0].host.auth.is_empty());
         assert!(matches!(
-            c.delete_secret(&meta.secret_ref, true),
+            c.delete_secret(&meta.secret_ref, true).await,
             Err(AppError::NotFound { .. })
         ));
 
         let key = c.generate_key("k", GenerateAlgorithm::Ed25519).unwrap();
         let as_secret = secret_ref_from_record(&key.id.to_string()).unwrap();
-        assert!(matches!(c.delete_secret(&as_secret, true), Err(AppError::Invalid(_))));
+        assert!(matches!(c.delete_secret(&as_secret, true).await, Err(AppError::Invalid(_))));
         assert_eq!(c.vault_read().record_count(), 1);
     }
 

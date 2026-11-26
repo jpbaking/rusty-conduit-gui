@@ -4,6 +4,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  AccessRecordView,
   AppErrorCode,
   AutostartStatus,
   ChainTestResult,
@@ -41,6 +42,22 @@ import type {
   VaultKeyMeta,
   VaultStatus,
   ViewLogsPayload,
+  Proxy,
+  ProxyEvent,
+  ProxyId,
+  ProxySaveResult,
+  ProxySnapshot,
+  ProxyView,
+  RouteInbound,
+  RouteTestResult,
+  Tunnel,
+  TunnelChainTestResult,
+  TunnelEvent,
+  TunnelId,
+  TunnelView,
+  UpstreamProbeResult,
+  UpstreamProfile,
+  V2EventHandlers,
 } from "./types";
 
 /** A failed command. `no_backend` means the page is running outside the desktop app. */
@@ -173,6 +190,64 @@ export const api = {
   importConfig: (path: string, passphrase: string | null = null, replaceExisting = false) =>
     call<ImportSummary>("import_config", { path, passphrase, replaceExisting }),
 
+  // Proxies (v2).
+  listProxies: () => call<ProxyView[]>("list_proxies"),
+  upsertProxy: (profile: Proxy) => call<ProxySaveResult>("upsert_proxy", { profile }),
+  deleteProxy: (id: ProxyId) => call<void>("delete_proxy", { id }),
+  duplicateProxy: (id: ProxyId) => call<ProxySaveResult>("duplicate_proxy", { id }),
+  startProxy: (id: ProxyId) => call<void>("start_proxy", { id }),
+  stopProxy: (id: ProxyId) => call<void>("stop_proxy", { id }),
+  restartProxy: (id: ProxyId) => call<void>("restart_proxy", { id }),
+  /** A profile name (`direct` included), or `null` for Auto Switch. */
+  setProxyOverride: (id: ProxyId, overrideProfile: string | null) =>
+    call<ProxySnapshot>("set_proxy_override", { id, overrideProfile }),
+  getProxyLogs: (id: ProxyId, limit: number | null = null) =>
+    call<LogLine[]>("get_proxy_logs", { id, limit }),
+  clearProxyLogs: (id: ProxyId) => call<void>("clear_proxy_logs", { id }),
+  getProxyAccessRecords: (id: ProxyId, limit: number | null = null) =>
+    call<AccessRecordView[]>("get_proxy_access_records", { id, limit }),
+  /** Route Tester: evaluates `rawTarget` against the draft `proxy`. Needs no vault. */
+  testRoute: (proxy: Proxy, rawTarget: string, inbound: RouteInbound) =>
+    call<RouteTestResult>("test_route", { proxy, rawTarget, inbound }),
+  /** Test Upstream: dials `host:port` through one of the draft `proxy`'s profiles. */
+  testUpstream: (proxy: Proxy, profileName: string, host: string, port: number, timeoutMs: number) =>
+    call<UpstreamProbeResult>("test_upstream", { proxy, profileName, host, port, timeoutMs }),
+  checkProxyPortConflicts: (
+    proxyId: ProxyId | null,
+    bind: string,
+    httpPort: number,
+    socksPort: number,
+  ) => call<PortConflictReport>("check_proxy_port_conflicts", { proxyId, bind, httpPort, socksPort }),
+
+  // Profile Library (v2).
+  listProfileLibrary: () => call<UpstreamProfile[]>("list_profile_library"),
+  upsertLibraryProfile: (profile: UpstreamProfile) =>
+    call<UpstreamProfile>("upsert_library_profile", { profile }),
+  deleteLibraryProfile: (name: string) => call<void>("delete_library_profile", { name }),
+  /** Stores an upstream proxy password, or rotates `existing` to a new record. */
+  setUpstreamPassword: (value: string, existing: SecretRef | null = null) =>
+    call<SecretMeta>("set_upstream_password", { existing, value }),
+
+  // Tunnels (v2).
+  listTunnels: () => call<TunnelView[]>("list_tunnels"),
+  upsertTunnel: (profile: Tunnel) => call<Tunnel>("upsert_tunnel", { profile }),
+  /** Refuses without `force` while Proxies route through the Tunnel, listing them. */
+  deleteTunnel: (id: TunnelId, force = false) => call<DeleteResult>("delete_tunnel", { id, force }),
+  duplicateTunnel: (id: TunnelId) => call<Tunnel>("duplicate_tunnel", { id }),
+  startTunnel: (id: TunnelId) => call<void>("start_tunnel", { id }),
+  stopTunnel: (id: TunnelId) => call<void>("stop_tunnel", { id }),
+  restartTunnel: (id: TunnelId) => call<void>("restart_tunnel", { id }),
+  getTunnelLogs: (id: TunnelId, limit: number | null = null) =>
+    call<LogLine[]>("get_tunnel_logs", { id, limit }),
+  clearTunnelLogs: (id: TunnelId) => call<void>("clear_tunnel_logs", { id }),
+  approveTunnelHostKey: (id: TunnelId, sha256: string) =>
+    call<void>("approve_tunnel_host_key", { id, sha256 }),
+  rejectTunnelHostKey: (id: TunnelId) => call<void>("reject_tunnel_host_key", { id }),
+  /** An unknown key it stops at can be pinned with `trustTestedHostKey` and the Tunnel's id. */
+  testTunnelChain: (id: TunnelId) => call<TunnelChainTestResult>("test_tunnel_chain", { id }),
+  startAllV2: () => call<void>("start_all_v2"),
+  stopAllV2: () => call<void>("stop_all_v2"),
+
   // Desktop shell.
   getAutostart: () => call<AutostartStatus>("get_autostart"),
   setAutostart: (enabled: boolean) => call<AutostartStatus>("set_autostart", { enabled }),
@@ -203,6 +278,32 @@ export async function subscribeShellEvents(handlers: ShellEventHandlers): Promis
     listen<{ message: string; is_warning: boolean }>("migration-notice", (e) =>
       handlers.onUiEvent({ event: "migration-notice", payload: e.payload }),
     ),
+  ]);
+
+  const attached: UnlistenFn[] = [];
+  let failure: unknown;
+  for (const result of results) {
+    if (result.status === "fulfilled") attached.push(result.value);
+    else failure ??= result.reason;
+  }
+  const unlistenAll = () => attached.forEach((unlisten) => unlisten());
+  if (failure !== undefined) {
+    unlistenAll();
+    throw toApiError(failure);
+  }
+  return unlistenAll;
+}
+
+/** Attaches the v2 Proxy and Tunnel event listeners, with the same contract as above. */
+export async function subscribeV2Events(handlers: V2EventHandlers): Promise<UnlistenFn> {
+  if (!hasBackend()) return () => {};
+
+  const onProxy = (e: { payload: ProxyEvent }) => handlers.onProxyEvent(e.payload);
+  const results = await Promise.allSettled([
+    listen<ProxyEvent>("proxy-state-changed", onProxy),
+    listen<ProxyEvent>("proxy-reloaded", onProxy),
+    listen<ProxyEvent>("proxy-override-changed", onProxy),
+    listen<TunnelEvent>("tunnel-state-changed", (e) => handlers.onTunnelEvent(e.payload)),
   ]);
 
   const attached: UnlistenFn[] = [];

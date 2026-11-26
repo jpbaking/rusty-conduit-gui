@@ -3,7 +3,21 @@
 
 import { ApiError } from "./api";
 import type {
+  AccessRecordView,
   CaView,
+  Proxy,
+  ProxySaveResult,
+  ProxySnapshot,
+  ProxyState,
+  ProxyView,
+  RouteTestResult,
+  RouteTarget,
+  Tunnel,
+  TunnelChainTestResult,
+  TunnelSnapshot,
+  TunnelView,
+  UpstreamProbeResult,
+  UpstreamProfile,
   DeleteResult,
   ExportSummary,
   FilterTestResult,
@@ -177,7 +191,7 @@ let keys: KeyView[] = [
     source: "Generated",
     created_at: Math.floor(Date.now() / 1000),
     used_by: 0,
-    usage: { hosts: [], sessions: [] },
+    usage: { hosts: [], sessions: [], tunnels: [], proxies: [], library_profiles: [] },
   },
 ];
 let cas: CaView[] = [
@@ -189,7 +203,7 @@ let cas: CaView[] = [
     fingerprint_sha256: "SHA256:demoCaFingerprintForPreviewOnly",
     created_at: Math.floor(Date.now() / 1000),
     used_by: 0,
-    usage: { hosts: [], sessions: [] },
+    usage: { hosts: [], sessions: [], tunnels: [], proxies: [], library_profiles: [] },
   },
 ];
 let autostart = false;
@@ -302,6 +316,361 @@ function mockOpensshCheck(args?: Record<string, unknown>): OpenSshBinaryInfo {
     message: "OpenSSH 9.6 is supported.",
     note: null,
   };
+}
+
+// ---- v2: Tunnels, Proxies, and the Profile Library. ----
+
+const NO_USAGE = { hosts: [], sessions: [], tunnels: [], proxies: [], library_profiles: [] };
+
+function sampleTunnel(id: string, name: string, host: string): Tunnel {
+  const base = profile(id, name, host, 0);
+  return {
+    id,
+    name,
+    enabled: true,
+    start_mode: "linked",
+    engine: base.engine,
+    hops: base.hops,
+    reverse: base.reverse,
+    port_forwards: [],
+    keepalive: base.tunnel,
+    logging: base.logging,
+    openssh: base.openssh,
+  };
+}
+
+function tunnelSnapshot(t: Tunnel, state: TunnelSnapshot["state"], holders = 0): TunnelSnapshot {
+  return {
+    id: t.id,
+    name: t.name,
+    enabled: t.enabled,
+    start_mode: t.start_mode,
+    engine: t.engine,
+    state,
+    stats: state.state === "connected" ? { ...IDLE_STATS, total_connections: 12, uptime_secs: 900 } : { ...IDLE_STATS },
+    remote_listeners: [],
+    reverse_listeners: [],
+    port_forwards: [],
+    linked_holders: holders,
+  };
+}
+
+const TUNNEL_A = "a1111111-1111-4111-8111-111111111111";
+const TUNNEL_B = "a2222222-2222-4222-8222-222222222222";
+
+let tunnels: TunnelView[] = [
+  { profile: sampleTunnel(TUNNEL_A, "Staging bastion", "192.0.2.10"), snapshot: tunnelSnapshot(sampleTunnel(TUNNEL_A, "Staging bastion", "192.0.2.10"), { state: "connected" }, 1), used_by: [] },
+  { profile: sampleTunnel(TUNNEL_B, "Lab gateway", "198.51.100.7"), snapshot: tunnelSnapshot(sampleTunnel(TUNNEL_B, "Lab gateway", "198.51.100.7"), { state: "stopped" }), used_by: [] },
+];
+
+function blankProxyFields(): Omit<Proxy, "id" | "name"> {
+  return {
+    enabled: true,
+    autostart: false,
+    source: "managed",
+    listeners: { bind: "127.0.0.1", http_port: 3128, socks_port: 1080, max_connections: 4096 },
+    network: { connect_timeout: 10, tcp_keepalive: 60, tcp_keepalive_interval: 10, tcp_keepalive_retries: 5 },
+    profiles: [],
+    routing: { default: "direct", resolve_dns: false, rules: [] },
+    filter: "off",
+    mitm: null,
+    logging: { level: "INFO", format: "text", http_access_log: null, socks_log: null },
+  };
+}
+
+function upstream(name: string, kind: UpstreamProfile["kind"], host: string | null, port: number | null): UpstreamProfile {
+  return { name, kind, host, port, username: null, password: null, bypass: [], color: null };
+}
+
+const PROXY_A = "b1111111-1111-4111-8111-111111111111";
+const PROXY_B = "b2222222-2222-4222-8222-222222222222";
+
+const proxyA: Proxy = {
+  ...blankProxyFields(),
+  id: PROXY_A,
+  name: "Work",
+  profiles: [
+    upstream("corp", { type: "http" }, "192.0.2.80", 8080),
+    upstream("staging", { type: "tunnel", tunnel_id: TUNNEL_A }, null, null),
+  ],
+  routing: {
+    default: "direct",
+    resolve_dns: false,
+    rules: [
+      { name: "intranet", host_wildcard: "*.corp.example", match_all: false, disabled: false, target: ["corp", "direct"] },
+      { name: "staging", host_wildcard: "*.staging.example", match_all: false, disabled: false, target: "staging" },
+    ],
+  },
+};
+const proxyB: Proxy = {
+  ...blankProxyFields(),
+  id: PROXY_B,
+  name: "Direct",
+  listeners: { bind: "127.0.0.1", http_port: 3130, socks_port: 1082, max_connections: 4096 },
+};
+
+function proxySnapshot(p: Proxy, state: ProxyState, generation = 0): ProxySnapshot {
+  const running = state.state === "running";
+  return {
+    id: p.id,
+    name: p.name,
+    enabled: p.enabled,
+    state,
+    listeners: running
+      ? [
+          { role: "HTTP/HTTPS", addr: `${p.listeners.bind}:${p.listeners.http_port}` },
+          { role: "SOCKS4/4a/5", addr: `${p.listeners.bind}:${p.listeners.socks_port}` },
+        ]
+      : [],
+    config_generation: generation,
+    override_profile: running ? state.override_profile : null,
+    restart_required: running ? state.restart_required : false,
+    profile_counters: running ? { corp: { active: 1, bytes_in: 20_480, bytes_out: 4_096, hits: 7 } } : {},
+    rule_counters: running ? { intranet: { active: 1, bytes_in: 20_480, bytes_out: 4_096, hits: 7 } } : {},
+    referenced_tunnels: tunnelIdsOf(p),
+  };
+}
+
+let proxies: ProxyView[] = [
+  { profile: proxyA, snapshot: proxySnapshot(proxyA, { state: "running", override_profile: null, config_generation: 1, restart_required: false }, 1) },
+  { profile: proxyB, snapshot: proxySnapshot(proxyB, { state: "stopped" }) },
+];
+
+let library: UpstreamProfile[] = [upstream("Corporate HTTP", { type: "http" }, "192.0.2.80", 8080)];
+
+const v2Logs = (label: string): LogLine[] =>
+  Array.from({ length: 40 }, (_, seq) => ({ seq, timestamp: now - 40 + seq, text: `INFO ${label} sample line ${seq}` }));
+
+function tunnelIdsOf(p: Proxy): string[] {
+  return p.profiles.flatMap((u) => (u.kind.type === "tunnel" ? [u.kind.tunnel_id] : []));
+}
+
+function refreshTunnelUsage(): void {
+  tunnels = tunnels.map((t) => ({
+    ...t,
+    used_by: proxies
+      .filter((p) => tunnelIdsOf(p.profile).includes(t.profile.id))
+      .map((p) => ({ id: p.profile.id, name: p.profile.name })),
+  }));
+}
+refreshTunnelUsage();
+
+function findProxy(args?: Record<string, unknown>): ProxyView {
+  const proxy = proxies.find((p) => p.profile.id === args?.id);
+  if (!proxy) throw new ApiError("not_found", "proxy not found");
+  return proxy;
+}
+
+function findTunnel(args?: Record<string, unknown>): TunnelView {
+  const tunnel = tunnels.find((t) => t.profile.id === args?.id);
+  if (!tunnel) throw new ApiError("not_found", "tunnel not found");
+  return tunnel;
+}
+
+function saveProxy(p: Proxy, isNew: boolean): ProxySaveResult {
+  const saved = structuredClone(p);
+  if (isNew || saved.id === NIL) saved.id = crypto.randomUUID();
+  const existing = proxies.find((v) => v.profile.id === saved.id);
+  let state: ProxyState = existing?.snapshot.state ?? { state: "stopped" };
+  const reloaded = state.state === "running";
+  if (state.state === "running") state = { ...state, config_generation: state.config_generation + 1 };
+  const snapshot = proxySnapshot(saved, state, state.state === "running" ? state.config_generation : 0);
+  const viewed: ProxyView = { profile: saved, snapshot };
+  proxies = existing ? proxies.map((v) => (v.profile.id === saved.id ? viewed : v)) : [...proxies, viewed];
+  refreshTunnelUsage();
+  return structuredClone({ profile: saved, snapshot, reloaded, reload_error: null });
+}
+
+const firstTarget = (target: RouteTarget): string[] => (Array.isArray(target) ? target : [target]);
+
+/** A tiny stand-in for the engine: exact and `*.` wildcard host rules only. */
+function mockRouteTest(args?: Record<string, unknown>): RouteTestResult {
+  const proxy = args?.proxy as Proxy;
+  const host = String(args?.rawTarget ?? "").replace(/^[a-z]+:\/\//, "").split(/[/:]/)[0] ?? "";
+  const matches = (pattern: string) =>
+    pattern.startsWith("*.") ? host.endsWith(pattern.slice(1)) : host === pattern;
+  const asList = (value: string | string[] | undefined) => (value === undefined ? [] : Array.isArray(value) ? value : [value]);
+  const rule = proxy.routing.rules.find(
+    (r) => !r.disabled && (r.match_all || [...asList(r.host), ...asList(r.host_wildcard)].some(matches)),
+  );
+  const names = firstTarget(rule ? rule.target : proxy.routing.default);
+  return {
+    table: "[routing]",
+    matched_rule: rule ? (rule.name ?? "rule") : null,
+    blocked_by_filter: false,
+    filter_reason: null,
+    targets: names.map((name) => ({ name, profile: name, redacted_upstream: name === "direct" ? "direct" : `${name} (redacted)`, bypassed: false })),
+  };
+}
+
+function mockAccessRecords(): AccessRecordView[] {
+  return Array.from({ length: 5 }, (_, i) => ({
+    kind: i % 2 === 0 ? "http" : "socks",
+    ts_ms: Date.now() - (5 - i) * 1000,
+    direction: "forward",
+    client: "127.0.0.1:50000",
+    proto: i % 2 === 0 ? "HTTP/1.1" : "SOCKS5",
+    method: i % 2 === 0 ? "CONNECT" : "connect",
+    target: `app${i}.corp.example:443`,
+    rule: "intranet",
+    profile: "corp",
+    upstream: "http://192.0.2.80:8080",
+    status: i % 2 === 0 ? "200" : "succeeded",
+    mitm: false,
+    bytes_in: 4096 * (i + 1),
+    bytes_out: 1024 * (i + 1),
+    duration_ms: 120 * (i + 1),
+  }));
+}
+
+const NOT_HANDLED = Symbol("not handled");
+
+function dispatchV2(command: string, args?: Record<string, unknown>): unknown {
+  switch (command) {
+    case "list_proxies":
+      return structuredClone(proxies);
+    case "upsert_proxy":
+      return saveProxy(args?.profile as Proxy, false);
+    case "duplicate_proxy": {
+      const source = findProxy(args).profile;
+      return saveProxy({ ...source, name: `${source.name} (copy)`, autostart: false }, true);
+    }
+    case "delete_proxy":
+      findProxy(args);
+      proxies = proxies.filter((p) => p.profile.id !== args?.id);
+      refreshTunnelUsage();
+      return null;
+    case "start_proxy":
+    case "restart_proxy": {
+      const p = findProxy(args);
+      p.snapshot = proxySnapshot(p.profile, { state: "running", override_profile: null, config_generation: p.snapshot.config_generation + 1, restart_required: false }, p.snapshot.config_generation + 1);
+      return null;
+    }
+    case "stop_proxy": {
+      const p = findProxy(args);
+      p.snapshot = proxySnapshot(p.profile, { state: "stopped" });
+      return null;
+    }
+    case "set_proxy_override": {
+      const p = findProxy(args);
+      if (p.snapshot.state.state !== "running") throw new ApiError("runtime", "proxy is not running");
+      const override = (args?.overrideProfile as string | null) ?? null;
+      p.snapshot = proxySnapshot(p.profile, { ...p.snapshot.state, override_profile: override }, p.snapshot.config_generation);
+      return structuredClone(p.snapshot);
+    }
+    case "get_proxy_logs":
+      return v2Logs(findProxy(args).profile.name);
+    case "clear_proxy_logs":
+    case "clear_tunnel_logs":
+      return null;
+    case "get_proxy_access_records":
+      findProxy(args);
+      return mockAccessRecords();
+    case "test_route":
+      return mockRouteTest(args);
+    case "test_upstream": {
+      const proxy = args?.proxy as Proxy;
+      const name = String(args?.profileName);
+      const known = name === "direct" || proxy.profiles.some((u) => u.name === name);
+      return (known
+        ? { ok: true, elapsed_ms: 42, redacted_upstream: name, error: null }
+        : { ok: false, elapsed_ms: 0, redacted_upstream: name, error: `unknown upstream profile \`${name}\`` }) satisfies UpstreamProbeResult;
+    }
+    case "check_proxy_port_conflicts": {
+      const bind = String(args?.bind);
+      const ports = new Set([Number(args?.httpPort), Number(args?.socksPort)].filter((p) => p !== 0));
+      const conflicts: PortConflict[] = [];
+      for (const other of proxies) {
+        if (other.profile.id === args?.proxyId || !bindsOverlap(bind, other.profile.listeners.bind)) continue;
+        for (const port of [other.profile.listeners.http_port, other.profile.listeners.socks_port]) {
+          if (ports.has(port)) conflicts.push({ port, kind: "session", detail: `Used by proxy "${other.profile.name}".` });
+        }
+      }
+      return { conflicts } satisfies PortConflictReport;
+    }
+    case "list_profile_library":
+      return structuredClone(library);
+    case "upsert_library_profile": {
+      const saved = structuredClone(args?.profile) as UpstreamProfile;
+      library = [...library.filter((u) => u.name !== saved.name), saved];
+      return structuredClone(saved);
+    }
+    case "delete_library_profile":
+      library = library.filter((u) => u.name !== args?.name);
+      return null;
+    case "set_upstream_password":
+      return { secret_ref: crypto.randomUUID(), has_secret: true };
+    case "list_tunnels":
+      return structuredClone(tunnels);
+    case "upsert_tunnel": {
+      const saved = structuredClone(args?.profile) as Tunnel;
+      if (saved.id === NIL) saved.id = crypto.randomUUID();
+      const existing = tunnels.find((t) => t.profile.id === saved.id);
+      const snapshot = tunnelSnapshot(saved, existing?.snapshot.state ?? { state: "stopped" }, existing?.snapshot.linked_holders ?? 0);
+      const viewed: TunnelView = { profile: saved, snapshot, used_by: existing?.used_by ?? [] };
+      tunnels = existing ? tunnels.map((t) => (t.profile.id === saved.id ? viewed : t)) : [...tunnels, viewed];
+      return structuredClone(saved);
+    }
+    case "duplicate_tunnel": {
+      const source = findTunnel(args).profile;
+      const copy: Tunnel = { ...structuredClone(source), id: crypto.randomUUID(), name: `${source.name} (copy)` };
+      tunnels = [...tunnels, { profile: copy, snapshot: tunnelSnapshot(copy, { state: "stopped" }), used_by: [] }];
+      return structuredClone(copy);
+    }
+    case "delete_tunnel": {
+      const t = findTunnel(args);
+      if (t.used_by.length > 0 && !args?.force) {
+        return { deleted: false, used_by: t.used_by.length, usage: { ...NO_USAGE, proxies: t.used_by } } satisfies DeleteResult;
+      }
+      tunnels = tunnels.filter((v) => v.profile.id !== args?.id);
+      return { deleted: true, used_by: t.used_by.length, usage: { ...NO_USAGE, proxies: t.used_by } } satisfies DeleteResult;
+    }
+    case "start_tunnel":
+    case "restart_tunnel":
+    case "approve_tunnel_host_key": {
+      const t = findTunnel(args);
+      t.snapshot = tunnelSnapshot(t.profile, { state: "connected" }, t.snapshot.linked_holders);
+      return null;
+    }
+    case "stop_tunnel": {
+      const t = findTunnel(args);
+      t.snapshot = tunnelSnapshot(t.profile, { state: "stopped" }, t.snapshot.linked_holders);
+      return null;
+    }
+    case "reject_tunnel_host_key": {
+      const t = findTunnel(args);
+      t.snapshot = tunnelSnapshot(t.profile, { state: "needs_attention", reason: "host key rejected" }, t.snapshot.linked_holders);
+      return null;
+    }
+    case "get_tunnel_logs":
+      return v2Logs(findTunnel(args).profile.name);
+    case "test_tunnel_chain": {
+      const t = findTunnel(args);
+      return {
+        tunnel_id: t.profile.id,
+        all_connected: true,
+        hops: t.profile.hops.map((hop, hop_index) => ({
+          hop_index,
+          hop_id: hop.hop_id,
+          host: hop.host.host,
+          port: hop.host.port,
+          status: "connected",
+          error: null,
+          elapsed_ms: 35,
+          host_key: null,
+        })),
+      } satisfies TunnelChainTestResult;
+    }
+    case "start_all_v2":
+      proxies.filter((p) => p.profile.enabled).forEach((p) => dispatchV2("start_proxy", { id: p.profile.id }));
+      return null;
+    case "stop_all_v2":
+      proxies.forEach((p) => dispatchV2("stop_proxy", { id: p.profile.id }));
+      tunnels.forEach((t) => dispatchV2("stop_tunnel", { id: t.profile.id }));
+      return null;
+    default:
+      return NOT_HANDLED;
+  }
 }
 
 function dispatch(command: string, args?: Record<string, unknown>): unknown {
@@ -466,7 +835,7 @@ function dispatch(command: string, args?: Record<string, unknown>): unknown {
       return cas.map((ca) => {
         const users = sessions.filter((s) => s.profile.mitm?.ca === ca.id);
         const refs = users.map((s) => ({ id: s.profile.id, name: s.profile.name }));
-        return { ...ca, used_by: refs.length, usage: { hosts: [], sessions: refs } } satisfies CaView;
+        return { ...ca, used_by: refs.length, usage: { hosts: [], sessions: refs, tunnels: [], proxies: [], library_profiles: [] } } satisfies CaView;
       });
     case "import_mitm_ca": {
       const now = Math.floor(Date.now() / 1000);
@@ -478,7 +847,7 @@ function dispatch(command: string, args?: Record<string, unknown>): unknown {
         fingerprint_sha256: `SHA256:preview${cas.length}`,
         created_at: now,
         used_by: 0,
-        usage: { hosts: [], sessions: [] },
+        usage: { hosts: [], sessions: [], tunnels: [], proxies: [], library_profiles: [] },
       };
       cas = [...cas, ca];
       return ca;
@@ -500,7 +869,7 @@ function dispatch(command: string, args?: Record<string, unknown>): unknown {
       return { deleted: true, used_by: users.length, usage } satisfies DeleteResult;
     }
     case "delete_secret":
-      return { deleted: true, used_by: 0, usage: { hosts: [], sessions: [] } } satisfies DeleteResult;
+      return { deleted: true, used_by: 0, usage: { hosts: [], sessions: [], tunnels: [], proxies: [], library_profiles: [] } } satisfies DeleteResult;
     case "upsert_host": {
       const saved = structuredClone(args?.host) as HostProfile;
       if (saved.id === NIL) saved.id = crypto.randomUUID();
@@ -568,7 +937,7 @@ function dispatch(command: string, args?: Record<string, unknown>): unknown {
         source: generated ? "Generated" : (args?.source as KeyView["source"]),
         created_at: Math.floor(Date.now() / 1000),
         used_by: 0,
-        usage: { hosts: [], sessions: [] },
+        usage: { hosts: [], sessions: [], tunnels: [], proxies: [], library_profiles: [] },
       };
       keys = [...keys, key];
       return key;
@@ -638,8 +1007,11 @@ function dispatch(command: string, args?: Record<string, unknown>): unknown {
     case "reject_host_key":
       find(args).runtime.state = { state: "needs_attention", reason: "host key rejected" };
       return null;
-    default:
+    default: {
+      const handled = dispatchV2(command, args);
+      if (handled !== NOT_HANDLED) return handled;
       throw new ApiError("invalid", `"${command}" is not available in the browser preview.`);
+    }
   }
 }
 

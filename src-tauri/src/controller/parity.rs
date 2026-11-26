@@ -5,7 +5,7 @@ use std::io::ErrorKind;
 use std::net::{IpAddr, TcpListener};
 use std::str::FromStr;
 
-use conduit_core::ForwardDirection;
+use conduit_core::{ForwardDirection, ProxyId};
 use conduit_openssh::OpenSshBinaryInfo;
 use rusty_conduit_engine::filter::{FilterRule, HostFilter};
 use serde::{Deserialize, Serialize};
@@ -15,6 +15,10 @@ use super::AppController;
 
 /// `kind` of a conflict with another saved session's forward port.
 const CONFLICT_SESSION: &str = "session";
+/// `kind` of a conflict with another saved Proxy's listener.
+const CONFLICT_PROXY: &str = "proxy";
+/// `kind` of a conflict with a Tunnel's local port forward.
+const CONFLICT_TUNNEL: &str = "tunnel";
 /// `kind` of a conflict with a socket already bound on this machine.
 const CONFLICT_OS_SOCKET: &str = "os_socket";
 /// The program used when a session does not name one.
@@ -24,7 +28,7 @@ const DEFAULT_SSH_BIN: &str = "ssh";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PortConflict {
     pub port: u16,
-    /// `session` | `os_socket`.
+    /// `session` | `proxy` | `tunnel` | `os_socket`.
     pub kind: &'static str,
     pub detail: String,
 }
@@ -183,6 +187,77 @@ impl AppController {
                         detail: format!(
                             "session \"{}\" forwards {} to {}",
                             other.name,
+                            forward.listen(),
+                            forward.destination()
+                        ),
+                    });
+                }
+            }
+            let owned = own_listeners
+                .iter()
+                .any(|addr| addr.port() == port && binds_overlap(bind, addr.ip()));
+            if owned {
+                continue;
+            }
+            if let Err(error) = TcpListener::bind((bind, port)) {
+                if error.kind() == ErrorKind::AddrInUse {
+                    conflicts.push(PortConflict {
+                        port,
+                        kind: CONFLICT_OS_SOCKET,
+                        detail: format!("{bind}:{port} is already in use on this machine"),
+                    });
+                }
+            }
+        }
+        PortConflictReport { conflicts }
+    }
+
+    /// Checks each non-zero port of a Proxy draft against other saved Proxies, every Tunnel's
+    /// local port forwards, and the live OS socket table. A listener `proxy_id` itself holds
+    /// while running is not a conflict.
+    pub fn check_proxy_port_conflicts(
+        &self,
+        proxy_id: Option<ProxyId>,
+        bind: IpAddr,
+        http_port: u16,
+        socks_port: u16,
+    ) -> PortConflictReport {
+        let config = self.config_snapshot();
+        let own_listeners: Vec<std::net::SocketAddr> = proxy_id
+            .and_then(|id| self.proxies().snapshot(id).ok())
+            .map(|snapshot| snapshot.listeners.into_iter().map(|l| l.addr).collect())
+            .unwrap_or_default();
+        let ports: BTreeSet<u16> = [http_port, socks_port].into_iter().filter(|p| *p != 0).collect();
+
+        let mut conflicts = Vec::new();
+        for port in ports {
+            for other in config.proxies.iter().filter(|p| Some(p.id) != proxy_id) {
+                if !binds_overlap(bind, other.listeners.bind) {
+                    continue;
+                }
+                let roles = [("HTTP", other.listeners.http_port), ("SOCKS", other.listeners.socks_port)];
+                for (role, _) in roles.iter().filter(|(_, p)| *p == port) {
+                    conflicts.push(PortConflict {
+                        port,
+                        kind: CONFLICT_PROXY,
+                        detail: format!(
+                            "proxy \"{}\" uses {}:{port} for {role}",
+                            other.name, other.listeners.bind
+                        ),
+                    });
+                }
+            }
+            for tunnel in &config.tunnels {
+                let forwards = tunnel
+                    .active_forwards_in(ForwardDirection::Local)
+                    .filter(|f| f.port == port && binds_overlap(bind, f.bind));
+                for forward in forwards {
+                    conflicts.push(PortConflict {
+                        port,
+                        kind: CONFLICT_TUNNEL,
+                        detail: format!(
+                            "tunnel \"{}\" forwards {} to {}",
+                            tunnel.name,
                             forward.listen(),
                             forward.destination()
                         ),
@@ -382,5 +457,60 @@ mod tests {
         let blank = test_filter_rules(FilterMode::Block, &rules(&["a.example"]), "  ");
         assert!(!blank.valid);
         assert_eq!(blank.allowed, None);
+    }
+
+    fn v2_proxy(name: &str, bind: &str, http: u16, socks: u16) -> conduit_core::Proxy {
+        conduit_core::Proxy {
+            id: ProxyId::new(),
+            name: name.into(),
+            listeners: conduit_core::ListenerConfig {
+                bind: bind.parse().unwrap(),
+                http_port: http,
+                socks_port: socks,
+                ..conduit_core::ListenerConfig::default()
+            },
+            ..conduit_core::Proxy::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn parity_proxy_port_check_sees_proxies_tunnel_forwards_and_os_sockets() {
+        let dir = TempDir::new();
+        let c = controller(&dir);
+        let other = v2_proxy("other", "0.0.0.0", 18080, 18081);
+        let own = v2_proxy("own", "127.0.0.1", 18082, 0);
+        let mut tunnel = conduit_core::Tunnel { name: "fwd".into(), ..conduit_core::Tunnel::default() };
+        tunnel.port_forwards.push(conduit_core::PortForward {
+            enabled: true,
+            direction: ForwardDirection::Local,
+            bind: "127.0.0.1".parse().unwrap(),
+            port: 18083,
+            dest_host: "db".into(),
+            dest_port: 5432,
+            ..conduit_core::PortForward::default()
+        });
+        c.mutate_config(|config| {
+            config.proxies.extend([other.clone(), own.clone()]);
+            config.tunnels.push(tunnel);
+            Ok(())
+        })
+        .unwrap();
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+
+        let report = c.check_proxy_port_conflicts(Some(own.id), loopback, 18080, 18083);
+        let kinds: Vec<_> = report.conflicts.iter().map(|c| (c.port, c.kind)).collect();
+        assert!(kinds.contains(&(18080, "proxy")), "{report:?}");
+        assert!(kinds.contains(&(18083, "tunnel")), "{report:?}");
+
+        // The edited Proxy's own saved ports are not conflicts.
+        assert!(c.check_proxy_port_conflicts(Some(own.id), loopback, 18082, 0).conflicts.is_empty());
+        // Without an id, the saved "own" Proxy conflicts like any other.
+        assert_eq!(c.check_proxy_port_conflicts(None, loopback, 18082, 0).conflicts[0].kind, "proxy");
+
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = held.local_addr().unwrap().port();
+        let busy = c.check_proxy_port_conflicts(None, loopback, port, port);
+        assert_eq!(busy.conflicts.len(), 1);
+        assert_eq!(busy.conflicts[0].kind, "os_socket");
     }
 }

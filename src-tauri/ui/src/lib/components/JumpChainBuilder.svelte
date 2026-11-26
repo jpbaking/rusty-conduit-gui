@@ -1,23 +1,63 @@
+<script lang="ts" module>
+  import { getContext, setContext } from "svelte";
+  import { store } from "../stores.svelte";
+  import type { HopEntry, HopTestResult, SessionProfile, SessionView, TunnelStartMode } from "../types";
+  import type { FieldErrors } from "../validate";
+
+  /**
+   * What the shared SSH tabs (route, reverse proxy, port forwards, keepalive, logging) edit.
+   * The store itself is one, for the v1 session editor. The Tunnel editor provides another that
+   * shows a Tunnel in the same shape, so the tabs work unchanged for both.
+   */
+  export interface ChainEditor {
+    readonly draft: SessionProfile | null;
+    readonly draftErrors: FieldErrors;
+    updateDraft(edit: (profile: SessionProfile) => SessionProfile): void;
+    readonly selectedHop: HopEntry | null;
+    selectedHopId: string | null;
+    readonly chainResult: { all_connected: boolean; hops: HopTestResult[] } | null;
+    testSelected(): Promise<void>;
+    /** The saved item with its runtime, or `null` while unsaved. */
+    readonly selected: SessionView | null;
+    /** Set for a Tunnel: how it starts, in place of the session's autostart. */
+    readonly startMode?: TunnelStartMode;
+    setStartMode?(mode: TunnelStartMode): void;
+    /** Set for a Tunnel: there is no forward proxy to fall back to. */
+    readonly isTunnel?: boolean;
+  }
+
+  const CHAIN_EDITOR = Symbol("chain-editor");
+
+  /** Makes the SSH tabs below the calling component edit `editor` instead of the session. */
+  export function provideChainEditor(editor: ChainEditor): void {
+    setContext(CHAIN_EDITOR, editor);
+  }
+
+  /** The editor the SSH tabs work on: the Tunnel editor's if there is one, else the session's. */
+  export function chainEditor(): ChainEditor {
+    return getContext<ChainEditor | undefined>(CHAIN_EDITOR) ?? store;
+  }
+</script>
+
 <script lang="ts">
   import { tick } from "svelte";
   import { hopBadge, hopRole, hopTitle, moved, newHop } from "../chain";
-  import { store } from "../stores.svelte";
-  import type { HopEntry } from "../types";
 
-  const hops = $derived(store.draft?.hops ?? []);
-  const selected = $derived(store.selectedHop);
-  const results = $derived(new Map((store.chainResult?.hops ?? []).map((r) => [r.hop_id, r])));
+  const ed = chainEditor();
+  const hops = $derived(ed.draft?.hops ?? []);
+  const selected = $derived(ed.selectedHop);
+  const results = $derived(new Map((ed.chainResult?.hops ?? []).map((r) => [r.hop_id, r])));
   // Only one hop's form shows at a time, so the route marks the others that have errors.
   const invalidHops = $derived(
     new Set(
-      Object.keys(store.draftErrors).flatMap((field) => {
+      Object.keys(ed.draftErrors).flatMap((field) => {
         const match = /^hop:([^:]+):/.exec(field);
         return match ? [match[1]] : [];
       }),
     ),
   );
   const failed = $derived(
-    store.chainResult?.hops.find((r) => r.status === "failed" || r.status === "host_key_unknown") ?? null,
+    ed.chainResult?.hops.find((r) => r.status === "failed" || r.status === "host_key_unknown") ?? null,
   );
 
   let list = $state<HTMLOListElement>();
@@ -26,7 +66,7 @@
   let announcement = $state("");
 
   function setHops(edit: (current: HopEntry[]) => HopEntry[]) {
-    store.updateDraft((profile) => ({ ...profile, hops: edit(profile.hops) }));
+    ed.updateDraft((profile) => ({ ...profile, hops: edit(profile.hops) }));
   }
 
   function addJump() {
@@ -36,7 +76,7 @@
       const at = Math.max(current.length - 1, 0);
       return [...current.slice(0, at), hop, ...current.slice(at)];
     });
-    store.selectedHopId = hop.hop_id;
+    ed.selectedHopId = hop.hop_id;
     announcement = "Hop added.";
   }
 
@@ -70,7 +110,7 @@
     (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
     dragId = hop.hop_id;
     dropIndex = index;
-    store.selectedHopId = hop.hop_id;
+    ed.selectedHopId = hop.hop_id;
   }
 
   function onDragMove(event: PointerEvent) {
@@ -131,7 +171,7 @@
         <button
           class="hop-select"
           aria-pressed={selected?.hop_id === hop.hop_id}
-          onclick={() => (store.selectedHopId = hop.hop_id)}
+          onclick={() => (ed.selectedHopId = hop.hop_id)}
         >
           <small class="hop-role">
             {hopRole(index, hops.length)}
@@ -179,13 +219,13 @@
   {#if failed?.status === "host_key_unknown"}
     <p class="reason" role="alert">
       Hop {failed.hop_index + 1} ({failed.host}:{failed.port}): host key not trusted.
-      <button class="link-button" onclick={() => store.testSelected()}>Review again</button>
+      <button class="link-button" onclick={() => ed.testSelected()}>Review again</button>
     </p>
   {:else if failed}
     <p class="reason" role="alert">
       Hop {failed.hop_index + 1} ({failed.host}:{failed.port}) failed: {failed.error ?? "unknown error"}
     </p>
-  {:else if store.chainResult?.all_connected}
+  {:else if ed.chainResult?.all_connected}
     <p class="ok" role="status">All hops connected.</p>
   {/if}
 </section>

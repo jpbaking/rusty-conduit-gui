@@ -16,7 +16,8 @@ use tokio::time::timeout;
 use crate::backend::{ActionDispatcher, SharedHostStatus, TrayBackend, TrayError};
 use crate::image::TrayImage;
 use crate::model::{
-    TrayAction, TrayHostStatus, TrayIconState, TrayMenuItem, TrayMenuModel, APP_TITLE,
+    TrayAction, TrayHostStatus, TrayIconState, TrayMenuEntry, TrayMenuItem, TrayMenuModel,
+    APP_TITLE,
 };
 
 const TRAY_ID: &str = "rusty-conduit-ssh";
@@ -77,36 +78,69 @@ fn standard_item(item: &TrayMenuItem) -> MenuItem<ConduitTray> {
     .into()
 }
 
+fn label_item(label: &str) -> MenuItem<ConduitTray> {
+    StandardItem {
+        label: escape_label(label),
+        enabled: false,
+        ..Default::default()
+    }
+    .into()
+}
+
+fn submenu(label: &str, submenu: Vec<MenuItem<ConduitTray>>) -> MenuItem<ConduitTray> {
+    SubMenu {
+        label: escape_label(label),
+        submenu,
+        ..Default::default()
+    }
+    .into()
+}
+
+// Recursive, so a Proxy's `Mode ▸` renders as a submenu inside the Proxy's submenu.
+fn entry_item(entry: &TrayMenuEntry) -> MenuItem<ConduitTray> {
+    match entry {
+        TrayMenuEntry::Item(item) => standard_item(item),
+        TrayMenuEntry::Submenu(nested) => {
+            submenu(&nested.label, nested.entries.iter().map(entry_item).collect())
+        }
+    }
+}
+
 fn build_menu(model: &TrayMenuModel) -> Vec<MenuItem<ConduitTray>> {
     let mut menu: Vec<MenuItem<ConduitTray>> = vec![
-        StandardItem {
-            label: escape_label(&format!("{APP_TITLE} — {}", model.summary)),
-            enabled: false,
-            ..Default::default()
-        }
-        .into(),
+        label_item(&format!("{APP_TITLE} — {}", model.summary)),
         MenuItem::Separator,
     ];
 
-    if model.sessions.is_empty() {
-        menu.push(
-            StandardItem {
-                label: "No sessions".into(),
-                enabled: false,
-                ..Default::default()
-            }
-            .into(),
-        );
+    if model.proxies.is_empty() && model.tunnels.is_empty() && model.sessions.is_empty() {
+        menu.push(label_item("No proxies or tunnels"));
+    }
+    if !model.proxies.is_empty() {
+        menu.push(label_item("PROXIES"));
+        for proxy in &model.proxies {
+            menu.push(submenu(
+                &proxy.label(),
+                proxy.entries.iter().map(entry_item).collect(),
+            ));
+        }
+    }
+    if !model.tunnels.is_empty() {
+        menu.push(label_item("TUNNELS"));
+        for tunnel in &model.tunnels {
+            menu.push(submenu(
+                &tunnel.label(),
+                tunnel.items.iter().map(standard_item).collect(),
+            ));
+        }
+    }
+    if !model.sessions.is_empty() && !(model.proxies.is_empty() && model.tunnels.is_empty()) {
+        menu.push(label_item("SESSIONS"));
     }
     for session in &model.sessions {
-        menu.push(
-            SubMenu {
-                label: escape_label(&session.label()),
-                submenu: session.items.iter().map(standard_item).collect(),
-                ..Default::default()
-            }
-            .into(),
-        );
+        menu.push(submenu(
+            &session.label(),
+            session.items.iter().map(standard_item).collect(),
+        ));
     }
 
     menu.push(MenuItem::Separator);
@@ -435,7 +469,83 @@ mod tests {
     #[test]
     fn ksni_empty_menu_shows_placeholder() {
         let menu = build_menu(&TrayMenuModel::from_snapshots(&[], false));
-        assert_eq!(label(&menu[2]), "No sessions");
+        assert_eq!(label(&menu[2]), "No proxies or tunnels");
+    }
+
+    #[test]
+    fn ksni_menu_nests_mode_submenu_inside_proxy() {
+        use crate::model::{ProxyTrayItem, TrayState, TunnelTrayItem};
+        use conduit_core::{ProxyId, TunnelId};
+        use conduit_runtime::ProxyState;
+
+        let proxy_id = ProxyId::new();
+        let state = TrayState {
+            proxies: vec![ProxyTrayItem {
+                id: proxy_id,
+                name: "Work".into(),
+                enabled: true,
+                state: ProxyState::Running {
+                    override_profile: None,
+                    config_generation: 3,
+                    restart_required: false,
+                },
+                listeners: vec![ListenerInfo {
+                    role: "SOCKS4/4a/5".into(),
+                    addr: "127.0.0.1:1080".parse().unwrap(),
+                }],
+                rule_count: 2,
+                profiles: vec!["corp".into()],
+            }],
+            tunnels: vec![TunnelTrayItem {
+                id: TunnelId::new(),
+                name: "Bastion".into(),
+                enabled: true,
+                state: SessionState::Connected,
+                linked: true,
+                linked_to: vec!["Work".into()],
+            }],
+            ..TrayState::default()
+        };
+        let model = TrayMenuModel::from_state(&state);
+        let menu = build_menu(&model);
+        let labels: Vec<&str> = menu.iter().map(label).collect();
+        assert_eq!(
+            labels,
+            [
+                "Rusty Conduit GUI — 1 proxy running · 0 tunnels need attention",
+                "",
+                "PROXIES",
+                "● Work — Auto Switch · SOCKS :1080",
+                "TUNNELS",
+                "● Bastion — Connected (linked to Work)",
+                "",
+                "Start All",
+                "Stop All",
+                "Open Manage Window…",
+                "Quit",
+            ]
+        );
+
+        let MenuItem::SubMenu(proxy) = &menu[3] else {
+            panic!("expected a proxy submenu");
+        };
+        let MenuItem::SubMenu(mode) = &proxy.submenu[0] else {
+            panic!("expected the nested Mode submenu");
+        };
+        assert_eq!(mode.label, "Mode");
+        let mode_labels: Vec<&str> = mode.submenu.iter().map(label).collect();
+        assert_eq!(mode_labels, ["✓ Auto Switch (2 rules)", "Force Direct", "Force corp"]);
+
+        let MenuItem::Standard(force_corp) = &mode.submenu[2] else {
+            panic!("expected Force corp");
+        };
+        let mut tray = tray(model);
+        let mut actions = tray.dispatcher.subscribe();
+        (force_corp.activate)(&mut tray);
+        assert_eq!(
+            actions.try_recv().unwrap(),
+            TrayAction::SetProxyOverride { id: proxy_id, profile: Some("corp".into()) }
+        );
     }
 
     #[test]

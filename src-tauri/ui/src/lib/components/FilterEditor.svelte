@@ -7,14 +7,18 @@
 
   interface Props {
     title: string;
-    scope: "forward" | "reverse";
+    scope: "forward" | "reverse" | "global";
     allow: string[];
     block: string[];
     errors: FieldErrors;
+    /** Where this list's errors live in `errors`. Defaults to `filters.<scope>.`. */
+    errorPrefix?: string;
     onChange: (allow: string[], block: string[]) => void;
   }
 
-  let { title, scope, allow, block, errors, onChange }: Props = $props();
+  let { title, scope, allow, block, errors, errorPrefix, onChange }: Props = $props();
+
+  const prefix = $derived(errorPrefix ?? `filters.${scope}.`);
 
   const MODES: { value: Mode; label: string }[] = [
     { value: "off", label: "Disabled" },
@@ -31,7 +35,7 @@
 
   const mode = $derived<Mode>(allow.length > 0 ? "allow" : block.length > 0 ? "block" : picked);
   const rules = $derived(mode === "allow" ? allow : mode === "block" ? block : []);
-  const conflict = $derived(errors[`filters.${scope}.conflict`]);
+  const conflict = $derived(errors[`${prefix}conflict`]);
 
   let ruleText = $state("");
   let ruleError = $state<string | null>(null);
@@ -164,7 +168,7 @@
     {#if rules.length > 0}
       <ul class="rule-list" aria-label={`${title} rules`}>
         {#each rules as rule, index (`${index}:${rule}`)}
-          {@const problem = errors[`filters.${scope}.${mode}:${index}`]}
+          {@const problem = errors[`${prefix}${mode}:${index}`]}
           <li class="rule-chip" class:bad={!!problem} title={problem}>
             {rule}
             <button type="button" aria-label={`Remove ${rule}`} onclick={() => removeRule(index)}>×</button>
@@ -172,7 +176,7 @@
         {/each}
       </ul>
       {#each rules as _rule, index (index)}
-        {@const problem = errors[`filters.${scope}.${mode}:${index}`]}
+        {@const problem = errors[`${prefix}${mode}:${index}`]}
         {#if problem}<span class="field-error">{problem}</span>{/if}
       {/each}
     {/if}

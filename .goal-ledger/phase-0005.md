@@ -1,53 +1,53 @@
-# phase-0005 — Add headless U2 integration tests and run full verification suite
+# phase-0005 — Build 7-tab Proxy editor, Proxy header (hot-reload/counters), and Log drawer quick actions
 
 - Status: done
 - Owner: executor
 - Depends on: phase-0004
-- Goal: Add a comprehensive headless U2 integration test suite (`crates/conduit-runtime/tests/u2_tunnels_proxies.rs`) covering all §10 U2 scenarios and verify the entire workspace CI suite passes.
-- Done when: All 6+ headless U2 integration tests pass reliably and the complete `Full verification` command (Rust, Python, Frontend) exits 0.
-- Pattern to follow: `crates/conduit-runtime/tests/e2e_runtime.rs:1-120`, `docs/MASTER-PLAN.md:328-331`
+- Goal: Implement the full 7-tab Proxy editor (`ProxyEditor.svelte` + tab subcomponents), Proxy header (`gen #N · hot-reloaded`, `Save (Hot-Reload)` vs `Restart to Apply` banner, live counters, override indicator), and Log drawer (`LogDrawer.svelte`) filtering and quick actions (*Test route*, *Create rule for this host…*).
+- Done when: `cd src-tauri/ui && npm run check && npm test && npm run build` passes with zero errors and zero warnings.
+- Pattern to follow: `src-tauri/ui/src/lib/components/TunnelEditor.svelte`, `src-tauri/ui/src/lib/components/FilterEditor.svelte`, `src-tauri/ui/src/lib/components/MitmTab.svelte`, `src-tauri/ui/src/lib/components/LogDrawer.svelte`, `docs/MASTER-PLAN.md:295-302`
 
 ## Context
-- `docs/MASTER-PLAN.md` §10 U2 requires headless tests covering:
-  1. **Multi-Proxy routing:** two Proxies running concurrently (e.g., one plain `direct` Proxy and one Auto Switch Proxy with rules routing one host to an upstream HTTP/SOCKS5 proxy, another host to an SSH Tunnel, and default to `direct`), verifying per-profile and per-rule traffic counters accumulate accurately.
-  2. **Tunnel failover:** a Proxy with failover chain `["bastion", "direct"]` falls through to `direct` while the `bastion` Tunnel is stopped/down, and routes through `bastion` once the Tunnel is connected (also verifying `Linked` tunnel auto-start/stop).
-  3. **Zero-downtime hot-reload under active `CONNECT` and SOCKS5 tunnels:** open a live HTTP `CONNECT` tunnel and a live SOCKS5 tunnel through a running Proxy, hot-reload the Proxy's routing rules (bumping `config_generation` from 0 to 1), verify both in-flight tunnels continue exchanging data without dropping, and verify new connections follow the new rule while counters keep accumulating.
-  4. **Tray override swap & restore:** switch a running Auto Switch Proxy to `Force Direct`, verify traffic bypasses rules and goes direct; switch to `Force <profile>`, verify traffic goes to that profile; restore to `Auto Switch` (`None`), verify rules take effect again.
-  5. **Cross-Proxy and reverse-listener self-loop detection:** verify a Proxy whose upstream profile points to another running Proxy's listener OR a running Tunnel's reverse-proxy local listener is rejected at start and on hot-reload (leaving the running Proxy's previous routing intact on failed reload).
-  6. **§6.4 `v0.1.0` migration round-trip:** write a v1 `AppConfig` JSON with a `SessionProfile` to disk, run `load_or_migrate_app_config`, verify `config.v1.bak.json` is created, `schema_version == 2`, `tunnels` + `proxies` are populated, and start the migrated Proxy + Linked Tunnel to serve real proxied traffic end-to-end.
-- Also include a test for `test_route` and `test_upstream` against live local listeners.
-- Always use `CARGO_NET_GIT_FETCH_WITH_CLI=true` when running cargo commands.
+- Follow `docs/MASTER-PLAN.md` §9.2 for the 7 Proxy editor tabs:
+  1. **Routing Rules (`ProxyRoutingTab.svelte`)**: table selector (`Unified` / `HTTP override` / `SOCKS override`), default target or failover chain, `resolve_dns` toggle with DNS-leak notice, reorderable rules list (up/down buttons + keyboard reorder + enable/disable toggle), condition chips, failover badges, URL-rule-without-MITM warning badge, rule editor drawer supporting every engine matcher (`inbound`, `host`, `host_wildcard`, `host_regex`, `cidr`, `ip`, `port`, `host_levels`, `bypass`, `weekday`, `time`, `url_wildcard`, `url_regex`, `keyword`, `match_all`, `resolve_dns`, `target`), and inline **Route Tester** (calls `api.testRoute`, shows table, matched rule, bypass, failover chain, redacted upstreams, highlights matched rule).
+  2. **Upstream Profiles (`ProxyProfilesTab.svelte`)**: shows built-ins (`direct`, `block`) + all configured profiles (`http`, `https` with `tls_insecure_skip_verify`, `socks5`, `socks4a`, `composite`, `tunnel` referencing a Tunnel), color badge, write-only vaulted password (`api.setUpstreamPassword`) or `password_env` / `password_file`, import-from-Profile-Library picker, bypass lists, self-loop warning, and **Test Upstream** button (calls `api.testUpstream`, shows timing and redacted error).
+  3. **Listeners & Network (`ProxyListenersTab.svelte`)**: bind address (with non-loopback warning), HTTP/SOCKS ports, mux checkbox, `max_connections`, live port-conflict check (`api.checkProxyPortConflicts`), `connect_timeout`, and TCP keepalive settings.
+  4. **Global Filter**: mode (`Off` / `Allow` / `Block`), rule editor, bulk paste, host checker (reusing `FilterEditor.svelte`).
+  5. **HTTPS MITM**: CA selector from Vault, `cert_ttl`, `cert_cache_max_entries`, `socks_block_web` (reusing `MitmTab.svelte` adapted for `Proxy`).
+  6. **Import / Export & TOML (`ProxyImportExportTab.svelte`)**: clean placeholder panel explaining AirSwitch `.bak` / CLI `config.toml` / External TOML link mode coming in Milestone U4 (displays current `source` mode).
+  7. **Logging & General (`ProxyLoggingTab.svelte`)**: name, `enabled`, `autostart`, log level/format, optional HTTP/SOCKS log file paths.
+- **Proxy Header**: title, state pill, `gen #N · hot-reloaded` badge when running, `Restart to Apply` banner with Restart button when `restart_required` is true, live per-profile/total counters, Test Route shortcut, Save (Hot-Reload vs Save), Start/Stop/Restart, and tray override pill.
+- **Log drawer (`LogDrawer.svelte`)**: support both Proxy and Tunnel logs, filter by kind/level/profile/rule/text, pause/copy/clear; on Proxy access log rows, add **Test route** (opens Route Tester pre-filled with that host) and **Create rule for this host…** (opens Routing Rules tab with a new draft rule for that host).
+- Note: `npm run build` rewrites the tracked `src-tauri/ui/dist/` directory (which will be rebuilt and committed in phase-0006). After `npm run build` passes, restore `src-tauri/ui/dist/` (`git checkout -- src-tauri/ui/dist && git clean -fd src-tauri/ui/dist`) before committing so only `Scope: In` files are staged.
 
 ## Scope
-- In: `crates/conduit-runtime/tests/u2_tunnels_proxies.rs` (create)
-- Out: `Cargo.toml`, `crates/conduit-core/`, `crates/conduit-vault/`, `crates/conduit-ssh/`, `crates/conduit-openssh/`, `crates/conduit-tray/`, `src-tauri/`, `.github/`, `scripts/`, `docs/`
+- In: `src-tauri/ui/src/lib/components/ProxyEditor.svelte`, `src-tauri/ui/src/lib/components/ProxyRoutingTab.svelte` (create), `src-tauri/ui/src/lib/components/ProxyProfilesTab.svelte` (create), `src-tauri/ui/src/lib/components/ProxyListenersTab.svelte` (create), `src-tauri/ui/src/lib/components/ProxyImportExportTab.svelte` (create), `src-tauri/ui/src/lib/components/ProxyLoggingTab.svelte` (create), `src-tauri/ui/src/lib/components/LogDrawer.svelte`, `src-tauri/ui/src/lib/components/MitmTab.svelte`, `src-tauri/ui/src/lib/components/FilterEditor.svelte`, `src-tauri/ui/src/lib/components/SessionEditor.svelte` (remove if unused), `src-tauri/ui/src/lib/stores.svelte.ts` (only if needed for LogDrawer → ProxyEditor quick-action handoff)
+- Out: `crates/`, `src-tauri/src/`
 
 ## Sub-tasks
-1. [done] Create `crates/conduit-runtime/tests/u2_tunnels_proxies.rs` with reusable in-process echo/HTTP origin and in-process `russh` server helpers, and implement tests for (1) multi-Proxy routing + counters and (2) Tunnel failover (`["bastion", "direct"]`) + `Linked` lifecycle — done when: both tests pass under `cargo test -p conduit-runtime --test u2_tunnels_proxies`.
-2. [done] Add tests to `crates/conduit-runtime/tests/u2_tunnels_proxies.rs` for (3) zero-downtime hot-reload under active HTTP `CONNECT` and SOCKS5 tunnels and (4) tray override swap/restore — done when: both tests pass reliably.
-3. [done] Add tests to `crates/conduit-runtime/tests/u2_tunnels_proxies.rs` for (5) cross-Proxy & reverse-listener self-loop detection (at start and on hot-reload), (6) §6.4 `v0.1.0` migration round-trip serving real traffic, and (7) `test_route` + `test_upstream` — done when: all tests in `u2_tunnels_proxies` pass.
-4. [done] Run the complete `## Verify` command (Rust clippy + workspace tests + `secret_leak_scan` + Linux tray check + Python checks + frontend check/test/build) and record observed results in `## Evidence` — done when: every check exits 0.
+1. [done] Create `ProxyRoutingTab.svelte` (table selector, default target/chain, `resolve_dns` notice, reorderable rules, condition/failover/URL-without-MITM badges, rule editor drawer, inline Route Tester with matched-rule highlight) — done when: `npm run check` passes.
+2. [done] Create `ProxyProfilesTab.svelte` (built-ins + all `UpstreamKind` variants incl. `tunnel`, write-only vaulted password / `password_env`, Profile Library import, bypass, Test Upstream probe) and `ProxyListenersTab.svelte` (bind warning, ports, mux, `max_connections`, port-conflict check, `connect_timeout`, keepalive) — done when: `npm run check` passes.
+3. [done] Create `ProxyImportExportTab.svelte` and `ProxyLoggingTab.svelte`, wire all 7 tabs + Proxy header (`gen #N · hot-reloaded`, `Restart to Apply` banner, counters, Save/Start/Stop) in `ProxyEditor.svelte` — done when: `npm run check` passes.
+4. [done] Upgrade `LogDrawer.svelte` for Proxy & Tunnel logs with kind/level/profile/rule/text filters and *Test route* / *Create rule for this host…* quick actions, remove any unused legacy `SessionEditor.svelte`, and run `## Verify` — done when: `## Verify` exits 0.
 
 ## Verify
 ```sh
-CARGO_NET_GIT_FETCH_WITH_CLI=true cargo clippy --workspace --all-targets -- -D warnings && CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test --workspace && CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test -p rusty-conduit-gui --test secret_leak_scan && CARGO_NET_GIT_FETCH_WITH_CLI=true RUSTFLAGS="--cfg conduit_check_tauri_tray" cargo check -p rusty-conduit-gui --tests --features tauri/tray-icon && python3 scripts/check-pure-rust-crypto.py && python3 scripts/validate-release-config.py && python3 scripts/smoke-test-bundle.py --self-test && (cd src-tauri/ui && npm run check && npm test && npm run build)
+cd src-tauri/ui && npm run check && npm test && npm run build
 ```
 
 ## Escalate when
-- An integration test reveals a bug in `conduit-core` or `conduit-runtime` source files (which are Out of scope for this phase) → stop, set Status: needs-human — reason: describe the exact bug and failing test so the planner can open a fix-up
+- `npm run check` reports a Svelte 5 reactivity or type error that requires changing `types.ts` / `stores.svelte.ts` (outside Scope) → stop, set Status: needs-human — reason: list the exact type or store change needed
 
 ## Log
 - (append-only, one line per event)
-- sub-task 1: created `crates/conduit-runtime/tests/u2_tunnels_proxies.rs` with hermetic HOME, range-based free_port, in-process russh node (shared `conduit-ssh/tests/common`), echo/HTTP origins, a minimal upstream HTTP CONNECT proxy, and tests (1) `two_proxies_route_concurrently_and_count_per_profile_and_rule` and (2) `failover_chain_falls_through_to_direct_while_the_tunnel_is_down`
-- sub-task 2: added (3) `hot_reload_keeps_live_connect_and_socks_tunnels_and_counters` and (4) `tray_override_swaps_and_auto_switch_restores_rules`
-- sub-task 3: added (5) `self_loops_to_other_proxies_and_reverse_listeners_are_rejected`, (6) `v1_config_migrates_and_the_migrated_proxy_serves_traffic`, (7) `route_tester_and_test_upstream_against_live_listeners` (sub-tasks 1-3 were written in one file pass and checked together)
-- sub-task 4: full `## Verify` failed with ENOSPC (disk full) during clippy, before any check of the new file ran; escalated
-- planner recovery: after `target/` was cleared (25G free), planner took over sub-task 4 with `CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0`; full `## Verify` exited 0 (`target/` kept at 4.1G)
+- sub-task 4: rewrote LogDrawer.svelte for Proxy (app log + HTTP/SOCKS access records), Tunnel, and session logs with kind/level/profile/rule/text filters, pause/copy/clear per target, and per-access-row Test route / Create rule for this host… quick actions via store.requestProxyQuickAction; SessionEditor.svelte kept because App.svelte (out of scope) still imports it; restored src-tauri/ui/dist after build
+- sub-task 3: created ProxyImportExportTab.svelte (U4 placeholder showing source mode) and ProxyLoggingTab.svelte (name/enabled/autostart, level/format, log file paths); rewrote ProxyEditor.svelte body with 7 keyboard-navigable tabs + error badges and header (state pill, gen #N · hot-reloaded, override pill with clear, live counters, Test Route shortcut, Save (Hot-Reload)/Save, Start/Stop/Restart, Restart to Apply banner, reload-error notice); MitmTab gained an optional target prop for Proxy, FilterEditor an optional errorPrefix and global scope
+- sub-task 2: created ProxyProfilesTab.svelte (built-ins, all UpstreamKind variants incl. tunnel, color badge, write-only vault password via api.setUpstreamPassword or env/file source, Profile Library import, bypass, composite self-loop warning, Test Upstream probe) and ProxyListenersTab.svelte (bind non-loopback warning, ports + mux, max_connections, debounced api.checkProxyPortConflicts, connect_timeout, TCP keepalive)
+- sub-task 1: created ProxyRoutingTab.svelte (table selector, default/failover target picker, resolve_dns notice, up/down + Alt+Arrow reorder, enable toggle, condition/failover/URL-without-MITM badges, rule editor drawer for every matcher, inline Route Tester with matched-rule highlight); added ProxyQuickAction handoff (proxyQuickAction, requestProxyQuickAction, takeProxyQuickAction) to stores.svelte.ts
 
 ## Evidence
 - (append-only: command → observed result)
-- `CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test -p conduit-runtime --test u2_tunnels_proxies` → `test result: ok. 7 passed; 0 failed` (0.75s)
-- same command repeated 8 times in a loop → 8/8 `test result: ok. 7 passed; 0 failed`
-- full `## Verify` command → EXIT=101; `error: failed to write query cache to .../target/debug/incremental/conduit_tray-.../query-cache.bin: No space left on device (os error 28)`; `could not compile conduit-tray / conduit-runtime / rusty-conduit-gui`
-- `df -h .` → `/dev/sda2 126G 120G 0 100% /`; `du -sh target` → `25G`
-- planner `CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0` full `## Verify` → EXIT=0: clippy `-D warnings` clean; all workspace tests pass (incl. 7/7 `u2_tunnels_proxies`); `secret_leak_scan` pass; Linux tray check pass; `PURE_RUST_CRYPTO_OK`, `RELEASE_CONFIG_OK`, `SMOKE_TEST_SELF_TEST_OK`; frontend `npm run check` / `npm test` (78/78) / `npm run build` pass; `target/` 4.1G (21G free)
+- `cd src-tauri/ui && npm run check` → 193 FILES 0 ERRORS 0 WARNINGS
+- `cd src-tauri/ui && npm run check` → 195 FILES 0 ERRORS 0 WARNINGS
+- `cd src-tauri/ui && npm run check` → 197 FILES 0 ERRORS 0 WARNINGS
+- `cd src-tauri/ui && npm run check && npm test && npm run build` → exit 0 (svelte-check 197 files 0 errors 0 warnings; tests 93 pass 0 fail; vite ✓ built in 3.02s); `git checkout -- src-tauri/ui/dist && git clean -fdq src-tauri/ui/dist` → git status shows only Scope: In files + ledger

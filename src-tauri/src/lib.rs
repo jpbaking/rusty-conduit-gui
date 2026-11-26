@@ -153,6 +153,14 @@ pub fn run() {
             }
             app.manage(AutostartHandle::new(autostart));
             tauri::async_runtime::spawn(forward_runtime_events(handle.clone(), controller.clone()));
+            tauri::async_runtime::spawn(window::forward_proxy_events(
+                handle.clone(),
+                controller.subscribe_proxy_events(),
+            ));
+            tauri::async_runtime::spawn(window::forward_tunnel_events(
+                handle.clone(),
+                controller.subscribe_tunnel_events(),
+            ));
 
             let backend = tray_bridge::create_backend(&handle, tray_bridge::current_model(&controller));
             let shell = Arc::new(TauriShell::new(handle.clone()));
@@ -167,8 +175,11 @@ pub fn run() {
                 window::open_or_focus_manage_window(&handle)?;
             }
 
-            // Tunnels start whether or not a tray or window is available.
-            tauri::async_runtime::spawn(async move { controller.start_autostart().await });
+            // Tunnels and Proxies start whether or not a tray or window is available.
+            tauri::async_runtime::spawn(async move {
+                controller.start_autostart().await;
+                controller.start_autostart_v2().await;
+            });
             Ok(())
         })
         .build(tauri::generate_context!())

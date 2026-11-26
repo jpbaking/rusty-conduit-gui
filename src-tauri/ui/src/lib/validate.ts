@@ -5,9 +5,18 @@ import type {
   LoggingConfig,
   ForwardPreset,
   MitmConfig,
+  OpenSshOptions,
   PortForward,
+  Proxy,
+  ReverseConfig,
+  RoutePortSpec,
+  RouteTarget,
+  RoutingRule,
   SessionProfile,
+  SshEngine,
+  Tunnel,
   TunnelConfig,
+  TunnelId,
 } from "./types";
 
 /** Field path, such as `forward.bind` or `hop:<id>:host`, mapped to its message. */
@@ -243,42 +252,42 @@ function mitmErrors(errors: FieldErrors, mitm: MitmConfig): void {
   }
 }
 
-function tunnelErrors(errors: FieldErrors, tunnel: TunnelConfig): void {
+function keepaliveErrors(errors: FieldErrors, tunnel: TunnelConfig, prefix = "tunnel"): void {
   if (!["4", "6", "auto"].includes(tunnel.ip_version.trim().toLowerCase())) {
-    errors["tunnel.ip_version"] = "Choose IPv4, IPv6, or Auto.";
+    errors[`${prefix}.ip_version`] = "Choose IPv4, IPv6, or Auto.";
   }
   const seconds = {
-    "tunnel.server_alive_interval": tunnel.server_alive_interval,
-    "tunnel.reconnect_initial_delay": tunnel.reconnect_initial_delay,
-    "tunnel.reconnect_max_delay": tunnel.reconnect_max_delay,
-    "tunnel.startup_timeout": tunnel.startup_timeout,
+    [`${prefix}.server_alive_interval`]: tunnel.server_alive_interval,
+    [`${prefix}.reconnect_initial_delay`]: tunnel.reconnect_initial_delay,
+    [`${prefix}.reconnect_max_delay`]: tunnel.reconnect_max_delay,
+    [`${prefix}.startup_timeout`]: tunnel.startup_timeout,
   };
   for (const [field, value] of Object.entries(seconds)) {
     if (!isWholeNumber(value)) errors[field] = "Use a whole number of seconds.";
   }
   if (!isWholeNumber(tunnel.server_alive_count_max, MAX_U32)) {
-    errors["tunnel.server_alive_count_max"] = `Use a whole number up to ${MAX_U32}.`;
+    errors[`${prefix}.server_alive_count_max`] = `Use a whole number up to ${MAX_U32}.`;
   }
   if (!isWholeNumber(tunnel.tcp_keepalive, MAX_TCP_KEEPALIVE_SECS)) {
-    errors["tunnel.tcp_keepalive"] = `Use 0 (off) or a whole number from 1 to ${MAX_TCP_KEEPALIVE_SECS}.`;
+    errors[`${prefix}.tcp_keepalive`] = `Use 0 (off) or a whole number from 1 to ${MAX_TCP_KEEPALIVE_SECS}.`;
   }
   // Interval and probe count only matter while TCP keepalive is on, as in the engine.
   if (tunnel.tcp_keepalive !== 0) {
     const interval = tunnel.tcp_keepalive_interval;
     if (!isWholeNumber(interval, MAX_TCP_KEEPALIVE_SECS) || interval < 1) {
-      errors["tunnel.tcp_keepalive_interval"] = `Use a whole number from 1 to ${MAX_TCP_KEEPALIVE_SECS}.`;
+      errors[`${prefix}.tcp_keepalive_interval`] = `Use a whole number from 1 to ${MAX_TCP_KEEPALIVE_SECS}.`;
     }
     const retries = tunnel.tcp_keepalive_retries;
     if (!isWholeNumber(retries, MAX_TCP_KEEPALIVE_RETRIES) || retries < 1) {
-      errors["tunnel.tcp_keepalive_retries"] = `Use a whole number from 1 to ${MAX_TCP_KEEPALIVE_RETRIES}.`;
+      errors[`${prefix}.tcp_keepalive_retries`] = `Use a whole number from 1 to ${MAX_TCP_KEEPALIVE_RETRIES}.`;
     }
   }
   if (
-    !errors["tunnel.reconnect_initial_delay"] &&
-    !errors["tunnel.reconnect_max_delay"] &&
+    !errors[`${prefix}.reconnect_initial_delay`] &&
+    !errors[`${prefix}.reconnect_max_delay`] &&
     tunnel.reconnect_initial_delay > tunnel.reconnect_max_delay
   ) {
-    errors["tunnel.reconnect_initial_delay"] = "The initial delay cannot exceed the maximum delay.";
+    errors[`${prefix}.reconnect_initial_delay`] = "The initial delay cannot exceed the maximum delay.";
   }
 }
 
@@ -291,7 +300,10 @@ function loggingErrors(errors: FieldErrors, logging: LoggingConfig): void {
   }
 }
 
-function opensshErrors(errors: FieldErrors, profile: SessionProfile): void {
+function opensshErrors(
+  errors: FieldErrors,
+  profile: { engine: SshEngine; openssh: OpenSshOptions },
+): void {
   const { openssh } = profile;
   if (profile.engine === "OpenSsh" && !openssh.ssh_bin.trim()) {
     errors["openssh.ssh_bin"] = "Enter the ssh program to run.";
@@ -328,7 +340,14 @@ const bindsOverlap = (a: string, b: string): boolean =>
   a === b || a === "0.0.0.0" || a === "::" || b === "0.0.0.0" || b === "::";
 
 /** Field errors for each forward, keyed `forwards:<id>:<field>`. Mirrors `port_forward_problem`. */
-function portForwardErrors(errors: FieldErrors, profile: SessionProfile): void {
+function portForwardErrors(
+  errors: FieldErrors,
+  profile: {
+    forward: SessionProfile["forward"] | null;
+    reverse: ReverseConfig;
+    port_forwards: PortForward[];
+  },
+): void {
   const { forward, reverse } = profile;
   profile.port_forwards.forEach((f: PortForward, index) => {
     const key = (field: string) => `forwards:${f.id}:${field}`;
@@ -341,7 +360,8 @@ function portForwardErrors(errors: FieldErrors, profile: SessionProfile): void {
 
     const [proxyBind, ports, side] =
       f.direction === "local"
-        ? [forward.bind, forward.enabled ? [forward.http_port, forward.socks_port] : [], "forward"]
+        ? // A Tunnel has no forward proxy of its own, so a local forward may use any port.
+          [forward?.bind ?? "", forward?.enabled ? [forward.http_port, forward.socks_port] : [], "forward"]
         : [
             reverse.reverse_bind,
             reverse.enabled ? [reverse.reverse_http_port, reverse.reverse_socks_port] : [],
@@ -412,8 +432,229 @@ export function sessionErrors(profile: SessionProfile): FieldErrors {
   filterErrors(errors, "forward", forward.allow, forward.block);
   filterErrors(errors, "reverse", reverse.reverse_allow, reverse.reverse_block);
   if (profile.mitm) mitmErrors(errors, profile.mitm);
-  tunnelErrors(errors, profile.tunnel);
+  keepaliveErrors(errors, profile.tunnel);
   loggingErrors(errors, profile.logging);
   opensshErrors(errors, profile);
+  return errors;
+}
+
+// ---------------------------------------------------------------------------------------------
+// v2: Tunnels and Proxies. Mirror `validate_tunnel` and `validate_proxy` in `conduit-core`.
+// ---------------------------------------------------------------------------------------------
+
+/** Mirrors `validate_tunnel`. Unlike a v1 session, a Tunnel needs no listener of its own. */
+export function tunnelErrors(tunnel: Tunnel): FieldErrors {
+  const errors: FieldErrors = {};
+  if (!tunnel.name.trim()) errors.name = "Enter a tunnel name.";
+  if (tunnel.hops.length === 0) errors.hops = "Add at least one hop. The last hop is the target.";
+  for (const hop of tunnel.hops) Object.assign(errors, hostErrors(hop.host, `hop:${hop.hop_id}:`));
+
+  const { reverse } = tunnel;
+  if (!isIpAddress(reverse.reverse_bind)) {
+    errors["reverse.bind"] = "Use an IP address, such as 127.0.0.1.";
+  }
+  const ports = { "reverse.http": reverse.reverse_http_port, "reverse.socks": reverse.reverse_socks_port };
+  for (const [field, port] of Object.entries(ports)) {
+    if (!isPort(port, true)) errors[field] = "Use a port from 0 to 65535. 0 turns it off.";
+  }
+  const reverseCap = reverse.reverse_max_connections;
+  if (reverseCap !== null && (!Number.isSafeInteger(reverseCap) || reverseCap < 0)) {
+    errors["reverse.max_connections"] = "Use a whole number. 0 means unlimited.";
+  }
+  if (reverse.enabled && reverse.reverse_http_port === 0 && reverse.reverse_socks_port === 0) {
+    errors["reverse.ports"] = "Set an HTTP or SOCKS port, or switch the reverse proxy off.";
+  }
+  portForwardErrors(errors, { forward: null, reverse, port_forwards: tunnel.port_forwards });
+  filterErrors(errors, "reverse", reverse.reverse_allow, reverse.reverse_block);
+  keepaliveErrors(errors, tunnel.keepalive, "keepalive");
+  loggingErrors(errors, tunnel.logging);
+  opensshErrors(errors, tunnel);
+  return errors;
+}
+
+/** Built-in profile names a Proxy may route to without defining them. */
+export const BUILTIN_PROFILES = ["direct", "block"] as const;
+
+const MAX_U16 = 65_535;
+
+/** Mirrors the engine's `parse_port_spec`: `443`, or `"8000-8080"` (a single `"443"` too). */
+export function portSpecError(spec: RoutePortSpec): string | null {
+  if (typeof spec === "number") {
+    return Number.isInteger(spec) && spec >= 0 && spec <= MAX_U16 ? null : `Invalid port ${spec}.`;
+  }
+  const dash = spec.indexOf("-");
+  const [a, b] = dash >= 0 ? [spec.slice(0, dash).trim(), spec.slice(dash + 1).trim()] : [spec.trim(), spec.trim()];
+  const parse = (text: string) => (/^\+?\d+$/.test(text) && Number(text) <= MAX_U16 ? Number(text) : null);
+  const low = parse(a);
+  const high = parse(b);
+  if (low === null || high === null || low > high) {
+    return `Invalid port or range "${spec}" (use 443 or "8000-8080").`;
+  }
+  return null;
+}
+
+/** Mirrors the engine's `host_targets_listener` for IP literals and `localhost`. */
+function hostTargetsListener(rawHost: string, bind: string): boolean {
+  let host = stripBrackets(rawHost.trim().replace(/\.+$/, ""));
+  if (asciiLower(host) === "localhost") host = "127.0.0.1";
+  if (host.toLowerCase().startsWith("::ffff:") && isIpv4(host.slice(7))) host = host.slice(7);
+  if (!isIpAddress(host)) return false;
+  if (host === bind) return true;
+  const unspecified = (ip: string) => ip === "0.0.0.0" || ip === "::";
+  return unspecified(bind) && (isLoopback(host) || unspecified(host));
+}
+
+const targetNames = (target: RouteTarget): string[] => (Array.isArray(target) ? target : [target]);
+const asList = <T>(value: T | T[] | undefined): T[] =>
+  value === undefined ? [] : Array.isArray(value) ? value : [value];
+
+/**
+ * Field errors for a Proxy, keyed by field path (`listeners.http_port`,
+ * `profiles:<index>:host`, `routing.rules:<index>:target`, `routing.http.default`, ...).
+ * Mirrors `validate_proxy` and the engine checks it runs on profiles, targets, and self-loops.
+ */
+export function proxyErrors(proxy: Proxy, knownTunnels: readonly TunnelId[]): FieldErrors {
+  const errors: FieldErrors = {};
+  if (!proxy.name.trim()) errors.name = "Enter a proxy name.";
+
+  const { listeners, network } = proxy;
+  if (!isIpAddress(listeners.bind)) errors["listeners.bind"] = "Use an IP address, such as 127.0.0.1.";
+  if (!isPort(listeners.http_port, true)) errors["listeners.http_port"] = "Use a port from 0 to 65535. 0 turns it off.";
+  if (!isPort(listeners.socks_port, true)) errors["listeners.socks_port"] = "Use a port from 0 to 65535. 0 turns it off.";
+  if (listeners.http_port === 0 && listeners.socks_port === 0) {
+    errors["listeners.ports"] = "Set a non-zero HTTP or SOCKS port.";
+  }
+  if (!isWholeNumber(listeners.max_connections)) {
+    errors["listeners.max_connections"] = "Use a whole number. 0 means unlimited.";
+  }
+
+  if (proxy.mitm) mitmErrors(errors, proxy.mitm);
+
+  if (!isWholeNumber(network.connect_timeout) || network.connect_timeout === 0) {
+    errors["network.connect_timeout"] = "Use a whole number of seconds greater than 0.";
+  }
+  keepaliveErrors(
+    errors,
+    {
+      ip_version: "auto",
+      server_alive_interval: 0,
+      server_alive_count_max: 0,
+      tcp_keepalive: network.tcp_keepalive,
+      tcp_keepalive_interval: network.tcp_keepalive_interval,
+      tcp_keepalive_retries: network.tcp_keepalive_retries,
+      no_reconnect: false,
+      reconnect_initial_delay: 0,
+      reconnect_max_delay: 0,
+      startup_timeout: 0,
+    },
+    "network",
+  );
+
+  if (proxy.filter !== "off") {
+    const [list, rules] = "allow" in proxy.filter ? ["allow", proxy.filter.allow] : ["block", proxy.filter.block];
+    rules.forEach((rule, index) => {
+      const problem = filterRuleError(rule);
+      if (problem) errors[`filter.${list}:${index}`] = problem;
+    });
+  }
+
+  loggingErrors(errors, proxy.logging);
+
+  // Upstream profiles.
+  const defined = new Set<string>(BUILTIN_PROFILES);
+  const seen = new Set<string>();
+  const ownListeners = [listeners.http_port, listeners.socks_port].filter((port) => port !== 0);
+  proxy.profiles.forEach((profile, index) => {
+    const key = (field: string) => `profiles:${index}:${field}`;
+    const name = profile.name;
+    defined.add(name);
+    if (!name) errors[key("name")] = "Enter a profile name.";
+    else if ((BUILTIN_PROFILES as readonly string[]).includes(name)) {
+      errors[key("name")] = `"${name}" is a built-in profile name.`;
+    } else if (seen.has(name)) {
+      errors[key("name")] = `Another profile is already named "${name}".`;
+    }
+    seen.add(name);
+
+    const { kind } = profile;
+    if (kind.type === "tunnel") {
+      if (!knownTunnels.includes(kind.tunnel_id)) errors[key("tunnel")] = "Choose a tunnel that exists.";
+      return;
+    }
+    if (kind.type === "composite") {
+      if (![kind.http, kind.https, kind.fallback].some((sub) => sub.trim())) {
+        errors[key("composite")] = "Choose at least one of the HTTP, HTTPS, or fallback profiles.";
+      }
+      return;
+    }
+    const host = profile.host?.trim() ?? "";
+    if (!host) errors[key("host")] = "Enter the upstream proxy's host.";
+    if (profile.port === null || profile.port === 0 || !isPort(profile.port)) {
+      errors[key("port")] = "Use a port from 1 to 65535.";
+    } else if (host && ownListeners.includes(profile.port) && hostTargetsListener(host, listeners.bind)) {
+      errors[key("port")] = `This points at the proxy's own listener ${listeners.bind}:${profile.port} (a loop).`;
+    }
+  });
+
+  // Composite sub-profiles must exist; checked after every name is known.
+  proxy.profiles.forEach((profile, index) => {
+    if (profile.kind.type !== "composite") return;
+    for (const field of ["http", "https", "fallback"] as const) {
+      const sub = profile.kind[field].trim();
+      if (sub && !defined.has(sub)) errors[`profiles:${index}:composite.${field}`] = `Unknown profile "${sub}".`;
+    }
+  });
+
+  // Routing targets and rule conditions.
+  const targetError = (target: RouteTarget): string | null => {
+    const names = targetNames(target);
+    if (names.length === 0) return "Choose at least one profile.";
+    const missing = names.find((n) => !defined.has(n));
+    return missing === undefined ? null : `Unknown profile "${missing}".`;
+  };
+  const ruleErrors = (prefix: string, rules: RoutingRule[]) => {
+    rules.forEach((rule, index) => {
+      const key = (field: string) => `${prefix}:${index}:${field}`;
+      const problem = targetError(rule.target);
+      if (problem) errors[key("target")] = problem;
+      const badPort = asList(rule.port).map(portSpecError).find((e) => e !== null);
+      if (badPort) errors[key("port")] = badPort;
+      asList(rule.cidr).forEach((cidr) => {
+        if (!cidr.includes("/") || filterRuleError(cidr) !== null) {
+          errors[key("cidr")] = `Invalid CIDR "${cidr}".`;
+        }
+      });
+      asList(rule.ip).forEach((ip) => {
+        const text = stripBrackets(ip.trim());
+        if (!isIpAddress(text) && !(text.includes("/") && filterRuleError(text) === null)) {
+          errors[key("ip")] = `Invalid IP address "${ip}".`;
+        }
+      });
+      const levels = rule.host_levels;
+      if (levels) {
+        const min = levels.min ?? 0;
+        const max = levels.max ?? Number.MAX_SAFE_INTEGER;
+        if (!isWholeNumber(min, MAX_U32) || !isWholeNumber(max)) {
+          errors[key("host_levels")] = "Use whole numbers.";
+        } else if (min > max) {
+          errors[key("host_levels")] = `The minimum (${min}) is greater than the maximum (${max}).`;
+        }
+      }
+    });
+  };
+
+  const { routing } = proxy;
+  const defaultProblem = targetError(routing.default);
+  if (defaultProblem) errors["routing.default"] = defaultProblem;
+  ruleErrors("routing.rules", routing.rules);
+  for (const inbound of ["http", "socks"] as const) {
+    const table = routing[inbound];
+    if (!table) continue;
+    if (table.default !== undefined) {
+      const problem = targetError(table.default);
+      if (problem) errors[`routing.${inbound}.default`] = problem;
+    }
+    ruleErrors(`routing.${inbound}.rules`, table.rules);
+  }
   return errors;
 }

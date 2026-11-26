@@ -66,6 +66,12 @@ export interface UsageRef {
 export interface Usage {
   hosts: UsageRef[];
   sessions: UsageRef[];
+  // The backend always sends the v2 fields below. Optional so v1 callers that build a `Usage`
+  // by hand still type-check until the v2 components replace them.
+  tunnels?: UsageRef[];
+  proxies?: UsageRef[];
+  /** Names of Profile Library entries. */
+  library_profiles?: string[];
 }
 
 export interface KeyView extends VaultKeyMeta {
@@ -512,4 +518,301 @@ export interface ShellEventHandlers {
   onRuntimeEvent(event: RuntimeEvent): void;
   onRuntimeLagged(): void;
   onUiEvent(event: UiEvent): void;
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// v2 model: Tunnels and Proxies. Mirrors `conduit-core/src/v2_model.rs` and the runtime managers.
+// ---------------------------------------------------------------------------------------------
+
+export type TunnelId = Uuid;
+export type ProxyId = Uuid;
+
+/** `linked`: runs while a Proxy uses it. `manual`: started and stopped by hand. */
+export type TunnelStartMode = "linked" | { manual: { autostart: boolean } };
+
+/** The SSH half of a v1 session. */
+export interface Tunnel {
+  id: TunnelId;
+  name: string;
+  enabled: boolean;
+  start_mode: TunnelStartMode;
+  engine: SshEngine;
+  hops: HopEntry[];
+  reverse: ReverseConfig;
+  port_forwards: PortForward[];
+  keepalive: TunnelConfig;
+  logging: LoggingConfig;
+  openssh: OpenSshOptions;
+}
+
+/** `managed`: edited in the app. `external_toml`: read from a TOML file and watched. */
+export type SourceMode = "managed" | { external_toml: { path: string; debounce_ms: number } };
+
+export interface ListenerConfig {
+  bind: string;
+  /** 0 turns the listener off. */
+  http_port: number;
+  /** 0 turns the listener off. */
+  socks_port: number;
+  max_connections: number;
+}
+
+export interface NetworkConfig {
+  /** Seconds. */
+  connect_timeout: number;
+  /** Seconds, 0 = off. */
+  tcp_keepalive: number;
+  /** Seconds. */
+  tcp_keepalive_interval: number;
+  tcp_keepalive_retries: number;
+}
+
+export type GlobalFilterConfig = "off" | { allow: string[] } | { block: string[] };
+
+/** Where an upstream password comes from. Never the password itself. */
+export type UpstreamPasswordSource = { vault: SecretRef } | { env: string } | { file: string };
+
+export type UpstreamKind =
+  | { type: "http" }
+  | { type: "https"; tls_insecure_skip_verify: boolean }
+  | { type: "socks5" }
+  | { type: "socks4a" }
+  | { type: "composite"; http: string; https: string; fallback: string }
+  | { type: "tunnel"; tunnel_id: TunnelId };
+
+export type UpstreamKindName = UpstreamKind["type"];
+
+export interface UpstreamProfile {
+  name: string;
+  kind: UpstreamKind;
+  host: string | null;
+  port: number | null;
+  username: string | null;
+  password: UpstreamPasswordSource | null;
+  bypass: string[];
+  color: string | null;
+}
+
+export type RouteInbound = "http" | "socks";
+
+/** Serde `untagged`: a single value or a list. */
+export type RouteOneOrMany<T> = T | T[];
+
+/** A profile name (`direct` and `block` included), or a failover chain of them. */
+export type RouteTarget = RouteOneOrMany<string>;
+
+/** A single port, or a `"low-high"` range. */
+export type RoutePortSpec = number | string;
+
+export interface RouteHostLevels {
+  min?: number;
+  max?: number;
+}
+
+/** Unset matchers are left out of the wire shape. */
+export interface RoutingRule {
+  name?: string;
+  inbound?: RouteInbound;
+  host?: RouteOneOrMany<string>;
+  host_wildcard?: RouteOneOrMany<string>;
+  host_regex?: RouteOneOrMany<string>;
+  cidr?: RouteOneOrMany<string>;
+  ip?: RouteOneOrMany<string>;
+  port?: RouteOneOrMany<RoutePortSpec>;
+  host_levels?: RouteHostLevels;
+  bypass?: RouteOneOrMany<string>;
+  weekday?: RouteOneOrMany<string>;
+  time?: RouteOneOrMany<string>;
+  url_wildcard?: RouteOneOrMany<string>;
+  url_regex?: RouteOneOrMany<string>;
+  keyword?: RouteOneOrMany<string>;
+  match_all: boolean;
+  disabled: boolean;
+  resolve_dns?: boolean;
+  target: RouteTarget;
+}
+
+/** A per-inbound table (`[routing.http]` / `[routing.socks]`). */
+export interface RoutingTable {
+  default?: RouteTarget;
+  inherit: boolean;
+  rules: RoutingRule[];
+}
+
+export interface RoutingTablesConfig {
+  default: RouteTarget;
+  resolve_dns: boolean;
+  rules: RoutingRule[];
+  http?: RoutingTable;
+  socks?: RoutingTable;
+}
+
+/** The proxy half of a v1 session. */
+export interface Proxy {
+  id: ProxyId;
+  name: string;
+  enabled: boolean;
+  autostart: boolean;
+  source: SourceMode;
+  listeners: ListenerConfig;
+  network: NetworkConfig;
+  profiles: UpstreamProfile[];
+  routing: RoutingTablesConfig;
+  filter: GlobalFilterConfig;
+  mitm: MitmConfig | null;
+  logging: LoggingConfig;
+}
+
+// v2 runtime.
+
+export type ProxyState =
+  | { state: "stopped" }
+  | { state: "starting" }
+  | {
+      state: "running";
+      /** The tray override, `null` = Auto Switch. */
+      override_profile: string | null;
+      config_generation: number;
+      restart_required: boolean;
+    }
+  | { state: "reloading" }
+  | { state: "locked" }
+  | { state: "needs_attention"; reason: string }
+  | { state: "stopping" };
+
+export interface ProxyTrafficSnapshot {
+  active: number;
+  bytes_in: number;
+  bytes_out: number;
+  hits: number;
+}
+
+export interface ProxySnapshot {
+  id: ProxyId;
+  name: string;
+  enabled: boolean;
+  state: ProxyState;
+  /** Bound listeners, while running. */
+  listeners: ListenerInfo[];
+  config_generation: number;
+  override_profile: string | null;
+  /** The saved config changed something that only a restart applies. */
+  restart_required: boolean;
+  /** Traffic by serving profile, while running. */
+  profile_counters: Record<string, ProxyTrafficSnapshot>;
+  /** Traffic by rule label, while running. */
+  rule_counters: Record<string, ProxyTrafficSnapshot>;
+  referenced_tunnels: TunnelId[];
+}
+
+export interface ProxyView {
+  profile: Proxy;
+  snapshot: ProxySnapshot;
+}
+
+export interface ProxySaveResult {
+  profile: Proxy;
+  snapshot: ProxySnapshot;
+  /** A running Proxy took the new routing without a restart. */
+  reloaded: boolean;
+  /** A running Proxy rejected the new routing and kept the old one; the save still stands. */
+  reload_error: string | null;
+}
+
+/** A structured access record for the log drawer. `upstream` is always redacted. */
+export interface AccessRecordView {
+  kind: "http" | "socks";
+  /** Unix time in milliseconds. */
+  ts_ms: number;
+  direction: "forward" | "reverse" | null;
+  client: string;
+  proto: string;
+  /** HTTP method, or SOCKS command. */
+  method: string;
+  target: string;
+  rule: string;
+  profile: string;
+  upstream: string;
+  /** HTTP status code, or the SOCKS status label. */
+  status: string;
+  mitm: boolean;
+  bytes_in: number;
+  bytes_out: number;
+  duration_ms: number;
+}
+
+/** One element of a Route Tester failover chain. */
+export interface RouteTestTarget {
+  /** The name as written in the rule or default. */
+  name: string;
+  /** The concrete profile dialed, after composite resolution and bypass. */
+  profile: string;
+  redacted_upstream: string;
+  /** A profile `bypass` list sent the target `direct`. */
+  bypassed: boolean;
+}
+
+export interface RouteTestResult {
+  /** `[routing]`, `[routing.http]`, or `[routing.socks]`; `null` when the filter denied it. */
+  table: string | null;
+  /** The matched rule's label; `null` = the table default (or denied). */
+  matched_rule: string | null;
+  blocked_by_filter: boolean;
+  filter_reason: string | null;
+  /** The failover chain, in order. */
+  targets: RouteTestTarget[];
+}
+
+export interface UpstreamProbeResult {
+  ok: boolean;
+  elapsed_ms: number;
+  redacted_upstream: string;
+  /** Redacted reason when `ok` is false. */
+  error: string | null;
+}
+
+export interface TunnelSnapshot {
+  id: TunnelId;
+  name: string;
+  enabled: boolean;
+  start_mode: TunnelStartMode;
+  engine: SshEngine;
+  state: SessionState;
+  stats: SessionStatsSnapshot;
+  /** Reverse proxy (-R) listeners bound on the target host, while connected. */
+  remote_listeners: ListenerInfo[];
+  /** Loopback listeners of the reverse proxy on this computer. */
+  reverse_listeners: string[];
+  /** Port forwards: local ones once bound, remote ones while connected. */
+  port_forwards: ForwardStatus[];
+  /** How many Proxies currently hold a Linked reference. */
+  linked_holders: number;
+}
+
+export interface TunnelView {
+  profile: Tunnel;
+  snapshot: TunnelSnapshot;
+  /** Proxies that route through this Tunnel. */
+  used_by: UsageRef[];
+}
+
+export interface TunnelChainTestResult {
+  tunnel_id: TunnelId;
+  all_connected: boolean;
+  hops: HopTestResult[];
+}
+
+/** Payloads of the `proxy-*` events. */
+export type ProxyEvent =
+  | { event: "state_changed"; proxy_id: ProxyId; state: ProxyState }
+  | { event: "reloaded"; proxy_id: ProxyId; config_generation: number }
+  | { event: "override_changed"; proxy_id: ProxyId; override_profile: string | null };
+
+/** Payload of the `tunnel-state-changed` event. */
+export type TunnelEvent = { event: "state_changed"; tunnel_id: TunnelId; state: SessionState };
+
+export interface V2EventHandlers {
+  onProxyEvent(event: ProxyEvent): void;
+  onTunnelEvent(event: TunnelEvent): void;
 }

@@ -8,11 +8,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use conduit_core::{
-    ForwardPreset, HostProfile, KeyId, KeySource, MitmCaId, SecretRef, SessionProfile, VaultCaMeta,
-    VaultKeyMeta,
+    ForwardPreset, HostProfile, KeyId, KeySource, MitmCaId, Proxy, ProxyId, RouteInbound, SecretRef,
+    SessionProfile, Tunnel, TunnelId, UpstreamProfile, VaultCaMeta, VaultKeyMeta,
 };
 use conduit_openssh::OpenSshBinaryInfo;
-use conduit_runtime::LogLine;
+use conduit_runtime::{LogLine, ProxySnapshot, RouteTestResult, UpstreamProbeResult};
 use serde::Serialize;
 use tauri::{AppHandle, Manager, Runtime, State};
 use uuid::Uuid;
@@ -21,7 +21,9 @@ use crate::controller::export::{ExportSummary, ImportSummary};
 use crate::controller::keys::{DeleteResult, GenerateAlgorithm, KeyView};
 use crate::controller::mitm_ca::{CaView, MitmCaUpload};
 use crate::controller::parity::{self, FilterMode, FilterTestResult, PortConflictReport};
+use crate::controller::proxies::{AccessRecordView, ProxySaveResult, ProxyView};
 use crate::controller::sessions::{ChainTestResult, SessionView, StateSummary};
+use crate::controller::tunnels::{TunnelChainTestResult, TunnelView};
 use crate::controller::{run_blocking, AppController, AppError, SecretInput, SecretMeta, VaultStatus};
 use crate::platform;
 use crate::tray_bridge::quit_app;
@@ -155,7 +157,17 @@ pub async fn list_mitm_cas(c: Ctl<'_>) -> CmdResult<Vec<CaView>> {
 
 #[tauri::command]
 pub async fn delete_secret(c: Ctl<'_>, secret: SecretRef, force: Option<bool>) -> CmdResult<DeleteResult> {
-    blocking(&c, move |c| c.delete_secret(&secret, force.unwrap_or(false))).await
+    c.delete_secret(&secret, force.unwrap_or(false)).await
+}
+
+/// Stores an upstream proxy password, or rotates `existing` to a new record.
+#[tauri::command]
+pub async fn set_upstream_password(
+    c: Ctl<'_>,
+    existing: Option<SecretRef>,
+    value: SecretInput,
+) -> CmdResult<SecretMeta> {
+    c.set_upstream_password(existing, value).await
 }
 
 // Sessions and hosts.
@@ -247,15 +259,19 @@ pub async fn restart_session(c: Ctl<'_>, id: Uuid) -> CmdResult<()> {
     c.restart_session(id).await
 }
 
+/// Starts every enabled session, Manual Tunnel, and Proxy.
 #[tauri::command]
 pub async fn start_all(c: Ctl<'_>) -> CmdResult<()> {
     c.start_all().await;
+    c.start_all_v2().await;
     Ok(())
 }
 
+/// Stops every session, Proxy, and Tunnel.
 #[tauri::command]
 pub async fn stop_all(c: Ctl<'_>) -> CmdResult<()> {
     c.stop_all().await;
+    c.stop_all_v2().await;
     Ok(())
 }
 
@@ -347,6 +363,197 @@ pub async fn test_filter_rules(
 #[tauri::command]
 pub async fn check_openssh_binary(ssh_bin: Option<String>) -> CmdResult<OpenSshBinaryInfo> {
     run_blocking(move || Ok(parity::check_openssh_binary(ssh_bin))).await
+}
+
+// Proxies.
+
+#[tauri::command]
+pub async fn list_proxies(c: Ctl<'_>) -> CmdResult<Vec<ProxyView>> {
+    blocking(&c, |c| c.list_proxies()).await
+}
+
+#[tauri::command]
+pub async fn upsert_proxy(c: Ctl<'_>, profile: Proxy) -> CmdResult<ProxySaveResult> {
+    c.upsert_proxy(profile).await
+}
+
+#[tauri::command]
+pub async fn delete_proxy(c: Ctl<'_>, id: ProxyId) -> CmdResult<()> {
+    c.delete_proxy(id).await
+}
+
+#[tauri::command]
+pub async fn duplicate_proxy(c: Ctl<'_>, id: ProxyId) -> CmdResult<ProxySaveResult> {
+    c.duplicate_proxy(id).await
+}
+
+#[tauri::command]
+pub async fn start_proxy(c: Ctl<'_>, id: ProxyId) -> CmdResult<()> {
+    c.start_proxy(id).await
+}
+
+#[tauri::command]
+pub async fn stop_proxy(c: Ctl<'_>, id: ProxyId) -> CmdResult<()> {
+    c.stop_proxy(id).await
+}
+
+#[tauri::command]
+pub async fn restart_proxy(c: Ctl<'_>, id: ProxyId) -> CmdResult<()> {
+    c.restart_proxy(id).await
+}
+
+/// Tray override: a profile name (`direct` included), or `null` for Auto Switch.
+#[tauri::command]
+pub async fn set_proxy_override(
+    c: Ctl<'_>,
+    id: ProxyId,
+    override_profile: Option<String>,
+) -> CmdResult<ProxySnapshot> {
+    c.set_proxy_override(id, override_profile).await
+}
+
+#[tauri::command]
+pub async fn get_proxy_logs(c: Ctl<'_>, id: ProxyId, limit: Option<usize>) -> CmdResult<Vec<LogLine>> {
+    blocking(&c, move |c| c.get_proxy_logs(id, limit)).await
+}
+
+#[tauri::command]
+pub async fn clear_proxy_logs(c: Ctl<'_>, id: ProxyId) -> CmdResult<()> {
+    blocking(&c, move |c| c.clear_proxy_logs(id)).await
+}
+
+#[tauri::command]
+pub async fn get_proxy_access_records(
+    c: Ctl<'_>,
+    id: ProxyId,
+    limit: Option<usize>,
+) -> CmdResult<Vec<AccessRecordView>> {
+    blocking(&c, move |c| c.get_proxy_access_records(id, limit)).await
+}
+
+/// Route Tester: evaluates `raw_target` against the draft `proxy`. Needs no vault.
+#[tauri::command]
+pub async fn test_route(proxy: Proxy, raw_target: String, inbound: RouteInbound) -> CmdResult<RouteTestResult> {
+    run_blocking(move || AppController::test_route(&proxy, &raw_target, inbound)).await
+}
+
+#[tauri::command]
+pub async fn test_upstream(
+    c: Ctl<'_>,
+    proxy: Proxy,
+    profile_name: String,
+    host: String,
+    port: u16,
+    timeout_ms: u64,
+) -> CmdResult<UpstreamProbeResult> {
+    c.test_upstream(&proxy, &profile_name, &host, port, timeout_ms).await
+}
+
+#[tauri::command]
+pub async fn check_proxy_port_conflicts(
+    c: Ctl<'_>,
+    proxy_id: Option<ProxyId>,
+    bind: IpAddr,
+    http_port: u16,
+    socks_port: u16,
+) -> CmdResult<PortConflictReport> {
+    blocking(&c, move |c| Ok(c.check_proxy_port_conflicts(proxy_id, bind, http_port, socks_port))).await
+}
+
+// Profile Library.
+
+#[tauri::command]
+pub async fn list_profile_library(c: Ctl<'_>) -> CmdResult<Vec<UpstreamProfile>> {
+    blocking(&c, |c| Ok(c.list_profile_library())).await
+}
+
+#[tauri::command]
+pub async fn upsert_library_profile(c: Ctl<'_>, profile: UpstreamProfile) -> CmdResult<UpstreamProfile> {
+    blocking(&c, move |c| c.upsert_library_profile(profile)).await
+}
+
+#[tauri::command]
+pub async fn delete_library_profile(c: Ctl<'_>, name: String) -> CmdResult<()> {
+    blocking(&c, move |c| c.delete_library_profile(&name)).await
+}
+
+// Tunnels.
+
+#[tauri::command]
+pub async fn list_tunnels(c: Ctl<'_>) -> CmdResult<Vec<TunnelView>> {
+    blocking(&c, |c| c.list_tunnels()).await
+}
+
+#[tauri::command]
+pub async fn upsert_tunnel(c: Ctl<'_>, profile: Tunnel) -> CmdResult<Tunnel> {
+    blocking(&c, move |c| c.upsert_tunnel(profile)).await
+}
+
+/// Refuses without `force` while Proxies route through the Tunnel, listing them.
+#[tauri::command]
+pub async fn delete_tunnel(c: Ctl<'_>, id: TunnelId, force: Option<bool>) -> CmdResult<DeleteResult> {
+    c.delete_tunnel(id, force.unwrap_or(false)).await
+}
+
+#[tauri::command]
+pub async fn duplicate_tunnel(c: Ctl<'_>, id: TunnelId) -> CmdResult<Tunnel> {
+    blocking(&c, move |c| c.duplicate_tunnel(id)).await
+}
+
+#[tauri::command]
+pub async fn start_tunnel(c: Ctl<'_>, id: TunnelId) -> CmdResult<()> {
+    c.start_tunnel(id).await
+}
+
+#[tauri::command]
+pub async fn stop_tunnel(c: Ctl<'_>, id: TunnelId) -> CmdResult<()> {
+    c.stop_tunnel(id).await
+}
+
+#[tauri::command]
+pub async fn restart_tunnel(c: Ctl<'_>, id: TunnelId) -> CmdResult<()> {
+    c.restart_tunnel(id).await
+}
+
+#[tauri::command]
+pub async fn get_tunnel_logs(c: Ctl<'_>, id: TunnelId, limit: Option<usize>) -> CmdResult<Vec<LogLine>> {
+    blocking(&c, move |c| c.get_tunnel_logs(id, limit)).await
+}
+
+#[tauri::command]
+pub async fn clear_tunnel_logs(c: Ctl<'_>, id: TunnelId) -> CmdResult<()> {
+    blocking(&c, move |c| c.clear_tunnel_logs(id)).await
+}
+
+#[tauri::command]
+pub async fn approve_tunnel_host_key(c: Ctl<'_>, id: TunnelId, sha256: String) -> CmdResult<()> {
+    blocking(&c, move |c| c.approve_tunnel_host_key(id, &sha256)).await
+}
+
+#[tauri::command]
+pub async fn reject_tunnel_host_key(c: Ctl<'_>, id: TunnelId) -> CmdResult<()> {
+    blocking(&c, move |c| c.reject_tunnel_host_key(id)).await
+}
+
+/// Probes the Tunnel's chain; an unknown key can then be pinned with `trust_tested_host_key`
+/// using the Tunnel's id.
+#[tauri::command]
+pub async fn test_tunnel_chain(c: Ctl<'_>, id: TunnelId) -> CmdResult<TunnelChainTestResult> {
+    c.test_tunnel_chain(id).await
+}
+
+// Global v2 lifecycle.
+
+#[tauri::command]
+pub async fn start_all_v2(c: Ctl<'_>) -> CmdResult<()> {
+    c.start_all_v2().await;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn stop_all_v2(c: Ctl<'_>) -> CmdResult<()> {
+    c.stop_all_v2().await;
+    Ok(())
 }
 
 // Config export and import.
@@ -477,6 +684,38 @@ macro_rules! ipc_handler {
             $crate::commands::delete_mitm_ca,
             $crate::commands::list_mitm_cas,
             $crate::commands::delete_secret,
+            $crate::commands::set_upstream_password,
+            $crate::commands::list_proxies,
+            $crate::commands::upsert_proxy,
+            $crate::commands::delete_proxy,
+            $crate::commands::duplicate_proxy,
+            $crate::commands::start_proxy,
+            $crate::commands::stop_proxy,
+            $crate::commands::restart_proxy,
+            $crate::commands::set_proxy_override,
+            $crate::commands::get_proxy_logs,
+            $crate::commands::clear_proxy_logs,
+            $crate::commands::get_proxy_access_records,
+            $crate::commands::test_route,
+            $crate::commands::test_upstream,
+            $crate::commands::check_proxy_port_conflicts,
+            $crate::commands::list_profile_library,
+            $crate::commands::upsert_library_profile,
+            $crate::commands::delete_library_profile,
+            $crate::commands::list_tunnels,
+            $crate::commands::upsert_tunnel,
+            $crate::commands::delete_tunnel,
+            $crate::commands::duplicate_tunnel,
+            $crate::commands::start_tunnel,
+            $crate::commands::stop_tunnel,
+            $crate::commands::restart_tunnel,
+            $crate::commands::get_tunnel_logs,
+            $crate::commands::clear_tunnel_logs,
+            $crate::commands::approve_tunnel_host_key,
+            $crate::commands::reject_tunnel_host_key,
+            $crate::commands::test_tunnel_chain,
+            $crate::commands::start_all_v2,
+            $crate::commands::stop_all_v2,
             $crate::commands::get_state_summary,
             $crate::commands::list_sessions,
             $crate::commands::upsert_session,
@@ -559,6 +798,18 @@ mod tests {
         "reset_host_key", "import_known_host", "test_chain", "check_port_conflicts", "test_filter_rules",
         "check_openssh_binary", "export_config", "import_config",
         "get_autostart", "set_autostart", "shell_ready", "resolve_close",
+    ];
+
+    /// Every v2 (Tunnels, Proxies, Profile Library) command, exercised by its own test.
+    const V2_COMMANDS: &[&str] = &[
+        "set_upstream_password", "list_proxies", "upsert_proxy", "delete_proxy", "duplicate_proxy",
+        "start_proxy", "stop_proxy", "restart_proxy", "set_proxy_override", "get_proxy_logs",
+        "clear_proxy_logs", "get_proxy_access_records", "test_route", "test_upstream",
+        "check_proxy_port_conflicts", "list_profile_library", "upsert_library_profile",
+        "delete_library_profile", "list_tunnels", "upsert_tunnel", "delete_tunnel", "duplicate_tunnel",
+        "start_tunnel", "stop_tunnel", "restart_tunnel", "get_tunnel_logs", "clear_tunnel_logs",
+        "approve_tunnel_host_key", "reject_tunnel_host_key", "test_tunnel_chain", "start_all_v2",
+        "stop_all_v2",
     ];
 
     /// Keeps autostart in memory, so tests never touch the real login items.
@@ -963,6 +1214,144 @@ mod tests {
         for (name, bytes) in &on_disk {
             assert_clean(name, &String::from_utf8_lossy(bytes), &forbidden);
         }
+    }
+
+    #[test]
+    fn every_v2_ipc_command_works_and_no_response_leaks_a_secret() {
+        use conduit_core::{
+            ListenerConfig, RouteOneOrMany, RoutingTablesConfig, TunnelStartMode, UpstreamKind,
+            UpstreamPasswordSource,
+        };
+        use crate::controller::test_support::hop;
+
+        let dir = TempDir::new();
+        let mut ipc = Ipc::new(&dir);
+        ipc.ok("create_vault", json!({ "password": MASTER, "useKeyring": false }));
+        let free = || std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let closed = free();
+
+        // Upstream passwords: stored, then rotated.
+        let first = ipc.ok("set_upstream_password", json!({ "value": PASSWORD }));
+        assert_eq!(first["has_secret"], true);
+        let rotated = ipc.ok("set_upstream_password", json!({ "existing": first["secret_ref"], "value": PASSWORD }));
+        let secret_ref: SecretRef = serde_json::from_value(rotated["secret_ref"].clone()).unwrap();
+        ipc.err("set_upstream_password", json!({ "existing": first["secret_ref"], "value": PASSWORD }));
+
+        // Tunnels, on a closed loopback port so nothing external is contacted.
+        let tunnel = Tunnel {
+            name: "bastion".into(),
+            start_mode: TunnelStartMode::Manual { autostart: false },
+            hops: vec![hop("", closed, Vec::new())],
+            ..Tunnel::default()
+        };
+        let saved = ipc.ok("upsert_tunnel", json!({ "profile": tunnel }));
+        let tunnel_id: TunnelId = serde_json::from_value(saved["id"].clone()).unwrap();
+        let copy = ipc.ok("duplicate_tunnel", json!({ "id": tunnel_id }));
+        assert_eq!(copy["name"], "bastion (copy)");
+        assert_eq!(ipc.ok("list_tunnels", json!({})).as_array().unwrap().len(), 2);
+        ipc.ok("start_tunnel", json!({ "id": tunnel_id }));
+        ipc.ok("restart_tunnel", json!({ "id": tunnel_id }));
+        ipc.ok("stop_tunnel", json!({ "id": tunnel_id }));
+        assert!(ipc.ok("get_tunnel_logs", json!({ "id": tunnel_id, "limit": 10 })).is_array());
+        ipc.ok("clear_tunnel_logs", json!({ "id": tunnel_id }));
+        assert_eq!(ipc.err("approve_tunnel_host_key", json!({ "id": tunnel_id, "sha256": "SHA256:x" }))["code"], "tunnel");
+        assert_eq!(ipc.err("reject_tunnel_host_key", json!({ "id": tunnel_id }))["code"], "tunnel");
+        let chain = ipc.ok("test_tunnel_chain", json!({ "id": tunnel_id }));
+        assert_eq!((chain["all_connected"].clone(), chain["hops"][0]["status"].clone()), (json!(false), json!("failed")));
+
+        // Proxies: a vaulted upstream password and a Tunnel profile.
+        let proxy = Proxy {
+            name: "web".into(),
+            listeners: ListenerConfig {
+                bind: "127.0.0.1".parse().unwrap(),
+                http_port: free(),
+                socks_port: 0,
+                ..ListenerConfig::default()
+            },
+            profiles: vec![
+                UpstreamProfile {
+                    name: "corp".into(),
+                    kind: UpstreamKind::Http,
+                    host: Some("127.0.0.1".into()),
+                    port: Some(closed),
+                    username: Some("user".into()),
+                    password: Some(UpstreamPasswordSource::Vault(secret_ref.clone())),
+                    bypass: Vec::new(),
+                    color: None,
+                },
+                UpstreamProfile {
+                    name: "ssh".into(),
+                    kind: UpstreamKind::Tunnel { tunnel_id },
+                    host: None,
+                    port: None,
+                    username: None,
+                    password: None,
+                    bypass: Vec::new(),
+                    color: None,
+                },
+            ],
+            routing: RoutingTablesConfig { default: RouteOneOrMany::One("direct".into()), ..RoutingTablesConfig::default() },
+            ..Proxy::default()
+        };
+        let saved = ipc.ok("upsert_proxy", json!({ "profile": proxy }));
+        assert_eq!(saved["reloaded"], false);
+        let proxy_id: ProxyId = serde_json::from_value(saved["profile"]["id"].clone()).unwrap();
+        let draft = saved["profile"].clone();
+        let copy = ipc.ok("duplicate_proxy", json!({ "id": proxy_id }));
+        assert_eq!(copy["profile"]["autostart"], false);
+        assert_eq!(ipc.ok("list_proxies", json!({})).as_array().unwrap().len(), 2);
+        ipc.ok("start_proxy", json!({ "id": proxy_id }));
+        let forced = ipc.ok("set_proxy_override", json!({ "id": proxy_id, "overrideProfile": "direct" }));
+        assert_eq!(forced["override_profile"], "direct");
+        assert_eq!(ipc.ok("set_proxy_override", json!({ "id": proxy_id, "overrideProfile": null }))["override_profile"], Value::Null);
+        assert!(ipc.ok("get_proxy_logs", json!({ "id": proxy_id, "limit": 20 })).is_array());
+        assert_eq!(ipc.ok("get_proxy_access_records", json!({ "id": proxy_id })), json!([]));
+        ipc.ok("clear_proxy_logs", json!({ "id": proxy_id }));
+        ipc.ok("restart_proxy", json!({ "id": proxy_id }));
+        let ports = ipc.ok(
+            "check_proxy_port_conflicts",
+            json!({ "proxyId": copy["profile"]["id"], "bind": "127.0.0.1", "httpPort": draft["listeners"]["http_port"], "socksPort": 0 }),
+        );
+        assert_eq!(ports["conflicts"][0]["kind"], "proxy");
+        ipc.ok("stop_proxy", json!({ "id": proxy_id }));
+        let route = ipc.ok("test_route", json!({ "proxy": draft, "rawTarget": "example.com:443", "inbound": "http" }));
+        assert_eq!(route["targets"][0]["profile"], "direct");
+        let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let probe = ipc.ok(
+            "test_upstream",
+            json!({ "proxy": draft, "profileName": "direct", "host": "127.0.0.1",
+                    "port": target.local_addr().unwrap().port(), "timeoutMs": 2000 }),
+        );
+        assert_eq!(probe["ok"], true);
+        ipc.ok("start_all_v2", json!({}));
+        ipc.ok("stop_all_v2", json!({}));
+
+        // Profile Library.
+        let library = json!({ "name": "shared", "kind": { "type": "socks5" }, "host": "127.0.0.1", "port": closed });
+        assert_eq!(ipc.ok("upsert_library_profile", json!({ "profile": library }))["name"], "shared");
+        assert_eq!(ipc.ok("list_profile_library", json!({})).as_array().unwrap().len(), 1);
+        ipc.ok("delete_library_profile", json!({ "name": "shared" }));
+        assert_eq!(ipc.err("delete_library_profile", json!({ "name": "shared" }))["code"], "not_found");
+
+        // Safe deletes.
+        let refused = ipc.ok("delete_secret", json!({ "secret": secret_ref }));
+        assert_eq!((refused["deleted"].clone(), refused["usage"]["proxies"][0]["name"].clone()), (json!(false), json!("web")));
+        let refused = ipc.ok("delete_tunnel", json!({ "id": tunnel_id }));
+        assert_eq!((refused["deleted"].clone(), refused["used_by"].clone()), (json!(false), json!(2)));
+        assert_eq!(ipc.ok("delete_tunnel", json!({ "id": tunnel_id, "force": true }))["deleted"], true);
+        ipc.ok("delete_proxy", json!({ "id": proxy_id }));
+        ipc.ok("delete_proxy", json!({ "id": copy["profile"]["id"] }));
+        assert_eq!(ipc.ok("delete_secret", json!({ "secret": secret_ref }))["deleted"], true);
+        assert_eq!(ipc.ok("list_proxies", json!({})), json!([]));
+
+        let expected: BTreeSet<String> = V2_COMMANDS.iter().map(|c| c.to_string()).collect();
+        assert!(ipc.called.is_superset(&expected), "missing: {:?}", expected.difference(&ipc.called).collect::<Vec<_>>());
+        let forbidden = forbidden(&[]);
+        for (index, response) in ipc.transcript.iter().enumerate() {
+            assert_clean(&format!("IPC response #{index}"), response, &forbidden);
+        }
+        let config = std::fs::read(dir.path().join("config.json")).unwrap();
+        assert_clean("config.json", &String::from_utf8_lossy(&config), &forbidden);
     }
 
     #[test]

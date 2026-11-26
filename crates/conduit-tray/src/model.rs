@@ -1,12 +1,17 @@
-//! The platform-neutral tray menu, built from session snapshots and the vault lock state.
+//! The platform-neutral tray menu, built from Proxy and Tunnel state (plus any legacy v1
+//! sessions) and the vault lock state.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use conduit_runtime::{ListenerInfo, SessionSnapshot, SessionState};
+use conduit_core::{ProxyId, TunnelId};
+use conduit_runtime::{ListenerInfo, ProxyState, SessionSnapshot, SessionState};
 use uuid::Uuid;
 
 /// Name shown at the top of the tray menu.
 pub const APP_TITLE: &str = "Rusty Conduit GUI";
+
+/// The routing profile name that sends everything direct.
+pub const PROFILE_DIRECT: &str = "direct";
 
 // These match the `Display` output of the engine's `ListenerRole`, which is how
 // `ListenerInfo::role` is filled in.
@@ -23,15 +28,31 @@ pub enum TrayAction {
     StartSession(Uuid),
     StopSession(Uuid),
     RestartSession(Uuid),
+    /// `session_id` is the session, Proxy, or Tunnel the URL belongs to.
     CopyHttpUrl {
         session_id: Uuid,
         url: String,
     },
+    /// `session_id` is the session, Proxy, or Tunnel the URL belongs to.
     CopySocksUrl {
         session_id: Uuid,
         url: String,
     },
     ViewLogs(Uuid),
+    StartProxy(ProxyId),
+    StopProxy(ProxyId),
+    RestartProxy(ProxyId),
+    /// `Some(profile)` forces every connection through `profile` (`direct` included); `None`
+    /// returns to Auto Switch.
+    SetProxyOverride {
+        id: ProxyId,
+        profile: Option<String>,
+    },
+    ViewProxyLogs(ProxyId),
+    StartTunnel(TunnelId),
+    StopTunnel(TunnelId),
+    RestartTunnel(TunnelId),
+    ViewTunnelLogs(TunnelId),
     StartAll,
     StopAll,
     UnlockVault,
@@ -79,7 +100,21 @@ impl TrayMenuItem {
     }
 }
 
-/// One session and its submenu.
+/// A row inside a submenu: a clickable item or a further (nested) submenu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrayMenuEntry {
+    Item(TrayMenuItem),
+    Submenu(TraySubmenu),
+}
+
+/// A nested submenu, such as a Proxy's `Mode ▸`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraySubmenu {
+    pub label: String,
+    pub entries: Vec<TrayMenuEntry>,
+}
+
+/// One legacy v1 session and its submenu.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TraySessionEntry {
     pub id: Uuid,
@@ -99,14 +134,97 @@ impl TraySessionEntry {
     }
 }
 
+/// A Proxy as the tray needs to see it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyTrayItem {
+    pub id: ProxyId,
+    pub name: String,
+    pub enabled: bool,
+    pub state: ProxyState,
+    /// Bound listeners, while running.
+    pub listeners: Vec<ListenerInfo>,
+    /// How many Auto Switch routing rules the Proxy has.
+    pub rule_count: usize,
+    /// The Proxy's own upstream profile names (never the built-in `direct` / `block`).
+    pub profiles: Vec<String>,
+}
+
+/// A Tunnel as the tray needs to see it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TunnelTrayItem {
+    pub id: TunnelId,
+    pub name: String,
+    pub enabled: bool,
+    pub state: SessionState,
+    /// The Tunnel runs while a Proxy routes through it (start mode *Linked*).
+    pub linked: bool,
+    /// Names of the running Proxies that route through this Tunnel.
+    pub linked_to: Vec<String>,
+}
+
+/// Everything the tray menu is built from.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrayState {
+    pub proxies: Vec<ProxyTrayItem>,
+    pub tunnels: Vec<TunnelTrayItem>,
+    /// Legacy v1 sessions, shown in their own section while any exist.
+    pub sessions: Vec<SessionSnapshot>,
+    pub vault_locked: bool,
+}
+
+/// One Proxy row and its submenu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrayProxyEntry {
+    pub id: ProxyId,
+    pub name: String,
+    /// `●` running, `◐` in progress, `!` needs attention, `○` stopped.
+    pub marker: char,
+    pub status: String,
+    pub http_url: Option<String>,
+    pub socks_url: Option<String>,
+    /// `Mode ▸` (while running), lifecycle actions, Copy URLs, and View Logs.
+    pub entries: Vec<TrayMenuEntry>,
+}
+
+impl TrayProxyEntry {
+    /// The Proxy's row in the root menu.
+    pub fn label(&self) -> String {
+        format!("{} {} — {}", self.marker, self.name, self.status)
+    }
+}
+
+/// One Tunnel row and its submenu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrayTunnelEntry {
+    pub id: TunnelId,
+    pub name: String,
+    /// `●` connected, `◐` in progress, `!` needs attention, `○` stopped.
+    pub marker: char,
+    pub status: String,
+    pub items: Vec<TrayMenuItem>,
+}
+
+impl TrayTunnelEntry {
+    /// The Tunnel's row in the root menu.
+    pub fn label(&self) -> String {
+        format!("{} {} — {}", self.marker, self.name, self.status)
+    }
+}
+
 /// Everything a tray backend needs to draw the menu.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrayMenuModel {
-    /// `N connected · M needs attention`.
+    /// `N proxies running · M tunnels need attention` (or the v1 session summary).
     pub summary: String,
+    /// Running Proxies, connected Tunnels, and connected sessions.
     pub connected: usize,
     pub needs_attention: usize,
     pub icon: TrayIconState,
+    /// The PROXIES section.
+    pub proxies: Vec<TrayProxyEntry>,
+    /// The TUNNELS section.
+    pub tunnels: Vec<TrayTunnelEntry>,
+    /// Legacy v1 sessions.
     pub sessions: Vec<TraySessionEntry>,
     /// Start All, Stop All, the conditional Unlock Vault, Open Manage Window, and Quit.
     pub global_items: Vec<TrayMenuItem>,
@@ -114,20 +232,97 @@ pub struct TrayMenuModel {
     pub quit_needs_confirmation: bool,
 }
 
+/// How one item counts toward the summary, the icon, and Start All / Stop All.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Health {
+    Connected,
+    InProgress,
+    /// Waiting on the vault.
+    Locked,
+    Attention,
+    Stopped,
+}
+
+impl Health {
+    fn of_session(state: &SessionState) -> Self {
+        match state {
+            SessionState::Connected => Self::Connected,
+            SessionState::Stopped => Self::Stopped,
+            SessionState::Locked => Self::Locked,
+            s if needs_attention(s) => Self::Attention,
+            _ => Self::InProgress,
+        }
+    }
+
+    fn of_proxy(state: &ProxyState) -> Self {
+        match state {
+            ProxyState::Running { .. } => Self::Connected,
+            ProxyState::Stopped => Self::Stopped,
+            ProxyState::Locked => Self::Locked,
+            ProxyState::NeedsAttention { .. } => Self::Attention,
+            ProxyState::Starting | ProxyState::Reloading | ProxyState::Stopping => {
+                Self::InProgress
+            }
+        }
+    }
+
+    fn needs_attention(self) -> bool {
+        matches!(self, Self::Locked | Self::Attention)
+    }
+
+    fn marker(self) -> char {
+        match self {
+            Self::Connected => '●',
+            Self::Stopped => '○',
+            Self::Locked | Self::Attention => '!',
+            Self::InProgress => '◐',
+        }
+    }
+}
+
+/// `1 proxy running`, `2 proxies running`.
+fn count_label(n: usize, one: &str, many: &str, verb_one: &str, verb_many: &str) -> String {
+    if n == 1 {
+        format!("{n} {one} {verb_one}")
+    } else {
+        format!("{n} {many} {verb_many}")
+    }
+}
+
 impl TrayMenuModel {
-    /// Builds the menu. Session order is preserved.
+    /// Builds the menu from legacy v1 sessions only. Session order is preserved.
     pub fn from_snapshots(snapshots: &[SessionSnapshot], vault_locked: bool) -> Self {
-        let connected = snapshots
-            .iter()
-            .filter(|s| s.state == SessionState::Connected)
-            .count();
-        let needs_attention = snapshots
-            .iter()
-            .filter(|s| needs_attention(&s.state))
-            .count();
-        // Start All leaves disabled sessions out, so they do not make it clickable.
-        let any_startable = snapshots.iter().any(|s| s.enabled && s.state.is_terminal());
-        let any_active = snapshots.iter().any(|s| !s.state.is_terminal());
+        Self::from_state(&TrayState {
+            sessions: snapshots.to_vec(),
+            vault_locked,
+            ..TrayState::default()
+        })
+    }
+
+    /// Builds the menu. Proxy, Tunnel, and session order is preserved.
+    pub fn from_state(state: &TrayState) -> Self {
+        let vault_locked = state.vault_locked;
+        // (health, enabled, terminal) for every item.
+        let mut all: Vec<(Health, bool, bool)> = Vec::new();
+        all.extend(state.proxies.iter().map(|p| {
+            let terminal = matches!(
+                p.state,
+                ProxyState::Stopped | ProxyState::NeedsAttention { .. }
+            );
+            (Health::of_proxy(&p.state), p.enabled, terminal)
+        }));
+        all.extend(state.tunnels.iter().map(|t| {
+            (Health::of_session(&t.state), t.enabled, t.state.is_terminal())
+        }));
+        all.extend(state.sessions.iter().map(|s| {
+            (Health::of_session(&s.state), s.enabled, s.state.is_terminal())
+        }));
+
+        let connected = all.iter().filter(|(h, ..)| *h == Health::Connected).count();
+        let needs_attention = all.iter().filter(|(h, ..)| h.needs_attention()).count();
+        // Start All leaves disabled items out, so they do not make it clickable.
+        let any_startable = all.iter().any(|(_, enabled, terminal)| *enabled && *terminal);
+        let any_active = all.iter().any(|(.., terminal)| !terminal);
 
         let mut start_all = TrayMenuItem::new("Start All", TrayAction::StartAll);
         start_all.enabled = any_startable;
@@ -144,12 +339,43 @@ impl TrayMenuModel {
         ));
         global_items.push(TrayMenuItem::new("Quit", TrayAction::Quit));
 
+        let summary = if state.proxies.is_empty() && state.tunnels.is_empty() && !state.sessions.is_empty() {
+            format!("{connected} connected · {needs_attention} needs attention")
+        } else {
+            let running = state
+                .proxies
+                .iter()
+                .filter(|p| matches!(p.state, ProxyState::Running { .. }))
+                .count();
+            let tunnel_attention = state
+                .tunnels
+                .iter()
+                .filter(|t| Health::of_session(&t.state).needs_attention())
+                .count();
+            format!(
+                "{} · {}",
+                count_label(running, "proxy", "proxies", "running", "running"),
+                count_label(tunnel_attention, "tunnel", "tunnels", "needs attention", "need attention"),
+            )
+        };
+
         Self {
-            summary: format!("{connected} connected · {needs_attention} needs attention"),
+            summary,
             connected,
             needs_attention,
-            icon: icon_for(snapshots, vault_locked),
-            sessions: snapshots
+            icon: icon_for(all.iter().map(|(h, ..)| *h), vault_locked),
+            proxies: state
+                .proxies
+                .iter()
+                .map(|p| proxy_entry(p, vault_locked))
+                .collect(),
+            tunnels: state
+                .tunnels
+                .iter()
+                .map(|t| tunnel_entry(t, vault_locked))
+                .collect(),
+            sessions: state
+                .sessions
                 .iter()
                 .map(|s| session_entry(s, vault_locked))
                 .collect(),
@@ -190,38 +416,20 @@ fn needs_attention(state: &SessionState) -> bool {
     )
 }
 
-fn in_progress(state: &SessionState) -> bool {
-    matches!(
-        state,
-        SessionState::Starting
-            | SessionState::Reconnecting { .. }
-            | SessionState::WaitingForNetwork
-    )
-}
-
-fn icon_for(snapshots: &[SessionSnapshot], vault_locked: bool) -> TrayIconState {
-    let any = |test: fn(&SessionState) -> bool| snapshots.iter().any(|s| test(&s.state));
-    if any(|s| needs_attention(s) && *s != SessionState::Locked) {
+fn icon_for(health: impl Iterator<Item = Health> + Clone, vault_locked: bool) -> TrayIconState {
+    let any = |wanted: Health| health.clone().any(|h| h == wanted);
+    if any(Health::Attention) {
         TrayIconState::Attention
     } else if vault_locked {
         TrayIconState::Locked
-    } else if any(|s| *s == SessionState::Locked) {
+    } else if any(Health::Locked) {
         TrayIconState::Attention
-    } else if any(in_progress) {
+    } else if any(Health::InProgress) {
         TrayIconState::Reconnecting
-    } else if any(|s| *s == SessionState::Connected) {
+    } else if any(Health::Connected) {
         TrayIconState::Connected
     } else {
         TrayIconState::Idle
-    }
-}
-
-fn marker_for(state: &SessionState) -> char {
-    match state {
-        SessionState::Connected => '●',
-        SessionState::Stopped => '○',
-        s if needs_attention(s) => '!',
-        _ => '◐',
     }
 }
 
@@ -240,6 +448,13 @@ fn short_reason(reason: &str) -> String {
     format!("{}…", kept.trim_end())
 }
 
+fn port_labels(http: Option<SocketAddr>, socks: Option<SocketAddr>) -> Vec<String> {
+    [("HTTP", http), ("SOCKS", socks)]
+        .into_iter()
+        .filter_map(|(name, addr)| addr.map(|a| format!("{name} :{}", a.port())))
+        .collect()
+}
+
 fn status_text(
     state: &SessionState,
     http: Option<SocketAddr>,
@@ -249,10 +464,7 @@ fn status_text(
         SessionState::Stopped => "Stopped → Start".into(),
         SessionState::Starting => "Starting…".into(),
         SessionState::Connected => {
-            let ports: Vec<String> = [("HTTP", http), ("SOCKS", socks)]
-                .into_iter()
-                .filter_map(|(name, addr)| addr.map(|a| format!("{name} :{}", a.port())))
-                .collect();
+            let ports = port_labels(http, socks);
             if ports.is_empty() {
                 "Connected".into()
             } else {
@@ -269,6 +481,33 @@ fn status_text(
             format!("{} → Open Manage Window", short_reason(reason))
         }
     }
+}
+
+fn copy_items(
+    source: Uuid,
+    http_url: Option<&String>,
+    socks_url: Option<&String>,
+) -> Vec<TrayMenuItem> {
+    let mut items = Vec::new();
+    if let Some(url) = http_url {
+        items.push(TrayMenuItem::new(
+            format!("Copy HTTP Proxy URL ({url})"),
+            TrayAction::CopyHttpUrl {
+                session_id: source,
+                url: url.clone(),
+            },
+        ));
+    }
+    if let Some(url) = socks_url {
+        items.push(TrayMenuItem::new(
+            format!("Copy SOCKS Proxy URL ({url})"),
+            TrayAction::CopySocksUrl {
+                session_id: source,
+                url: url.clone(),
+            },
+        ));
+    }
+    items
 }
 
 fn session_entry(snapshot: &SessionSnapshot, vault_locked: bool) -> TraySessionEntry {
@@ -295,24 +534,7 @@ fn session_entry(snapshot: &SessionSnapshot, vault_locked: bool) -> TraySessionE
         items.push(TrayMenuItem::new("Stop", TrayAction::StopSession(id)));
         items.push(TrayMenuItem::new("Restart", TrayAction::RestartSession(id)));
     }
-    if let Some(url) = &http_url {
-        items.push(TrayMenuItem::new(
-            format!("Copy HTTP Proxy URL ({url})"),
-            TrayAction::CopyHttpUrl {
-                session_id: id,
-                url: url.clone(),
-            },
-        ));
-    }
-    if let Some(url) = &socks_url {
-        items.push(TrayMenuItem::new(
-            format!("Copy SOCKS Proxy URL ({url})"),
-            TrayAction::CopySocksUrl {
-                session_id: id,
-                url: url.clone(),
-            },
-        ));
-    }
+    items.extend(copy_items(id, http_url.as_ref(), socks_url.as_ref()));
     items.push(TrayMenuItem::new("View Logs", TrayAction::ViewLogs(id)));
     if needs_attention(state) {
         items.push(TrayMenuItem::new(
@@ -324,10 +546,168 @@ fn session_entry(snapshot: &SessionSnapshot, vault_locked: bool) -> TraySessionE
     TraySessionEntry {
         id,
         name: snapshot.name.clone(),
-        marker: marker_for(state),
+        marker: Health::of_session(state).marker(),
         status: status_text(state, http, socks),
         http_url,
         socks_url,
+        items,
+    }
+}
+
+/// `Auto Switch` or `Override: <profile>`.
+fn mode_text(override_profile: Option<&str>) -> String {
+    match override_profile {
+        None => "Auto Switch".into(),
+        Some(profile) => format!("Override: {profile}"),
+    }
+}
+
+/// The `Mode ▸` submenu: the current choice carries a `✓`.
+fn mode_submenu(proxy: &ProxyTrayItem, current: Option<&str>) -> TraySubmenu {
+    let check = |on: bool, label: String| {
+        if on {
+            format!("✓ {label}")
+        } else {
+            label
+        }
+    };
+    let set = |profile: Option<&str>| TrayAction::SetProxyOverride {
+        id: proxy.id,
+        profile: profile.map(str::to_owned),
+    };
+    let rules = if proxy.rule_count == 1 {
+        "1 rule".to_owned()
+    } else {
+        format!("{} rules", proxy.rule_count)
+    };
+    let mut entries = vec![
+        TrayMenuItem::new(
+            check(current.is_none(), format!("Auto Switch ({rules})")),
+            set(None),
+        ),
+        TrayMenuItem::new(
+            check(current == Some(PROFILE_DIRECT), "Force Direct".into()),
+            set(Some(PROFILE_DIRECT)),
+        ),
+    ];
+    entries.extend(proxy.profiles.iter().map(|name| {
+        TrayMenuItem::new(
+            check(current == Some(name.as_str()), format!("Force {name}")),
+            set(Some(name)),
+        )
+    }));
+    TraySubmenu {
+        label: "Mode".into(),
+        entries: entries.into_iter().map(TrayMenuEntry::Item).collect(),
+    }
+}
+
+fn proxy_entry(proxy: &ProxyTrayItem, vault_locked: bool) -> TrayProxyEntry {
+    let id = proxy.id;
+    let health = Health::of_proxy(&proxy.state);
+    let running = match &proxy.state {
+        ProxyState::Running {
+            override_profile, ..
+        } => Some(override_profile.as_deref()),
+        _ => None,
+    };
+    // Only a running Proxy's listeners are bound, so offer no URLs otherwise.
+    let (http, socks) = if running.is_some() {
+        (
+            listener_addr(&proxy.listeners, ROLE_HTTP),
+            listener_addr(&proxy.listeners, ROLE_SOCKS),
+        )
+    } else {
+        (None, None)
+    };
+    let http_url = http.map(http_proxy_url);
+    let socks_url = socks.map(socks_proxy_url);
+
+    let status = match &proxy.state {
+        ProxyState::Stopped => "Stopped → Start".into(),
+        ProxyState::Starting => "Starting…".into(),
+        ProxyState::Running {
+            override_profile, ..
+        } => {
+            let mut parts = vec![mode_text(override_profile.as_deref())];
+            parts.extend(port_labels(http, socks));
+            parts.join(" · ")
+        }
+        ProxyState::Reloading => "Reloading…".into(),
+        ProxyState::Locked => "Vault locked".into(),
+        ProxyState::NeedsAttention { reason } => {
+            format!("{} → Open Manage Window", short_reason(reason))
+        }
+        ProxyState::Stopping => "Stopping…".into(),
+    };
+
+    let mut entries = Vec::new();
+    if let Some(current) = running {
+        entries.push(TrayMenuEntry::Submenu(mode_submenu(proxy, current)));
+    }
+    let mut items = Vec::new();
+    if proxy.state == ProxyState::Locked && vault_locked {
+        items.push(TrayMenuItem::new("Unlock Vault…", TrayAction::UnlockVault));
+    } else if matches!(
+        proxy.state,
+        ProxyState::Stopped | ProxyState::NeedsAttention { .. }
+    ) {
+        items.push(TrayMenuItem::new("Start", TrayAction::StartProxy(id)));
+    } else {
+        items.push(TrayMenuItem::new("Stop", TrayAction::StopProxy(id)));
+        items.push(TrayMenuItem::new("Restart", TrayAction::RestartProxy(id)));
+    }
+    items.extend(copy_items(id.as_uuid(), http_url.as_ref(), socks_url.as_ref()));
+    items.push(TrayMenuItem::new("View Logs", TrayAction::ViewProxyLogs(id)));
+    if health.needs_attention() {
+        items.push(TrayMenuItem::new(
+            "Open Manage Window…",
+            TrayAction::OpenManageWindow,
+        ));
+    }
+    entries.extend(items.into_iter().map(TrayMenuEntry::Item));
+
+    TrayProxyEntry {
+        id,
+        name: proxy.name.clone(),
+        marker: health.marker(),
+        status,
+        http_url,
+        socks_url,
+        entries,
+    }
+}
+
+fn tunnel_entry(tunnel: &TunnelTrayItem, vault_locked: bool) -> TrayTunnelEntry {
+    let id = tunnel.id;
+    let state = &tunnel.state;
+    let mut status = status_text(state, None, None);
+    if tunnel.linked && !tunnel.linked_to.is_empty() && !state.is_terminal() {
+        status = format!("{status} (linked to {})", tunnel.linked_to.join(", "));
+    }
+
+    let mut items = Vec::new();
+    if *state == SessionState::Locked && vault_locked {
+        items.push(TrayMenuItem::new("Unlock Vault…", TrayAction::UnlockVault));
+    } else if state.is_terminal() {
+        items.push(TrayMenuItem::new("Start", TrayAction::StartTunnel(id)));
+    } else {
+        items.push(TrayMenuItem::new("Stop", TrayAction::StopTunnel(id)));
+        items.push(TrayMenuItem::new("Restart", TrayAction::RestartTunnel(id)));
+    }
+    items.push(TrayMenuItem::new("View Logs", TrayAction::ViewTunnelLogs(id)));
+    if needs_attention(state) {
+        items.push(TrayMenuItem::new(
+            "Open Manage Window…",
+            TrayAction::OpenManageWindow,
+        ));
+    }
+
+    TrayTunnelEntry {
+        id,
+        name: tunnel.name.clone(),
+        marker: Health::of_session(state).marker(),
+        status,
         items,
     }
 }
@@ -564,5 +944,250 @@ mod tests {
         assert!(!text.contains('\n'));
         assert_eq!(text.chars().count(), MAX_REASON_CHARS);
         assert!(text.ends_with('…'));
+    }
+
+    fn proxy(name: &str, state: ProxyState, listeners: &[(&str, &str)]) -> ProxyTrayItem {
+        ProxyTrayItem {
+            id: ProxyId::new(),
+            name: name.into(),
+            enabled: true,
+            state,
+            listeners: listeners
+                .iter()
+                .map(|(role, addr)| ListenerInfo {
+                    role: (*role).into(),
+                    addr: addr.parse().unwrap(),
+                })
+                .collect(),
+            rule_count: 14,
+            profiles: vec!["corp".into(), "tunnel Bastion".into()],
+        }
+    }
+
+    fn running(override_profile: Option<&str>) -> ProxyState {
+        ProxyState::Running {
+            override_profile: override_profile.map(str::to_owned),
+            config_generation: 1,
+            restart_required: false,
+        }
+    }
+
+    fn tunnel(name: &str, state: SessionState, linked_to: &[&str]) -> TunnelTrayItem {
+        TunnelTrayItem {
+            id: TunnelId::new(),
+            name: name.into(),
+            enabled: true,
+            state,
+            linked: true,
+            linked_to: linked_to.iter().map(|s| (*s).to_owned()).collect(),
+        }
+    }
+
+    fn entry_labels(entries: &[TrayMenuEntry]) -> Vec<String> {
+        entries
+            .iter()
+            .map(|e| match e {
+                TrayMenuEntry::Item(i) => i.label.clone(),
+                TrayMenuEntry::Submenu(s) => format!("{} ▸", s.label),
+            })
+            .collect()
+    }
+
+    fn mode(entry: &TrayProxyEntry) -> &TraySubmenu {
+        match &entry.entries[0] {
+            TrayMenuEntry::Submenu(s) => s,
+            TrayMenuEntry::Item(_) => panic!("expected the Mode submenu first"),
+        }
+    }
+
+    fn item(entry: &TrayMenuEntry) -> &TrayMenuItem {
+        match entry {
+            TrayMenuEntry::Item(i) => i,
+            TrayMenuEntry::Submenu(_) => panic!("expected an item"),
+        }
+    }
+
+    #[test]
+    fn model_running_proxy_has_mode_submenu_and_socks5h_urls() {
+        let p = proxy("Work", running(None), &both());
+        let id = p.id;
+        let model = TrayMenuModel::from_state(&TrayState {
+            proxies: vec![p],
+            ..TrayState::default()
+        });
+        let entry = &model.proxies[0];
+
+        assert_eq!(model.summary, "1 proxy running · 0 tunnels need attention");
+        assert_eq!(model.icon, TrayIconState::Connected);
+        assert_eq!(
+            entry.label(),
+            "● Work — Auto Switch · HTTP :3128 · SOCKS :1080"
+        );
+        assert_eq!(
+            entry_labels(&entry.entries),
+            [
+                "Mode ▸",
+                "Stop",
+                "Restart",
+                "Copy HTTP Proxy URL (http://127.0.0.1:3128)",
+                "Copy SOCKS Proxy URL (socks5h://127.0.0.1:1080)",
+                "View Logs",
+            ]
+        );
+        assert_eq!(entry.socks_url.as_deref(), Some("socks5h://127.0.0.1:1080"));
+        assert!(!entry_labels(&entry.entries).iter().any(|l| l.contains("socks5://")));
+        assert_eq!(item(&entry.entries[1]).action, TrayAction::StopProxy(id));
+        assert_eq!(
+            item(&entry.entries[4]).action,
+            TrayAction::CopySocksUrl {
+                session_id: id.as_uuid(),
+                url: "socks5h://127.0.0.1:1080".into()
+            }
+        );
+        assert_eq!(item(&entry.entries[5]).action, TrayAction::ViewProxyLogs(id));
+        assert!(model.quit_needs_confirmation);
+    }
+
+    #[test]
+    fn model_mode_submenu_checks_the_active_choice() {
+        let auto = proxy("Work", running(None), &both());
+        let id = auto.id;
+        let model = TrayMenuModel::from_state(&TrayState {
+            proxies: vec![auto],
+            ..TrayState::default()
+        });
+        let submenu = mode(&model.proxies[0]);
+        assert_eq!(submenu.label, "Mode");
+        assert_eq!(
+            entry_labels(&submenu.entries),
+            [
+                "✓ Auto Switch (14 rules)",
+                "Force Direct",
+                "Force corp",
+                "Force tunnel Bastion"
+            ]
+        );
+        assert_eq!(
+            item(&submenu.entries[0]).action,
+            TrayAction::SetProxyOverride { id, profile: None }
+        );
+        assert_eq!(
+            item(&submenu.entries[1]).action,
+            TrayAction::SetProxyOverride { id, profile: Some("direct".into()) }
+        );
+        assert_eq!(
+            item(&submenu.entries[2]).action,
+            TrayAction::SetProxyOverride { id, profile: Some("corp".into()) }
+        );
+
+        for (forced, checked) in [("direct", 1), ("corp", 2)] {
+            let p = proxy("Work", running(Some(forced)), &both());
+            let model = TrayMenuModel::from_state(&TrayState {
+                proxies: vec![p],
+                ..TrayState::default()
+            });
+            let labels = entry_labels(&mode(&model.proxies[0]).entries);
+            let marked: Vec<usize> = labels
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| l.starts_with('✓'))
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(marked, [checked], "{labels:?}");
+            assert!(model.proxies[0].status.starts_with(&format!("Override: {forced}")));
+        }
+    }
+
+    #[test]
+    fn model_stopped_proxy_offers_start_without_mode_or_urls() {
+        let p = proxy("Lab", ProxyState::Stopped, &both());
+        let id = p.id;
+        let model = TrayMenuModel::from_state(&TrayState {
+            proxies: vec![p],
+            ..TrayState::default()
+        });
+        let entry = &model.proxies[0];
+        assert_eq!(entry.label(), "○ Lab — Stopped → Start");
+        assert_eq!(entry_labels(&entry.entries), ["Start", "View Logs"]);
+        assert_eq!(item(&entry.entries[0]).action, TrayAction::StartProxy(id));
+        assert_eq!(entry.http_url, None);
+        assert!(model.global_items[0].enabled, "Start All");
+        assert!(!model.global_items[1].enabled, "Stop All");
+        assert!(!model.quit_needs_confirmation);
+    }
+
+    #[test]
+    fn model_tunnel_shows_linked_and_attention_labels() {
+        let linked = tunnel("Bastion", SessionState::Connected, &["Work"]);
+        let broken = tunnel(
+            "Client VPN",
+            SessionState::NeedsAttention { reason: "Auth rejected".into() },
+            &[],
+        );
+        let broken_id = broken.id;
+        let model = TrayMenuModel::from_state(&TrayState {
+            proxies: vec![
+                proxy("Work", running(None), &both()),
+                proxy("Lab", ProxyState::Stopped, &[]),
+            ],
+            tunnels: vec![linked, broken],
+            ..TrayState::default()
+        });
+
+        assert_eq!(
+            model.summary,
+            "1 proxy running · 1 tunnel needs attention"
+        );
+        assert_eq!(model.icon, TrayIconState::Attention);
+        assert_eq!(model.tunnels[0].label(), "● Bastion — Connected (linked to Work)");
+        assert_eq!(
+            model.tunnels[1].label(),
+            "! Client VPN — Auth rejected → Open Manage Window"
+        );
+        assert_eq!(
+            labels(&model.tunnels[1].items),
+            ["Start", "View Logs", "Open Manage Window…"]
+        );
+        assert_eq!(model.tunnels[1].items[0].action, TrayAction::StartTunnel(broken_id));
+        assert_eq!(
+            model.tunnels[1].items[1].action,
+            TrayAction::ViewTunnelLogs(broken_id)
+        );
+        assert!(model.proxies[0].status.starts_with("Auto Switch"));
+    }
+
+    #[test]
+    fn model_tunnel_actions_and_unlinked_label() {
+        let mut manual = tunnel("Jump", SessionState::Connected, &["Work"]);
+        manual.linked = false;
+        let id = manual.id;
+        let model = TrayMenuModel::from_state(&TrayState {
+            tunnels: vec![manual],
+            ..TrayState::default()
+        });
+        let entry = &model.tunnels[0];
+        assert_eq!(entry.label(), "● Jump — Connected");
+        assert_eq!(labels(&entry.items), ["Stop", "Restart", "View Logs"]);
+        assert_eq!(entry.items[0].action, TrayAction::StopTunnel(id));
+        assert_eq!(entry.items[1].action, TrayAction::RestartTunnel(id));
+        assert_eq!(model.summary, "0 proxies running · 0 tunnels need attention");
+    }
+
+    #[test]
+    fn model_locked_proxy_and_tunnel_offer_unlock() {
+        let model = TrayMenuModel::from_state(&TrayState {
+            proxies: vec![proxy("Work", ProxyState::Locked, &[])],
+            tunnels: vec![tunnel("Bastion", SessionState::Locked, &[])],
+            vault_locked: true,
+            ..TrayState::default()
+        });
+        assert_eq!(model.icon, TrayIconState::Locked);
+        assert_eq!(model.needs_attention, 2);
+        assert_eq!(
+            item(&model.proxies[0].entries[0]).action,
+            TrayAction::UnlockVault
+        );
+        assert_eq!(model.tunnels[0].items[0].action, TrayAction::UnlockVault);
+        assert_eq!(model.proxies[0].status, "Vault locked");
     }
 }

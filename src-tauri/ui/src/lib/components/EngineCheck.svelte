@@ -1,6 +1,6 @@
 <script lang="ts">
   import { opensshCheck } from "../opensshCheck.svelte";
-  import { store } from "../stores.svelte";
+  import { chainEditor } from "./JumpChainBuilder.svelte";
   import type { SessionProfile } from "../types";
 
   interface Props {
@@ -9,9 +9,10 @@
   }
 
   let { onChangeProgram }: Props = $props();
+  const ed = chainEditor();
 
   const check = opensshCheck;
-  const sshBin = $derived((store.draft as SessionProfile).openssh.ssh_bin.trim());
+  const sshBin = $derived((ed.draft as SessionProfile).openssh.ssh_bin.trim());
   // Only a result for the configured program counts; until then the check is pending.
   const shown = $derived(check.bin === sshBin);
   const info = $derived(shown ? check.info : null);

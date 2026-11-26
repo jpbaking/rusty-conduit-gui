@@ -12,23 +12,37 @@
     presetSummary,
   } from "../portForwards";
   import { store } from "../stores.svelte";
+  import { chainEditor } from "./JumpChainBuilder.svelte";
   import type { ForwardDirection, PortForward, SessionProfile } from "../types";
   import PortForwardRow from "./PortForwardRow.svelte";
 
   const uid = $props.id();
-  const draft = $derived(store.draft as SessionProfile);
+  const ed = chainEditor();
+  const draft = $derived(ed.draft as SessionProfile);
   const forwards = $derived(draft.port_forwards);
-  const listenersError = $derived(store.draftErrors.listeners);
+  const listenersError = $derived(ed.draftErrors.listeners);
+  // Each row reads the session editor's errors, so a Tunnel's forward errors are listed here.
+  const tunnelForwardErrors = $derived(
+    ed.isTunnel
+      ? Object.entries(ed.draftErrors).flatMap(([field, message]) => {
+          const match = /^forwards:([^:]+):/.exec(field);
+          if (!match) return [];
+          const forward = draft.port_forwards.find((f) => f.id === match[1]);
+          const label = forward ? forward.name.trim() || forwardSpec(forward) : "Port forward";
+          return [`${label}: ${message}`];
+        })
+      : [],
+  );
   const target = $derived.by(() => {
     const last = draft.hops[draft.hops.length - 1];
     return last ? hopTitle(last) : "the target";
   });
   const runtime = $derived(
-    store.selected && isActive(store.selected.runtime.state) ? store.selected.runtime : null,
+    ed.selected && isActive(ed.selected.runtime.state) ? ed.selected.runtime : null,
   );
   // A running session keeps the forwards it started with until it is restarted.
   const startedWith = $derived(
-    new Map((store.selected?.profile.port_forwards ?? []).map((f) => [f.id, JSON.stringify(f)])),
+    new Map((ed.selected?.profile.port_forwards ?? []).map((f) => [f.id, JSON.stringify(f)])),
   );
   // The only listener left cannot be switched off, as with the proxies.
   const proxiesOn = $derived(draft.forward.enabled || draft.reverse.enabled);
@@ -47,7 +61,7 @@
   let presetValue = $state("");
 
   function setForwards(edit: (list: PortForward[]) => PortForward[]) {
-    store.updateDraft((p) => ({ ...p, port_forwards: edit(p.port_forwards) }));
+    ed.updateDraft((p) => ({ ...p, port_forwards: edit(p.port_forwards) }));
   }
 
   function update(id: string, patch: Partial<PortForward>) {
@@ -99,7 +113,7 @@
   function moveFromExtraArgs() {
     const taken = new Set(movable.flatMap((m) => m.indices));
     const moved = movable.flatMap((m) => ("forward" in m.result ? [m.result.forward] : []));
-    store.updateDraft((p) => ({
+    ed.updateDraft((p) => ({
       ...p,
       port_forwards: [...p.port_forwards, ...moved],
       openssh: { ...p.openssh, extra_args: p.openssh.extra_args.filter((_, i) => !taken.has(i)) },
@@ -108,6 +122,11 @@
 </script>
 
 {#if listenersError}<p class="field-error">{listenersError}</p>{/if}
+{#if tunnelForwardErrors.length > 0}
+  <ul class="plain-list field-error" aria-label="Port forwards to fix">
+    {#each tunnelForwardErrors as error, index (index)}<li>{error}</li>{/each}
+  </ul>
+{/if}
 
 <section class="card" aria-labelledby={`${uid}-heading`}>
   <div class="card-head">

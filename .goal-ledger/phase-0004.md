@@ -1,70 +1,57 @@
-# phase-0004 — Build ProxyManager in conduit-runtime (hot-reload, overrides, Route Tester, Test Upstream, counters)
+# phase-0004 — Build Sidebar, New Proxy wizard, 5-tab Tunnel editor, Profile Library view, and Vault upstream-password UI
 
 - Status: done
 - Owner: executor
 - Depends on: phase-0003
-- Goal: Implement `ProxyManager` in `conduit-runtime` wired to `TunnelManager`, supporting zero-downtime `ArcSwap` hot-reload, tray overrides, Linked tunnel lifecycle, Route Tester, Test Upstream probe, per-rule/profile counters, and structured `AccessRecord` log sink.
-- Done when: `ProxyManager` and its types are exported from `conduit-runtime`, pass unit tests and `clippy -D warnings`, and existing `SessionManager` tests remain green.
-- Pattern to follow: `docs/MASTER-PLAN.md:134-164`, `../rusty-conduit-engine/src/routing.rs:687-1080` (`RoutingState`, `SharedRouting`, `RoutingCounters`), `../rusty-conduit-engine/src/router/mod.rs:40-460` (`ParsedTarget`, `RouteRequest`, `Router`)
+- Goal: Upgrade the Manage Window navigation (`Sidebar.svelte`, `App.svelte`), add the New Proxy wizard (*Direct* / *Through a tunnel* / *Auto Switch*), re-home the 5-tab Tunnel editor (with Linked/Manual start mode and "Used by" Proxies list), add the Profile Library view, and add upstream-password visibility/safe-delete support in `KeyVaultView.svelte`.
+- Done when: `cd src-tauri/ui && npm run check && npm test && npm run build` passes with zero errors and zero warnings.
+- Pattern to follow: `src-tauri/ui/src/lib/components/Sidebar.svelte`, `src-tauri/ui/src/lib/components/SessionEditor.svelte`, `src-tauri/ui/src/lib/components/KeyVaultView.svelte`, `docs/MASTER-PLAN.md:295-302`
 
 ## Context
-- Create `crates/conduit-runtime/src/proxy_manager.rs` (exported from `crates/conduit-runtime/src/lib.rs`).
-- `ProxyState` enum (`#[serde(tag = "state", rename_all = "snake_case")]`): `Stopped`, `Starting`, `Running { override_profile: Option<String>, config_generation: u64, restart_required: bool }`, `Reloading`, `Locked`, `NeedsAttention { reason: String }`, `Stopping`.
-- `ProxySnapshot`: `id: ProxyId`, `name: String`, `enabled: bool`, `state: ProxyState`, `listeners: Vec<ListenerInfo>`, `config_generation: u64`, `override_profile: Option<String>`, `restart_required: bool`, `profile_counters: BTreeMap<String, TrafficSnapshot>`, `rule_counters: BTreeMap<String, TrafficSnapshot>` (using a serde-serializable mirror `ProxyTrafficSnapshot { active, bytes_in, bytes_out, hits }` since engine's `TrafficSnapshot` may not derive `Serialize`), `referenced_tunnels: Vec<TunnelId>`.
-- `ProxyManager` holds `Arc<TunnelManager>`, `SharedVault`, `ManagerConfig`, `HashMap<ProxyId, Arc<ProxySlot>>`, and a `ProxyEvent` broadcast bus (`StateChanged { proxy_id, state }`, `Reloaded { proxy_id, config_generation }`, `OverrideChanged { proxy_id, override_profile }`).
-- **Start flow (`start(id)`):**
-  1. Validate `proxy` via `validate_proxy(&proxy, &known_tunnels, &other_listeners)` where `other_listeners` collects all bound listeners of other running Proxies plus `tunnels.reverse_listeners()` (and also check listener port conflicts against other running Proxies).
-  2. Check vault: if any profile has `UpstreamPasswordSource::Vault(_)` or `proxy.mitm` has a CA and vault is locked → transition to `ProxyState::Locked` and return `Err(ProxyError::VaultLocked)`.
-  3. Resolve vaulted upstream passwords into `BTreeMap<String, Zeroizing<String>>` and optional MITM CA PEM bytes into `Option<Zeroizing<Vec<u8>>>`.
-  4. Build `RoutingInput` via `proxy_to_routing_input(&proxy, &passwords, &other_listeners)`, attach every referenced Tunnel's dialer (`tunnels.dialer(tid)`) via `DialerOptions::with_external(profile.name, dialer)`, compile `RoutingState::from_input` → `SharedRouting` (`Arc<ArcSwap<RoutingState>>`).
-  5. Build `MitmState::from_pem_bytes` if MITM enabled.
-  6. Acquire Linked Tunnels (`tunnels.acquire_linked(tid, proxy.id)`) staggered if multiple, then bind `Server::from_options(&proxy_server_options(&proxy), handlers, logger)` with `.with_runtime(Arc::clone(&shared_routing))` so client TCP keepalive also hot-reloads! Spawn `server.run()` and optional MITM cert reaper.
-  7. Support an optional `AccessRecordSink` (or bounded ring buffer of structured `AccessRecord` entries per Proxy) alongside `LogRingBuffer`.
-- **Zero-downtime hot-reload (`upsert_proxy(proxy)` / `reload(id)`):**
-  - Compare running baseline config vs updated `Proxy`: changes to `listeners` (`bind`, `http_port`, `socks_port`, `max_connections`), `mitm` (on/off, CA, TTL, cache max, `socks_block_web`), or `logging` sinks set `restart_required = true` (do not rebind listeners).
-  - Compile the next `RoutingState` (re-resolving vaulted passwords, attaching referenced tunnel dialers, checking cross-Proxy + reverse-listener self-loops), preserving existing `RoutingCounters` via `.with_counters(prev.counters().clone())` and setting `.with_generation(next_gen)`.
-  - On success: update saved `compiled_routing`, atomically `shared_routing.store(Arc::new(next_state))` (unless a tray override is currently active, in which case keep the saved state updated and re-apply override if profile still exists or clear override), reconcile `acquire_linked` / `release_linked` for added/removed tunnel refs, and emit `Reloaded`.
-  - On failure: keep current `RoutingState` untouched and return `Err(ProxyError::...)`.
-- **Tray overrides (`set_override(id, override_profile: Option<String>)`):**
-  - `Some(profile_name)` (e.g. `"direct"` or any configured profile name): build a temporary rule-less `RoutingState` whose default target is `OneOrMany::One(profile_name)` using the current proxy's profiles/external dialers/keepalive/timeout/filter and preserving `RoutingCounters`, then `shared_routing.store(...)`.
-  - `None` (*Auto Switch*): restore the saved compiled `RoutingState` via `shared_routing.store(...)`.
-- **Route Tester (`test_route(proxy: &Proxy, raw_target: &str, inbound: RouteInbound) -> Result<RouteTestResult, ProxyError>`):**
-  - Parses `raw_target` with `rusty_conduit_engine::router::ParsedTarget::parse(raw_target)`, builds `RoutingInput` (using dummy placeholder passwords so vault isn't needed for route testing) + `Router::from_input`, evaluates `RouteRequest`, and returns `RouteTestResult { table, matched_rule, blocked_by_filter, filter_reason, targets: Vec<RouteTestTarget { profile, redacted_upstream, bypassed }> }`.
-- **Test Upstream (`test_upstream(&self, proxy: &Proxy, profile_name: &str, host: &str, port: u16, timeout: Duration) -> Result<UpstreamProbeResult, ProxyError>`):**
-  - Resolves vaulted password (if needed) or Tunnel dialer from `TunnelManager`, dials `host:port` through that profile's `UpstreamDialer`, and returns `UpstreamProbeResult { ok: bool, elapsed_ms: u64, redacted_upstream: String, error: Option<String> }` (never leaking passwords).
-- Always use `CARGO_NET_GIT_FETCH_WITH_CLI=true` when running cargo commands.
+- Follow `docs/MASTER-PLAN.md` §9.2:
+  - **Sidebar (`Sidebar.svelte`)**: **Proxies** and **Tunnels** lists (with search input, live status dots, mode pill e.g. `Direct` / `Tunnel` / `Auto Switch` / `Override`), `+ New Proxy` button (opens `NewProxyWizardModal.svelte`), `+ New Tunnel` button, then bottom nav for **Host Profiles**, **Profile Library**, **Vault**, **Settings**.
+  - **New Proxy wizard (`NewProxyWizardModal.svelte`)**: three clear starting presets — *Direct* (plain `rusty-conduit`, default `direct`, no rules), *Through a tunnel* (`rusty-conduit-ssh`, choose an existing Tunnel or create one, default `tunnel`), *Auto Switch* (`rusty-conduit-switch`, starter rules view). Creates the draft Proxy and opens it in the Proxy editor.
+  - **Tunnel editor (`TunnelEditor.svelte`)**: re-homed from `SessionEditor.svelte` with 5 tabs:
+    1. Connection & Jump Chain (`JumpChainBuilder`, `HopProfileBar`, per-hop auth, host-key status, IP version, engine)
+    2. Reverse Proxy (`-R`)
+    3. Port Forwards (+ presets)
+    4. Keepalive & Reconnect + `Linked` / `Manual` (+ autostart) start mode selector
+    5. Logging & Advanced (OpenSSH options with isolation validation)
+    Plus a **"Used by"** list of Proxies referencing this Tunnel, and header with Test Chain, Start/Stop/Restart, Save, Logs.
+  - **Profile Library view (`ProfileLibraryView.svelte`)**: list, add, edit, and delete shared `UpstreamProfile` entries (reusable across Proxies).
+  - **Vault (`KeyVaultView.svelte`)**: show upstream-password usage across Proxies and ensure safe-delete confirmation lists affected Proxies and Tunnels.
+  - Wire `App.svelte` to render `ProxyEditor` (stub/shell ready for phase-0005 if needed, or basic placeholder if phase-0005 replaces it), `TunnelEditor`, `ProfileLibraryView`, `HostProfilesView`, `KeyVaultView`, `SettingsView`, `NewProxyWizardModal`, and `HostKeyModal` (wired to Tunnel host-key approval).
+- Note: `npm run build` rewrites the tracked `src-tauri/ui/dist/` directory (which will be rebuilt and committed in phase-0006). After `npm run build` passes, restore `src-tauri/ui/dist/` (`git checkout -- src-tauri/ui/dist && git clean -fd src-tauri/ui/dist`) before committing so only `Scope: In` files are staged.
 
 ## Scope
-- In: `crates/conduit-runtime/Cargo.toml` (only if `arc-swap` is needed directly), `crates/conduit-runtime/src/lib.rs`, `crates/conduit-runtime/src/proxy_manager.rs` (create), `Cargo.lock`
-- Out: `Cargo.toml`, `crates/conduit-core/`, `crates/conduit-ssh/`, `crates/conduit-openssh/`, `crates/conduit-vault/`, `crates/conduit-tray/`, `src-tauri/`
+- In: `src-tauri/ui/src/lib/components/App.svelte`, `src-tauri/ui/src/lib/components/Sidebar.svelte`, `src-tauri/ui/src/lib/components/NewProxyWizardModal.svelte` (create), `src-tauri/ui/src/lib/components/TunnelEditor.svelte` (create), `src-tauri/ui/src/lib/components/ProfileLibraryView.svelte` (create), `src-tauri/ui/src/lib/components/ProxyEditor.svelte` (create minimal shell for phase-0005), `src-tauri/ui/src/lib/components/KeyVaultView.svelte`, `src-tauri/ui/src/lib/components/HostKeyModal.svelte`, `src-tauri/ui/src/lib/components/HeaderBar.svelte`, `src-tauri/ui/src/lib/components/JumpChainBuilder.svelte`, `src-tauri/ui/src/lib/components/HopEditor.svelte`, `src-tauri/ui/src/lib/components/ReverseProxyTab.svelte`, `src-tauri/ui/src/lib/components/PortForwardsTab.svelte`, `src-tauri/ui/src/lib/components/KeepaliveTab.svelte`, `src-tauri/ui/src/lib/components/LoggingAdvancedTab.svelte`, `src-tauri/ui/src/lib/components/EngineCheck.svelte`
+- Out: `crates/`, `src-tauri/src/`, `src-tauri/ui/src/lib/components/LogDrawer.svelte`
 
 ## Sub-tasks
-1. [done] Create `crates/conduit-runtime/src/proxy_manager.rs` with `ProxyState`, `ProxySnapshot`, `ProxyTrafficSnapshot`, `ProxyEvent`, `ProxyError`, `RouteTestResult`, `UpstreamProbeResult`, and `ProxyManager` lifecycle (`upsert_proxy`, `remove_proxy`, `start`, `stop`, `restart`, `stop_all`, `snapshot`, `snapshots`, `logs`, Linked tunnel acquire/release) — done when: `proxy_manager.rs` compiles cleanly.
-2. [done] Implement `reload` (with `restart_required` classification and `RoutingCounters` preservation), `set_override` (swap temporary rule-less `RoutingState` and restore saved state), `test_route` (`ParsedTarget` + `Router`), and `test_upstream` (dial probe with timing and redacted errors) in `proxy_manager.rs` — done when: all methods compile with zero warnings.
-3. [done] Export `ProxyManager` and its public types from `crates/conduit-runtime/src/lib.rs` and add unit tests in `proxy_manager.rs` covering `test_route`, `test_upstream`, `restart_required` detection, and `ProxyState` serialization — done when: `cargo test -p conduit-runtime` passes.
+1. [done] Update `Sidebar.svelte` (Proxies + Tunnels lists with search, live status, mode pills, `+ New Proxy`, `+ New Tunnel`, Profile Library nav) and create `NewProxyWizardModal.svelte` (*Direct* / *Through a tunnel* / *Auto Switch*) — done when: `npm run check` passes.
+2. [done] Create `TunnelEditor.svelte` (5 tabs: Connection & Jump Chain, Reverse Proxy, Port Forwards, Keepalive & Start Mode, Logging & Advanced, plus "Used by" Proxies list) and adapt the shared Tunnel tab components (`JumpChainBuilder`, `ReverseProxyTab`, `PortForwardsTab`, `KeepaliveTab`, `LoggingAdvancedTab`, `EngineCheck`, `HostKeyModal`) — done when: `npm run check` passes.
+3. [done] Create `ProfileLibraryView.svelte`, update `KeyVaultView.svelte` for Proxy/Tunnel usage and upstream passwords, create the `ProxyEditor.svelte` shell, and wire `App.svelte` — done when: `npm run check` passes.
 4. [done] Run `## Verify` and record observed results in `## Evidence` — done when: `## Verify` exits 0.
 
 ## Verify
 ```sh
-CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test -p conduit-runtime && CARGO_NET_GIT_FETCH_WITH_CLI=true cargo clippy -p conduit-runtime --all-targets -- -D warnings
+cd src-tauri/ui && npm run check && npm test && npm run build
 ```
 
 ## Escalate when
-- `arc-swap` is not re-exported by `rusty-conduit-engine` and needs to be added to root `Cargo.toml` → stop, set Status: needs-human — reason: confirm adding `arc-swap = "1"` to `[workspace.dependencies]`
-- Any `rusty_conduit_engine::router::ParsedTarget` or `RouteDecision` field differs from expected → stop, set Status: needs-human — reason: document the exact field mismatch
+- A shared tab component needs a new backend command not exposed in phase-0001 → stop, set Status: needs-human — reason: name the missing command and signature
 
 ## Log
 - (append-only, one line per event)
-- sub-task 1: created `crates/conduit-runtime/src/proxy_manager.rs` (ProxyState, ProxySnapshot, ProxyTrafficSnapshot, ProxyEvent, ProxyError, RouteTestResult/RouteTestTarget, UpstreamProbeResult, AccessRecordBuffer, ProxyManager upsert/remove/start/stop/restart/stop_all/snapshot(s)/logs, staggered Linked acquire + release) and declared `pub mod proxy_manager` in lib.rs; no Cargo.toml change needed (`SharedRouting` methods `store`/`load_full` are inherent, `RoutingState::shared()` builds it)
-- sub-task 2: implemented in the same file `reload` (restart_required via `requires_restart`, counters via `with_counters`, `with_generation`, tunnel acquire/release reconcile, override re-apply/clear), `set_override` (rule-less state sharing saved dialers/counters), `test_route` (ParsedTarget + Router + RouteRequest, placeholder passwords), `test_upstream` (dialer_for_profile, timing, redacted errors)
-
-- sub-task 3: exported `ProxyManager`, `ProxyError`, `ProxyEvent`, `ProxySnapshot`, `ProxyState`, `ProxyTrafficSnapshot`, `RouteTestResult`, `RouteTestTarget`, `UpstreamProbeResult`, `AccessRecordBuffer`, `requires_restart` from lib.rs; added 12 unit tests (state serialization, restart_required, test_route rule/bypass/filter/vault/tunnel/bad targets, test_upstream direct/refused/unknown/tunnel-down/vault-locked, Locked and NeedsAttention starts, port conflict, CONNECT counters, hot reload + rejected reload, override swap/keep/clear/restore, Linked acquire/release)
-
-- sub-task 4: ran `## Verify`; both commands passed with no fix-ups needed
+- started phase-0004 (begin commit 00b91dd)
+- sub-task 2 (done first, as the Sidebar/App wiring depends on the shared editor): added a `ChainEditor` context (`provideChainEditor`/`chainEditor`, module script of `JumpChainBuilder.svelte`) that the store satisfies structurally; `JumpChainBuilder`, `ReverseProxyTab`, `PortForwardsTab`, `KeepaliveTab` (Linked/Manual + autostart selector for Tunnels), `LoggingAdvancedTab`, `EngineCheck` now read it; `HostKeyModal` gains `kind="tunnel"` (approve/reject_tunnel_host_key); created `TunnelEditor.svelte` (5 tabs, Used by list, header with Test Chain/Start/Stop/Restart/Save/Discard/Logs) adapting a Tunnel to the session shape
+- sub-task 1: rewrote `Sidebar.svelte` (search, Proxies + Tunnels lists with status glyphs and mode pills, `+ New Proxy`/`+ New Tunnel`, context menus with Tunnel delete listing affected Proxies, bottom nav Host Profiles / Profile Library / Vault / Settings); created `NewProxyWizardModal.svelte` (Direct / Through a tunnel / Auto Switch → `store.newProxyFromPreset`)
+- sub-task 3: created `ProfileLibraryView.svelte` (list/add/edit/delete, vault/env/file password source), `ProxyEditor.svelte` shell (header + summary; exports `proxyStatusOf`/`proxyActive`/`proxyMode`), updated `KeyVaultView.svelte` (key delete lists Hosts/Sessions/Tunnels/Proxies/Profile Library; new Upstream passwords section with safe delete), wired `App.svelte` (proxy/tunnel/profileLibrary/vault views, wizard, Tunnel host-key modal, opens on Proxies)
+- sub-task 4: ran ## Verify → exit 0; restored `src-tauri/ui/dist/`
 
 ## Evidence
 - (append-only: command → observed result)
-- sub-task 1: `CARGO_NET_GIT_FETCH_WITH_CLI=true cargo build -p conduit-runtime` → `Finished dev profile`, exit 0
-- sub-task 2: `touch proxy_manager.rs && cargo build -p conduit-runtime 2>&1 | grep -c '^warning'` → `0`; build `Finished`
-- sub-task 3: `cargo test -p conduit-runtime --lib proxy_manager` → 12 passed; `cargo test -p conduit-runtime` → lib 86 passed, e2e_runtime 9 passed, openssh_e2e 9 passed, doctests 0; exit 0
-- sub-task 4 / Verify: `CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test -p conduit-runtime && CARGO_NET_GIT_FETCH_WITH_CLI=true cargo clippy -p conduit-runtime --all-targets -- -D warnings` → tests 86+9+9 passed; clippy `Finished dev profile` with no warnings; exit 0
+- after sub-task 2: `cd src-tauri/ui && npm run check` → `COMPLETED 190 FILES 0 ERRORS 0 WARNINGS 0 FILES_WITH_PROBLEMS`
+- after sub-tasks 1 and 3: `cd src-tauri/ui && npm run check` → `COMPLETED 192 FILES 0 ERRORS 0 WARNINGS 0 FILES_WITH_PROBLEMS`
+- ## Verify: `cd src-tauri/ui && npm run check && npm test && npm run build` → exit 0; svelte-check 0 errors / 0 warnings; node tests 93 pass / 0 fail; vite `✓ 186 modules transformed … ✓ built in 2.55s`
+- `git checkout -- src-tauri/ui/dist && git clean -fdq src-tauri/ui/dist; git status --short` → only the 10 modified + 4 new files under `src-tauri/ui/src/lib/components/` listed in Scope: In

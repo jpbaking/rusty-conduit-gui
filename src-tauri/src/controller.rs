@@ -10,7 +10,9 @@ pub mod mitm_ca;
 pub mod parity;
 pub mod password;
 pub mod presets;
+pub mod proxies;
 pub mod sessions;
+pub mod tunnels;
 #[cfg(test)]
 pub(crate) mod test_support;
 
@@ -22,10 +24,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use conduit_core::{
-    load_app_config, load_known_hosts, save_app_config, save_known_hosts, AppConfig, KeyId,
-    KnownHostsStore, SecretRef, SessionProfile, StorageError, ValidateError,
+    load_known_hosts, load_or_migrate_app_config, save_app_config, save_known_hosts, AppConfig,
+    KeyId, KnownHostsStore, Proxy, ProxyValidateError, SecretRef, SessionProfile, StorageError,
+    Tunnel, ValidateError,
 };
-use conduit_runtime::{HostKeyPrompt, ManagerConfig, RuntimeError, RuntimeEvent, SessionManager};
+use conduit_runtime::{
+    HostKeyPrompt, ManagerConfig, ProxyError, ProxyEvent, ProxyManager, RuntimeError, RuntimeEvent,
+    SessionManager, TunnelError, TunnelEvent, TunnelEventReceiver, TunnelManager,
+};
 use conduit_vault::{
     generate_dek, Argon2Params, KeyringBackend, OsKeyringBackend, Vault, VaultError, VaultHeader,
 };
@@ -38,8 +44,9 @@ use zeroize::Zeroizing;
 
 use keys::Usage;
 
-/// Current `config.json` schema version.
-const SCHEMA_VERSION: u32 = 1;
+/// Current `config.json` schema version. Fresh documents are written at this version, so only a
+/// real v0.1.0 file (schema 1) goes through the §6.4 migration on open.
+const SCHEMA_VERSION: u32 = conduit_core::CURRENT_SCHEMA_VERSION;
 
 /// Cost of the throwaway vault used until the user creates a real one. Its password is random
 /// and discarded, so it protects nothing and needs no real work factor.
@@ -98,6 +105,12 @@ pub enum AppError {
     Validate(#[from] ValidateError),
     #[error(transparent)]
     Runtime(#[from] RuntimeError),
+    #[error(transparent)]
+    ProxyValidate(#[from] ProxyValidateError),
+    #[error(transparent)]
+    Proxy(#[from] ProxyError),
+    #[error(transparent)]
+    Tunnel(#[from] TunnelError),
     #[error("the vault has not been created yet")]
     VaultNotInitialized,
     #[error("a vault already exists and will not be overwritten")]
@@ -125,6 +138,10 @@ impl AppError {
             Self::Storage(_) => "storage",
             Self::Validate(_) => "validation",
             Self::Runtime(_) => "runtime",
+            Self::ProxyValidate(_) => "validation",
+            Self::Proxy(ProxyError::VaultLocked) => "vault_locked",
+            Self::Proxy(_) => "proxy",
+            Self::Tunnel(_) => "tunnel",
             Self::VaultNotInitialized => "vault_not_initialized",
             Self::VaultExists => "vault_exists",
             Self::NotFound { .. } => "not_found",
@@ -197,11 +214,15 @@ struct Inner {
     known_hosts: Arc<RwLock<KnownHostsStore>>,
     vault: Arc<RwLock<Vault>>,
     manager: SessionManager,
+    manager_config: ManagerConfig,
+    tunnels: Arc<TunnelManager>,
+    proxies: Arc<ProxyManager>,
     /// Keeps concurrent saves of `known_hosts.json` in order.
     known_hosts_save: Mutex<()>,
     /// Serializes vault creation and unlocking.
     vault_lifecycle: Mutex<()>,
-    /// The unknown key each session's latest chain test saw, so the user can trust exactly it.
+    /// The unknown key each session's or Tunnel's latest chain test saw, so the user can trust
+    /// exactly it. Keyed by the session or Tunnel UUID.
     tested_host_keys: Mutex<HashMap<Uuid, HostKeyPrompt>>,
 }
 
@@ -263,8 +284,10 @@ impl AppController {
             vault_keyring: dir.join("vault.keyring"),
         };
 
+        // A v0.1.0 document (schema 1 with sessions) becomes Tunnels and Proxies here, once, with
+        // the original kept as `config.v1.bak.json`.
         let mut config = if paths.config.exists() {
-            load_app_config(&paths.config)?
+            load_or_migrate_app_config(&paths.config)?.0
         } else {
             AppConfig {
                 schema_version: SCHEMA_VERSION,
@@ -287,9 +310,26 @@ impl AppController {
 
         let vault = Arc::new(RwLock::new(vault));
         let known_hosts = Arc::new(RwLock::new(known_hosts));
+        let manager_config = options.manager.clone();
         let manager = SessionManager::new(Arc::clone(&vault), Arc::clone(&known_hosts), options.manager);
         for profile in &config.sessions {
             manager.upsert_profile(profile.clone());
+        }
+        let tunnels = Arc::new(TunnelManager::new(
+            Arc::clone(&vault),
+            Arc::clone(&known_hosts),
+            manager_config.clone(),
+        ));
+        for tunnel in &config.tunnels {
+            tunnels.upsert_tunnel(tunnel.clone());
+        }
+        let proxies = Arc::new(ProxyManager::new(
+            Arc::clone(&tunnels),
+            Arc::clone(&vault),
+            manager_config.clone(),
+        ));
+        for proxy in &config.proxies {
+            register_stopped_proxy(&proxies, proxy.clone());
         }
 
         Ok(Self {
@@ -301,6 +341,9 @@ impl AppController {
                 known_hosts,
                 vault,
                 manager,
+                manager_config,
+                tunnels,
+                proxies,
                 known_hosts_save: Mutex::new(()),
                 vault_lifecycle: Mutex::new(()),
                 tested_host_keys: Mutex::new(HashMap::new()),
@@ -317,10 +360,33 @@ impl AppController {
         &self.inner.manager
     }
 
-    /// Reports an OS wake so live sessions are recycled once the burst settles. Must be called
-    /// inside a Tokio runtime.
+    pub(crate) fn tunnels(&self) -> &TunnelManager {
+        &self.inner.tunnels
+    }
+
+    pub(crate) fn proxies(&self) -> &ProxyManager {
+        &self.inner.proxies
+    }
+
+    pub(crate) fn manager_config(&self) -> &ManagerConfig {
+        &self.inner.manager_config
+    }
+
+    /// Reports an OS wake so live sessions and Tunnels are recycled once the burst settles.
+    /// Must be called inside a Tokio runtime.
     pub fn notify_system_wake(&self) {
         self.inner.manager.notify_system_wake();
+        self.inner.tunnels.on_system_wake();
+    }
+
+    /// A new stream of Proxy events.
+    pub fn subscribe_proxy_events(&self) -> tokio::sync::broadcast::Receiver<ProxyEvent> {
+        self.inner.proxies.subscribe_events()
+    }
+
+    /// A new stream of Tunnel events.
+    pub fn subscribe_tunnel_events(&self) -> TunnelEventReceiver {
+        self.inner.tunnels.subscribe_events()
     }
 
     /// A new stream of runtime events.
@@ -370,6 +436,26 @@ impl AppController {
         }
     }
 
+    /// Hands updated Tunnels to the Tunnel manager. Running Tunnels use them on next start.
+    pub(crate) fn sync_tunnels(&self, tunnels: impl IntoIterator<Item = Tunnel>) {
+        for tunnel in tunnels {
+            self.inner.tunnels.upsert_tunnel(tunnel);
+        }
+    }
+
+    /// Stops each Proxy (a running one holds secrets in memory), then hands it the updated
+    /// profile. Used when a forced delete removes a secret or CA the Proxy referenced.
+    pub(crate) async fn stop_and_sync_proxies(&self, proxies: Vec<Proxy>) -> Result<(), AppError> {
+        for proxy in proxies {
+            match self.inner.proxies.stop(proxy.id).await {
+                Ok(()) | Err(ProxyError::UnknownProxy(_)) => {}
+                Err(error) => return Err(error.into()),
+            }
+            self.inner.proxies.upsert_proxy(proxy).await?;
+        }
+        Ok(())
+    }
+
     /// Atomically saves the current known hosts.
     pub(crate) fn persist_known_hosts(&self) -> Result<(), AppError> {
         let _order = lock(&self.inner.known_hosts_save);
@@ -383,26 +469,42 @@ impl AppController {
         Ok(())
     }
 
-    /// A task that saves `known_hosts.json` whenever the runtime reports a pin change. It
-    /// subscribes immediately, so no event after this call is missed.
+    /// A task that saves `known_hosts.json` whenever a session or Tunnel reports a pin change.
+    /// It subscribes immediately, so no event after this call is missed.
     pub fn known_hosts_autosave(&self) -> impl Future<Output = ()> + Send + 'static {
-        let mut events = self.inner.manager.subscribe_events();
+        let mut sessions = self.inner.manager.subscribe_events();
+        let mut tunnels = self.inner.tunnels.subscribe_events();
         let controller = self.clone();
         async move {
-            loop {
-                match events.recv().await {
-                    // After a lag an event may have been lost, so save to be safe.
-                    Ok(RuntimeEvent::KnownHostsChanged { .. }) | Err(RecvError::Lagged(_)) => {
-                        let saver = controller.clone();
-                        let saved = tokio::task::spawn_blocking(move || saver.persist_known_hosts()).await;
-                        match saved {
-                            Ok(Ok(())) => {}
-                            Ok(Err(error)) => eprintln!("failed to save known hosts: {error}"),
-                            Err(error) => eprintln!("known hosts save task failed: {error}"),
+            let (mut sessions_open, mut tunnels_open) = (true, true);
+            while sessions_open || tunnels_open {
+                // After a lag an event may have been lost, so save to be safe.
+                let save = tokio::select! {
+                    event = sessions.recv(), if sessions_open => match event {
+                        Ok(RuntimeEvent::KnownHostsChanged { .. }) | Err(RecvError::Lagged(_)) => true,
+                        Ok(_) => false,
+                        Err(RecvError::Closed) => {
+                            sessions_open = false;
+                            false
                         }
+                    },
+                    event = tunnels.recv(), if tunnels_open => match event {
+                        Ok(TunnelEvent::KnownHostsChanged { .. }) | Err(RecvError::Lagged(_)) => true,
+                        Ok(_) => false,
+                        Err(RecvError::Closed) => {
+                            tunnels_open = false;
+                            false
+                        }
+                    },
+                };
+                if save {
+                    let saver = controller.clone();
+                    let saved = tokio::task::spawn_blocking(move || saver.persist_known_hosts()).await;
+                    match saved {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => eprintln!("failed to save known hosts: {error}"),
+                        Err(error) => eprintln!("known hosts save task failed: {error}"),
                     }
-                    Ok(_) => {}
-                    Err(RecvError::Closed) => break,
                 }
             }
         }
@@ -485,7 +587,7 @@ impl AppController {
             Ok(())
         })
         .await?;
-        self.inner.manager.on_vault_unlocked().await;
+        self.on_vault_unlocked().await;
         Ok(self.vault_status())
     }
 
@@ -540,7 +642,7 @@ impl AppController {
             Ok(())
         })
         .await?;
-        self.inner.manager.on_vault_unlocked().await;
+        self.on_vault_unlocked().await;
         Ok(self.vault_status())
     }
 
@@ -583,8 +685,14 @@ impl AppController {
             Ok(())
         })
         .await?;
-        self.inner.manager.on_vault_unlocked().await;
+        self.on_vault_unlocked().await;
         Ok(self.vault_status())
+    }
+
+    /// Resumes sessions, Tunnels, and Proxies that were waiting in `Locked`.
+    async fn on_vault_unlocked(&self) {
+        self.inner.manager.on_vault_unlocked().await;
+        self.resume_locked_v2().await;
     }
 
     /// Deletes vault records no config can refer to any more: MITM CA passphrases, which
@@ -622,7 +730,19 @@ pub(crate) async fn run_blocking<T: Send + 'static>(
 
 /// `true` when nothing references the key or secret.
 pub(crate) fn usage_is_empty(usage: &Usage) -> bool {
-    usage.hosts.is_empty() && usage.sessions.is_empty()
+    usage.count() == 0
+}
+
+/// Registers a saved Proxy that is not running. A new slot is never live, so
+/// [`ProxyManager::upsert_proxy`] completes without waiting and needs no async runtime.
+fn register_stopped_proxy(proxies: &ProxyManager, proxy: Proxy) {
+    let mut future = std::pin::pin!(proxies.upsert_proxy(proxy));
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    match future.as_mut().poll(&mut context) {
+        std::task::Poll::Ready(Ok(())) => {}
+        std::task::Poll::Ready(Err(error)) => eprintln!("failed to load a proxy: {error}"),
+        std::task::Poll::Pending => eprintln!("failed to load a proxy: registration did not complete"),
+    }
 }
 
 #[cfg(test)]
@@ -880,6 +1000,47 @@ mod tests {
         drop(c);
         let c = controller(&dir);
         assert_eq!(c.config_snapshot().sessions[0].name, "persisted");
+    }
+
+    #[tokio::test]
+    async fn a_schema_1_config_migrates_into_tunnels_and_proxies_on_open() {
+        let dir = TempDir::new();
+        let path = dir.path().join("config.json");
+        let v1 = AppConfig {
+            schema_version: 1,
+            sessions: vec![profile("legacy", 22)],
+            ..AppConfig::default()
+        };
+        save_app_config(&path, &v1).unwrap();
+        let original = fs::read(&path).unwrap();
+
+        let c = controller(&dir);
+        let config = c.config_snapshot();
+        assert_eq!(config.schema_version, conduit_core::CURRENT_SCHEMA_VERSION);
+        assert!(config.sessions.is_empty());
+        assert_eq!((config.tunnels.len(), config.proxies.len()), (1, 1));
+        assert_eq!(config.tunnels[0].name, "legacy");
+        assert_eq!(config.proxies[0].name, "legacy");
+        let backup = dir.path().join(conduit_core::V1_BACKUP_FILE_NAME);
+        assert_eq!(fs::read(&backup).unwrap(), original, "the v1 file is kept unchanged");
+        // Both managers hold the migrated items.
+        assert_eq!(c.tunnels().snapshots()[0].id, config.tunnels[0].id);
+        assert_eq!(c.proxies().snapshots()[0].id, config.proxies[0].id);
+        assert!(c.manager().snapshots().is_empty());
+
+        // Fresh documents are written at the current schema, so a reopen migrates nothing.
+        drop(c);
+        let c = controller(&dir);
+        assert_eq!(c.config_snapshot().tunnels.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_fresh_config_is_written_at_the_current_schema() {
+        let dir = TempDir::new();
+        let c = controller(&dir);
+        c.mutate_config(|_| Ok(())).unwrap();
+        let saved = conduit_core::load_app_config(&dir.path().join("config.json")).unwrap();
+        assert_eq!(saved.schema_version, conduit_core::CURRENT_SCHEMA_VERSION);
     }
 
     #[cfg(unix)]

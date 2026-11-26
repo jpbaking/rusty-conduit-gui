@@ -1,7 +1,7 @@
 <script lang="ts">
   import { untrack } from "svelte";
   import { opensshCheck } from "../opensshCheck.svelte";
-  import { store } from "../stores.svelte";
+  import { chainEditor } from "./JumpChainBuilder.svelte";
   import type { LoggingConfig, OpenSshOptions, SessionProfile } from "../types";
   import { configLineArgs, denylistedFlag, isIpAddress, isLoopback, LOG_FORMATS, LOG_LEVELS, redactArgs } from "../validate";
   import BrowseButton from "./BrowseButton.svelte";
@@ -20,10 +20,11 @@
     a.length === b.length && a.every((arg, index) => arg === b[index]);
 
   const uid = $props.id();
-  const draft = $derived(store.draft as SessionProfile);
+  const ed = chainEditor();
+  const draft = $derived(ed.draft as SessionProfile);
   const logging = $derived(draft.logging);
   const openssh = $derived(draft.openssh);
-  const errors = $derived(store.draftErrors);
+  const errors = $derived(ed.draftErrors);
   // The backend accepts any letter case. Showing the canonical form keeps the select in step.
   const level = $derived(logging.level.trim().toUpperCase());
   const format = $derived(logging.format.trim().toLowerCase());
@@ -83,11 +84,11 @@
   const LOG_FILES = [{ name: "Log files", extensions: ["log", "txt", "jsonl"] }];
 
   function setLogging(patch: Partial<LoggingConfig>) {
-    store.updateDraft((p) => ({ ...p, logging: { ...p.logging, ...patch } }));
+    ed.updateDraft((p) => ({ ...p, logging: { ...p.logging, ...patch } }));
   }
 
   function setOpenssh(patch: Partial<OpenSshOptions>) {
-    store.updateDraft((p) => ({ ...p, openssh: { ...p.openssh, ...patch } }));
+    ed.updateDraft((p) => ({ ...p, openssh: { ...p.openssh, ...patch } }));
   }
 </script>
 

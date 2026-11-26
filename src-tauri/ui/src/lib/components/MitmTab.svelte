@@ -2,16 +2,34 @@
   import { caExpiry } from "../format";
   import { store } from "../stores.svelte";
   import type { MitmConfig, SessionProfile, VaultCaMeta } from "../types";
-  import { MIN_CERT_TTL_SECS } from "../validate";
+  import { MIN_CERT_TTL_SECS, type FieldErrors } from "../validate";
   import AddCaModal from "./AddCaModal.svelte";
   import NumberField from "./NumberField.svelte";
 
   const DEFAULT_CERT_TTL_SECS = 3600;
   const DEFAULT_CACHE_ENTRIES = 10_000;
 
+  /** What a Proxy editor hands in. Without it, the selected session's MITM is edited. */
+  interface MitmTarget {
+    mitm: MitmConfig | null;
+    errors: FieldErrors;
+    set: (mitm: MitmConfig | null) => void;
+  }
+
+  interface Props {
+    target?: MitmTarget;
+  }
+
+  let { target }: Props = $props();
+
   const uid = $props.id();
-  const mitm = $derived((store.draft as SessionProfile).mitm);
-  const errors = $derived(store.draftErrors);
+  const mitm = $derived(target ? target.mitm : (store.draft as SessionProfile).mitm);
+  const errors = $derived(target ? target.errors : store.draftErrors);
+
+  function update(edit: (mitm: MitmConfig | null) => MitmConfig | null) {
+    if (target) target.set(edit(target.mitm));
+    else store.updateDraft((p) => ({ ...p, mitm: edit(p.mitm) }));
+  }
   const selected = $derived(mitm?.ca ? (store.cas.find((ca) => ca.id === mitm.ca) ?? null) : null);
   const expiry = $derived(selected ? caExpiry(selected.not_after) : null);
   const vaultReady = $derived(store.vault.initialized && store.vault.unlocked);
@@ -21,14 +39,14 @@
   let uploading = $state(false);
 
   function setMitm(patch: Partial<MitmConfig>) {
-    store.updateDraft((p) => (p.mitm ? { ...p, mitm: { ...p.mitm, ...patch } } : p));
+    update((current) => (current ? { ...current, ...patch } : current));
   }
 
   function setEnabled(enabled: boolean) {
     if (enabled === !!mitm) return;
     if (!enabled) {
       lastSettings = mitm;
-      store.updateDraft((p) => ({ ...p, mitm: null }));
+      update(() => null);
       return;
     }
     // A CA deleted while MITM was off must not come back.
@@ -39,7 +57,7 @@
       cert_cache_max_entries: lastSettings?.cert_cache_max_entries ?? DEFAULT_CACHE_ENTRIES,
       socks_block_web: lastSettings?.socks_block_web ?? false,
     };
-    store.updateDraft((p) => ({ ...p, mitm: { ...settings } }));
+    update(() => ({ ...settings }));
   }
 
   function added(ca: VaultCaMeta) {
@@ -95,7 +113,7 @@
         <dd><span class={`pill ${expiry.tone}`}>{expiry.label}</span></dd>
       </dl>
       {#if expiry.tone === "alert"}
-        <p class="field-error">This CA has expired. The session will not start until you choose another.</p>
+        <p class="field-error">This CA has expired. It will not start until you choose another.</p>
       {/if}
     {:else if mitm.ca}
       <p class="field-error">This CA is no longer in the vault. Choose another.</p>

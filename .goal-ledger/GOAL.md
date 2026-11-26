@@ -1,60 +1,65 @@
-# GOAL — U2 Tunnels + Proxies Model
+# GOAL — U3 Manage Window & Tray
 
 ## Goal
-- Goal ID: 20261126-u2-tunnels-proxies
-- Outcome: Implement Milestone U2 (`docs/MASTER-PLAN.md` §5, §6.4, §8.2, §10 U2): split `conduit-core` into `Tunnel`, `Proxy`, `UpstreamProfile` (including `tunnel`), routing rules, validation, engine mapping, and §6.4 `v0.1.0` migration; add upstream-password record support in `conduit-vault`; build `TunnelManager` and `ProxyManager` in `conduit-runtime` (Linked/Manual start modes, zero-downtime `ArcSwap` hot-reload, tray overrides, Route Tester, Test Upstream probe, per-rule/profile counters); and verify with headless integration tests while keeping legacy `SessionProfile`/`SessionManager` intact until U3.
-- Done when: All headless U2 integration tests (multi-Proxy routing, Tunnel failover, hot-reload under active `CONNECT` and SOCKS5 tunnels, override swap/restore, cross-Proxy and reverse-listener self-loop detection, §6.4 migration round-trip) and the full local CI suite (`clippy -D warnings`, `cargo test --workspace`, `secret_leak_scan`, Linux tray check, `check-pure-rust-crypto.py`, `validate-release-config.py`, `smoke-test-bundle.py --self-test`, and frontend `npm run check && npm test && npm run build`) pass with zero errors.
+- Goal ID: 20261126-u3-manage-window-tray
+- Outcome: Complete Milestone U3 (`docs/MASTER-PLAN.md` §9 & §10 U3) by wiring `src-tauri` (`AppController`, IPC `commands.rs`, `tray_bridge.rs`, `tray_tauri.rs`) and `conduit-tray` (`model.rs`, `linux_ksni.rs`) to `TunnelManager` + `ProxyManager` (with §9.1 PROXIES/TUNNELS tray sections and Mode override submenu), and upgrading the Svelte 5 Manage Window (`src-tauri/ui`) with the Proxies + Tunnels sidebar, New Proxy wizard, 7-tab Proxy editor (inline Route Tester, Test Upstream, `gen #N · hot-reloaded`, `Restart to Apply` banner), re-homed 5-tab Tunnel editor, Profile Library, Vault upstream-password support, and Log drawer quick actions.
+- Done when: All Rust workspace tests (including updated `src-tauri`, `conduit-tray`, and `secret_leak_scan`), `clippy -D warnings`, Linux `conduit_check_tauri_tray` check, `check-pure-rust-crypto.py`, `validate-release-config.py`, `smoke-test-bundle.py --self-test`, and frontend (`npm run check && npm test && npm run build`) pass with zero errors.
 - Goal status: completed
 - Goal status meaning: drafting | approved | executing | blocked-on-human | in-review | awaiting-acceptance | completed | abandoned
-- Last completed phase: phase-0005
+- Last completed phase: phase-0006
 
 ## Execution
 - Execution mode: delegated
 - Planner tier: primary session
 - Executor tier: herdr-subagent (primary: claude opus 5.5 medium; backup: agy claude opus 5.5 medium)
-- Full verification: CARGO_NET_GIT_FETCH_WITH_CLI=true cargo clippy --workspace --all-targets -- -D warnings && CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test --workspace && CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test -p rusty-conduit-gui --test secret_leak_scan && CARGO_NET_GIT_FETCH_WITH_CLI=true RUSTFLAGS="--cfg conduit_check_tauri_tray" cargo check -p rusty-conduit-gui --tests --features tauri/tray-icon && python3 scripts/check-pure-rust-crypto.py && python3 scripts/validate-release-config.py && python3 scripts/smoke-test-bundle.py --self-test && (cd src-tauri/ui && npm run check && npm test && npm run build)
+- Full verification: CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_NET_GIT_FETCH_WITH_CLI=true cargo clippy --workspace --all-targets -- -D warnings && CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test --workspace && CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test -p rusty-conduit-gui --test secret_leak_scan && CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_NET_GIT_FETCH_WITH_CLI=true RUSTFLAGS="--cfg conduit_check_tauri_tray" cargo check -p rusty-conduit-gui --tests --features tauri/tray-icon && python3 scripts/check-pure-rust-crypto.py && python3 scripts/validate-release-config.py && python3 scripts/smoke-test-bundle.py --self-test && (cd src-tauri/ui && npm run check && npm test && npm run build)
 
 ## Git
 - Repository: yes
 - Strategy: isolated-branch
 - Starting branch: feat/one-gui
-- Work branch: goal/20261126-u2-tunnels-proxies
-- Baseline commit: 874ec3f1897f21ca23915ded883d18eb3ad8fbb1
+- Work branch: goal/20261126-u3-manage-window-tray
+- Baseline commit: ca16a92be966d2aaf67e3fb47cbe8ff418ce5352
 - Starting upstream at start: origin/feat/one-gui@5ad227c55f4815e91c3354f7736b6c105917bf28
 - Work upstream at start: none
 
 ## Phases
-- [done] phase-0001 — Add Tunnel, Proxy, UpstreamProfile, and routing models to conduit-core and upstream-password record to conduit-vault
-- [done] phase-0002 — Add Tunnel/Proxy validation, engine mapping, and §6.4 v0.1.0 migration in conduit-core
-- [done] phase-0003 — Build TunnelManager in conduit-runtime
-- [done] phase-0004 — Build ProxyManager in conduit-runtime (hot-reload, overrides, Route Tester, Test Upstream, counters)
-- [done] phase-0005 — Add headless U2 integration tests and run full verification suite
+- [done] phase-0001 — Wire AppController and Tauri commands to TunnelManager and ProxyManager
+- [done] phase-0002 — Update conduit-tray and src-tauri tray bridge for PROXIES (Mode submenu) and TUNNELS sections
+- [done] phase-0003 — Update Svelte UI core layer (types, api, mock, stores, validation, and tests) for v2 Proxies and Tunnels
+- [done] phase-0004 — Build Sidebar, New Proxy wizard, 5-tab Tunnel editor, Profile Library view, and Vault upstream-password UI
+- [done] phase-0005 — Build 7-tab Proxy editor, Proxy header (hot-reload/counters), and Log drawer quick actions
+- [done] phase-0006 — Update secret_leak_scan for v2 and run full low-disk verification suite
 
 ## Handoff
 - Current position: completed
 - Next role: planner
 - Next action: none
-- Last verified evidence: user accepted and squashed U2 into one clean commit on `goal/20261126-u2-tunnels-proxies` and merged into `feat/one-gui`; full Gate D verification passed
+- Last verified evidence: User accepted U3 (#1); squashed into 1 commit on `goal/20261126-u3-manage-window-tray` and merged into `feat/one-gui`. Full verification exit 0 (clippy -D warnings clean, workspace Rust tests + secret_leak_scan 6/6 passed, conduit_check_tauri_tray clean, 3 Python checks OK, svelte-check 0/0, npm test 93/93, vite build ok).
 - Blockers: none
 
 ## Review
 - Reviewed by: planner (primary session)
-- Verification result: pass — Full verification exited 0 across all Rust (`clippy -D warnings`, workspace tests incl. 7 headless U2 integration tests, `secret_leak_scan`, Linux tray check), Python (`PURE_RUST_CRYPTO_OK`, `RELEASE_CONFIG_OK`, `SMOKE_TEST_SELF_TEST_OK`), and Svelte/Node (`npm run check`, 78 tests, `npm run build`) gates
-- Diff reviewed: `874ec3f..HEAD` (read across all 5 phases; all files strictly within planned phase scopes)
-- Findings: none
+- Verification result: Full verification exit 0 (clippy -D warnings clean, workspace Rust tests + secret_leak_scan 6/6 passed, conduit_check_tauri_tray clean, check-pure-rust-crypto/validate-release-config/smoke-test-bundle OK, svelte-check 0/0, npm test 93/93, vite build ok; target 4.5G, 20G free)
+- Diff reviewed: ca16a92be966..0d2858f (55 changed files verified against phases 1–6 Scope: In; 0 scope drift; 22 matching Goal-ID commits, 0 foreign/merge commits)
+- Findings: none (encrypted backup export sealing of v2 Proxies/Tunnels/upstream passwords belongs to Milestone U4 as planned)
 
 ## Log
-- created ledger with 5 phases for Milestone U2 (replacing completed U1 ledger `20261126-u1-engine`, preserved in git history)
-- approved Gates A–C; created isolated branch `goal/20261126-u2-tunnels-proxies` off `feat/one-gui` (`874ec3f1897f`)
-- tightened phase-0003 sub-task 1 wording and delegated phase-0001 to herdr-subagent executor (`claude` opus 5.5 medium)
-- executor completed phase-0001: v2_model.rs, AppConfig v2 fields, vault upstream-password helpers; Verify exit 0
-- planner accepted phase-0001 and delegated phase-0002 to herdr-subagent executor (`claude` opus 5.5 medium)
-- executor completed phase-0002: v2_mapping.rs, v2_validate.rs, migrate_v2.rs (+ pub(crate) helper refactors in validate.rs/mapping.rs, zeroize dep); Verify exit 0
-- planner accepted phase-0002 and delegated phase-0003 to herdr-subagent executor (`claude` opus 5.5 medium)
-- executor completed phase-0003: tunnel_manager.rs (TunnelManager, TunnelSnapshot, TunnelEvent, gated persistent dialer, Linked refcount, reverse/forwards, host keys, wake), pub(crate) runner helpers, ReverseProxy::local_listeners; 1 fix-up (clippy); Verify exit 0
-- planner accepted phase-0003 and delegated phase-0004 to herdr-subagent executor (`claude` opus 5.5 medium)
-- executor completed phase-0004: proxy_manager.rs (ProxyManager lifecycle, ArcSwap hot-reload with restart_required + counter preservation, tray overrides, Linked tunnel reconcile, Route Tester, Test Upstream, AccessRecordBuffer sink) exported from lib.rs; no Cargo.toml change; Verify exit 0
-- planner accepted phase-0004 and delegated phase-0005 to herdr-subagent executor (`claude` opus 5.5 medium)
-- executor wrote u2_tunnels_proxies.rs (7 tests, 8/8 green runs); full Verify blocked by disk full (ENOSPC, 0 bytes free, target/ 25G); escalated
-- planner recovered after `target/` cleanup, ran full Verify with `CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0` (exit 0, `target/` 4.1G), closed phase-0005, and passed Gate D review → `awaiting-acceptance`
-- accepted by user; squashed 16 goal commits into one commit retaining `.goal-ledger/`, marked `completed`, and fast-forward merged into `feat/one-gui`
+- created ledger with 6 phases for Milestone U3 (replacing completed U2 ledger `20261126-u2-tunnels-proxies`, preserved in git history)
+- approved Gates A–B; created isolated branch `goal/20261126-u3-manage-window-tray` off `feat/one-gui` (`ca16a92be966`); paused before Gate C for fresh session handoff
+- resumed in fresh planner session (verified clean tree, branch `goal/20261126-u3-manage-window-tray` at `c620b44`, validator 0 warnings); started Gate C and delegated `phase-0001` to executor (`claude --model opus --effort medium`)
+- executor stopped phase-0001 on its Escalate-when trigger: load_or_migrate_app_config breaks 2 v1 reopen tests (see phase-0001 Evidence)
+- planner answered phase-0001 escalation (`SCHEMA_VERSION = conduit_core::CURRENT_SCHEMA_VERSION` = 2) and steered `sub-u3-p1` to continue phase-0001
+- executor completed phase-0001: AppController wired to TunnelManager + ProxyManager with schema-2 stamping and v1 migration on open, 32 v2 IPC commands, v2 event forwarding; Verify exit 0 (155 lib tests, clippy clean)
+- planner verified phase-0001 independently (155/155 tests, clippy clean, scope clean), closed `sub-u3-p1`, and delegated `phase-0002` to `sub-u3-p2` (`claude --model opus --effort medium`)
+- executor completed phase-0002: tray model gains PROXIES (nested Mode submenu, Start/Stop/Restart, socks5h:// copy, View Logs) and TUNNELS (linked/attention labels) sections; ksni + Tauri render nested submenus; tray_bridge builds TrayState from Proxies/Tunnels, listens to Proxy/Tunnel events, StartAll/StopAll/Quit use the v2 calls; Verify exit 0
+- planner verified phase-0002 independently (30+160 tests, tauri-tray check, clippy clean, scope clean), closed `sub-u3-p2`, and delegated `phase-0003` to `sub-u3-p3` (`claude --model opus --effort medium`)
+- executor completed phase-0003: v2 wire types, 30+2 v2 api wrappers + subscribeV2Events, browser-preview mocks for every v2 command, store state/actions/events for Proxies/Tunnels/Profile Library (presets, drafts, hot-reload note, override, Route Tester, Test Upstream, view-logs resolution), proxyErrors/tunnelErrors + 16 tests; Verify exit 0
+- planner verified phase-0003 independently (svelte-check 0/0, 93/93 tests, vite build ok, scope clean), closed `sub-u3-p3`, updated phase-0004/0005/0006 for `src-tauri/ui/dist/`, and delegated `phase-0004` to `sub-u3-p4` (`claude --model opus --effort medium`)
+- executor completed phase-0004: Proxies/Tunnels sidebar with mode pills, New Proxy wizard, 5-tab TunnelEditor via a shared ChainEditor context, Profile Library view, ProxyEditor shell, Vault upstream-password usage + safe delete, App wiring incl. Tunnel host-key modal; Verify exit 0
+- planner verified phase-0004 independently (svelte-check 0/0, 93/93 tests, vite build ok, scope clean), closed `sub-u3-p4`, and delegated `phase-0005` to `sub-u3-p5` (`claude --model opus --effort medium`)
+- executor completed phase-0005: 7-tab ProxyEditor (Routing w/ rule drawer + Route Tester, Profiles w/ vault password + Test Upstream, Listeners & Network, Global Filter, MITM, Import/Export placeholder, Logging & General), Proxy header (gen #N · hot-reloaded, Restart to Apply, counters, override pill, Save (Hot-Reload)), LogDrawer for Proxy/Tunnel/session with filters + quick actions; SessionEditor kept (App.svelte still imports it); Verify exit 0
+- planner verified phase-0005 independently (svelte-check 0/0, 93/93 tests, vite build ok, scope clean), closed `sub-u3-p5`, and delegated `phase-0006` to `sub-u3-p6` (`claude --model opus --effort medium`)
+- executor completed phase-0006: added v2 Proxy/Tunnel/vaulted upstream-password secret-leak scan; full Verify exit 0; rebuilt `src-tauri/ui/dist/`; open question: encrypted export does not seal upstream passwords (secret_count 3)
+- planner completed Gate D review: independent full verification exit 0, 0 scope drift across all 55 changed files, closed `sub-u3-p6`, set Goal status `awaiting-acceptance`
+- user accepted U3 (#1); squashed 23 commits into 1 commit on `goal/20261126-u3-manage-window-tray` and merged into `feat/one-gui`

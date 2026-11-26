@@ -5,15 +5,20 @@
 
   interface Props {
     pending: PendingHostKey;
+    /** `tunnel`: `pending.sessionId` is a running Tunnel's id. */
+    kind?: "session" | "tunnel";
   }
 
-  let { pending }: Props = $props();
+  let { pending, kind = "session" }: Props = $props();
 
   let busy = $state(false);
   let error = $state<string | null>(null);
 
-  const session = $derived(store.sessions.find((s) => s.profile.id === pending.sessionId));
-  const hops = $derived(session?.profile.hops ?? []);
+  const hops = $derived(
+    (kind === "tunnel"
+      ? store.tunnels.find((t) => t.profile.id === pending.sessionId)?.profile.hops
+      : store.sessions.find((s) => s.profile.id === pending.sessionId)?.profile.hops) ?? [],
+  );
   const hop = $derived(hops.find((entry) => entry.hop_id === pending.prompt.hop_id));
   const hopName = $derived(hop?.name || pending.prompt.host);
 
@@ -32,6 +37,11 @@
         await store.trustTestedHostKey(prompt.sha256);
         return;
       }
+      if (kind === "tunnel") {
+        await (approve ? api.approveTunnelHostKey(sessionId, prompt.sha256) : api.rejectTunnelHostKey(sessionId));
+        await store.refreshV2();
+        return;
+      }
       await (approve ? api.approveHostKey(sessionId, prompt.sha256) : api.rejectHostKey(sessionId));
       await store.refresh();
     } catch (failure) {
@@ -42,7 +52,7 @@
   }
 </script>
 
-<!-- Escape does nothing for a running session, which waits on the answer. A test can be
+<!-- Escape does nothing for a running session or Tunnel, which waits on the answer. A test can be
      dismissed, which leaves the key untrusted. -->
 <ModalDialog
   title="Verify host key"

@@ -4,9 +4,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use conduit_tray::{
-    TrayAction, TrayBackend, TrayError, TrayHostStatus, TrayMenuItem, TrayMenuModel, APP_TITLE,
+    TrayAction, TrayBackend, TrayError, TrayHostStatus, TrayMenuEntry, TrayMenuItem, TrayMenuModel,
+    APP_TITLE,
 };
-use tauri::menu::{IsMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::{AppHandle, Runtime};
 use tokio::sync::mpsc;
@@ -39,25 +40,54 @@ impl<R: Runtime> MenuBuild<'_, R> {
         MenuItem::with_id(self.app, id, escape_label(&item.label), item.enabled, None::<&str>)
     }
 
+    fn label(&self, text: &str) -> tauri::Result<MenuItem<R>> {
+        MenuItem::new(self.app, escape_label(text), false, None::<&str>)
+    }
+
+    fn submenu(&mut self, label: &str, entries: &[TrayMenuEntry]) -> tauri::Result<Submenu<R>> {
+        let submenu = Submenu::new(self.app, escape_label(label), true)?;
+        for entry in entries {
+            // Recursive, so a Proxy's `Mode ▸` becomes a submenu inside the Proxy's submenu.
+            match entry {
+                TrayMenuEntry::Item(item) => submenu.append(&self.item(item)?)?,
+                TrayMenuEntry::Submenu(nested) => {
+                    submenu.append(&self.submenu(&nested.label, &nested.entries)?)?;
+                }
+            }
+        }
+        Ok(submenu)
+    }
+
+    fn flat_submenu(&mut self, label: &str, items: &[TrayMenuItem]) -> tauri::Result<Submenu<R>> {
+        let entries: Vec<TrayMenuEntry> = items.iter().cloned().map(TrayMenuEntry::Item).collect();
+        self.submenu(label, &entries)
+    }
+
     fn menu(&mut self, model: &TrayMenuModel) -> tauri::Result<Menu<R>> {
         let menu = Menu::new(self.app)?;
-        let title = format!("{APP_TITLE} — {}", model.summary);
-        menu.append(&MenuItem::new(self.app, escape_label(&title), false, None::<&str>)?)?;
+        menu.append(&self.label(&format!("{APP_TITLE} — {}", model.summary))?)?;
         menu.append(&PredefinedMenuItem::separator(self.app)?)?;
 
-        if model.sessions.is_empty() {
-            menu.append(&MenuItem::new(self.app, "No sessions", false, None::<&str>)?)?;
+        if model.proxies.is_empty() && model.tunnels.is_empty() && model.sessions.is_empty() {
+            menu.append(&self.label("No proxies or tunnels")?)?;
+        }
+        if !model.proxies.is_empty() {
+            menu.append(&self.label("PROXIES")?)?;
+            for proxy in &model.proxies {
+                menu.append(&self.submenu(&proxy.label(), &proxy.entries)?)?;
+            }
+        }
+        if !model.tunnels.is_empty() {
+            menu.append(&self.label("TUNNELS")?)?;
+            for tunnel in &model.tunnels {
+                menu.append(&self.flat_submenu(&tunnel.label(), &tunnel.items)?)?;
+            }
+        }
+        if !model.sessions.is_empty() && !(model.proxies.is_empty() && model.tunnels.is_empty()) {
+            menu.append(&self.label("SESSIONS")?)?;
         }
         for session in &model.sessions {
-            let items = session
-                .items
-                .iter()
-                .map(|item| self.item(item))
-                .collect::<tauri::Result<Vec<_>>>()?;
-            let refs: Vec<&dyn IsMenuItem<R>> =
-                items.iter().map(|item| item as &dyn IsMenuItem<R>).collect();
-            let label = escape_label(&session.label());
-            menu.append(&Submenu::with_items(self.app, label, true, &refs)?)?;
+            menu.append(&self.flat_submenu(&session.label(), &session.items)?)?;
         }
 
         menu.append(&PredefinedMenuItem::separator(self.app)?)?;

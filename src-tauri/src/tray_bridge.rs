@@ -1,10 +1,16 @@
-//! Connects the tray to the app: session state flows to the menu, and menu picks flow to the
-//! [`AppController`] and the Manage Window.
+//! Connects the tray to the app: Proxy, Tunnel, and session state flows to the menu, and menu
+//! picks flow to the [`AppController`] and the Manage Window.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use conduit_tray::{TrayAction, TrayBackend, TrayError, TrayHostStatus, TrayMenuModel};
+use conduit_core::TunnelStartMode;
+use conduit_runtime::ProxyState;
+use conduit_tray::{
+    ProxyTrayItem, TrayAction, TrayBackend, TrayError, TrayHostStatus, TrayMenuModel, TrayState,
+    TunnelTrayItem,
+};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::time::Instant;
@@ -60,14 +66,66 @@ impl QuitGuard {
     }
 }
 
-/// The menu for the current state. Sessions are sorted so the menu order stays stable.
-pub fn current_model(controller: &AppController) -> TrayMenuModel {
+/// What the tray shows for the current state. Proxies, Tunnels, and sessions are sorted by name
+/// so the menu order stays stable.
+pub fn current_state(controller: &AppController) -> TrayState {
     let summary = controller.get_state_summary();
     let mut sessions = summary.sessions;
     sessions.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
     // Before a vault exists there is nothing to unlock.
     let vault_locked = summary.vault.initialized && !summary.vault.unlocked;
-    TrayMenuModel::from_snapshots(&sessions, vault_locked)
+
+    let proxies = controller.list_proxies().unwrap_or_else(|error| {
+        eprintln!("tray could not list proxies: {error}");
+        Vec::new()
+    });
+    let running: HashSet<uuid::Uuid> = proxies
+        .iter()
+        .filter(|p| matches!(p.snapshot.state, ProxyState::Running { .. }))
+        .map(|p| p.profile.id.as_uuid())
+        .collect();
+    let mut proxies: Vec<ProxyTrayItem> = proxies
+        .into_iter()
+        .map(|view| ProxyTrayItem {
+            id: view.profile.id,
+            name: view.profile.name.clone(),
+            enabled: view.profile.enabled,
+            state: view.snapshot.state,
+            listeners: view.snapshot.listeners,
+            rule_count: view.profile.routing.rules.len(),
+            profiles: view.profile.profiles.into_iter().map(|p| p.name).collect(),
+        })
+        .collect();
+    proxies.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.as_uuid().cmp(&b.id.as_uuid())));
+
+    let tunnels = controller.list_tunnels().unwrap_or_else(|error| {
+        eprintln!("tray could not list tunnels: {error}");
+        Vec::new()
+    });
+    let mut tunnels: Vec<TunnelTrayItem> = tunnels
+        .into_iter()
+        .map(|view| TunnelTrayItem {
+            id: view.profile.id,
+            name: view.profile.name,
+            enabled: view.profile.enabled,
+            state: view.snapshot.state,
+            linked: matches!(view.profile.start_mode, TunnelStartMode::Linked),
+            linked_to: view
+                .used_by
+                .into_iter()
+                .filter(|user| running.contains(&user.id))
+                .map(|user| user.name)
+                .collect(),
+        })
+        .collect();
+    tunnels.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.as_uuid().cmp(&b.id.as_uuid())));
+
+    TrayState { proxies, tunnels, sessions, vault_locked }
+}
+
+/// The menu for the current state.
+pub fn current_model(controller: &AppController) -> TrayMenuModel {
+    TrayMenuModel::from_state(&current_state(controller))
 }
 
 fn report(action: &str, result: Result<(), AppError>) {
@@ -93,6 +151,17 @@ async fn copy_url<S: ShellActions>(shell: &Arc<S>, url: String) {
     }
 }
 
+/// Opens the log drawer for a session, Proxy, or Tunnel (their ids never collide).
+async fn view_logs<S: ShellActions>(shell: &Arc<S>, session_id: uuid::Uuid) {
+    on_shell(shell, move |s| s.show_ui_event(UiEvent::ViewLogs { session_id })).await;
+}
+
+/// Stops every Proxy and Tunnel, and every legacy session.
+async fn stop_everything(controller: &AppController) {
+    controller.stop_all_v2().await;
+    controller.stop_all().await;
+}
+
 /// Carries out one tray menu pick.
 pub async fn handle_action<S: ShellActions>(
     controller: &AppController,
@@ -107,11 +176,28 @@ pub async fn handle_action<S: ShellActions>(
         TrayAction::CopyHttpUrl { url, .. } | TrayAction::CopySocksUrl { url, .. } => {
             copy_url(shell, url).await;
         }
-        TrayAction::ViewLogs(session_id) => {
-            on_shell(shell, move |s| s.show_ui_event(UiEvent::ViewLogs { session_id })).await;
+        TrayAction::ViewLogs(session_id) => view_logs(shell, session_id).await,
+        TrayAction::StartProxy(id) => report("start proxy", controller.start_proxy(id).await),
+        TrayAction::StopProxy(id) => report("stop proxy", controller.stop_proxy(id).await),
+        TrayAction::RestartProxy(id) => {
+            report("restart proxy", controller.restart_proxy(id).await);
         }
-        TrayAction::StartAll => controller.start_all().await,
-        TrayAction::StopAll => controller.stop_all().await,
+        TrayAction::SetProxyOverride { id, profile } => report(
+            "set proxy mode",
+            controller.set_proxy_override(id, profile).await.map(|_| ()),
+        ),
+        TrayAction::ViewProxyLogs(id) => view_logs(shell, id.as_uuid()).await,
+        TrayAction::StartTunnel(id) => report("start tunnel", controller.start_tunnel(id).await),
+        TrayAction::StopTunnel(id) => report("stop tunnel", controller.stop_tunnel(id).await),
+        TrayAction::RestartTunnel(id) => {
+            report("restart tunnel", controller.restart_tunnel(id).await);
+        }
+        TrayAction::ViewTunnelLogs(id) => view_logs(shell, id.as_uuid()).await,
+        TrayAction::StartAll => {
+            controller.start_all().await;
+            controller.start_all_v2().await;
+        }
+        TrayAction::StopAll => stop_everything(controller).await,
         TrayAction::UnlockVault => on_shell(shell, |s| s.show_ui_event(UiEvent::UnlockVault)).await,
         TrayAction::OpenManageWindow => on_shell(shell, |s| s.open_manage_window()).await,
         TrayAction::Quit => {
@@ -141,6 +227,10 @@ pub async fn run_bridge<B, S>(
     let mut actions = backend.subscribe_actions();
     let mut actions_open = true;
     let mut events = controller.subscribe_events();
+    let mut proxy_events = controller.subscribe_proxy_events();
+    let mut proxy_events_open = true;
+    let mut tunnel_events = controller.subscribe_tunnel_events();
+    let mut tunnel_events_open = true;
     let quit = Arc::new(QuitGuard::default());
     let deadline = Instant::now() + HOST_WAIT;
     let mut waiting = true;
@@ -187,6 +277,17 @@ pub async fn run_bridge<B, S>(
             event = events.recv() => {
                 if matches!(event, Err(RecvError::Closed)) {
                     return;
+                }
+            }
+            // Any Proxy or Tunnel change redraws the menu on the next pass.
+            event = proxy_events.recv(), if proxy_events_open => {
+                if matches!(event, Err(RecvError::Closed)) {
+                    proxy_events_open = false;
+                }
+            }
+            event = tunnel_events.recv(), if tunnel_events_open => {
+                if matches!(event, Err(RecvError::Closed)) {
+                    tunnel_events_open = false;
                 }
             }
             () = tokio::time::sleep(delay) => {}
@@ -308,13 +409,13 @@ impl<R: Runtime> ShellActions for TauriShell<R> {
     }
 }
 
-/// Stops every session, waiting a bounded time, then exits.
+/// Stops every Proxy, Tunnel, and session, waiting a bounded time, then exits.
 pub fn quit_app<R: Runtime>(app: AppHandle<R>) {
     tauri::async_runtime::spawn(async move {
         if let Some(controller) = app.try_state::<AppController>() {
             let controller = controller.inner().clone();
-            if tokio::time::timeout(QUIT_STOP_TIMEOUT, controller.stop_all()).await.is_err() {
-                eprintln!("sessions did not stop in time; exiting anyway");
+            if tokio::time::timeout(QUIT_STOP_TIMEOUT, stop_everything(&controller)).await.is_err() {
+                eprintln!("proxies, tunnels, or sessions did not stop in time; exiting anyway");
             }
         }
         app.exit(0);
@@ -326,8 +427,40 @@ mod tests {
     use conduit_tray::MockTrayBackend;
     use uuid::Uuid;
 
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use conduit_core::{ListenerConfig, Proxy, ProxyId, Tunnel, TunnelId};
+
     use super::*;
-    use crate::controller::test_support::{controller, profile, TempDir};
+    use crate::controller::test_support::{controller, hop, profile, TempDir};
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    /// A direct Proxy with an HTTP listener on a free loopback port.
+    fn direct_proxy(name: &str) -> Proxy {
+        Proxy {
+            name: name.into(),
+            listeners: ListenerConfig {
+                bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                http_port: free_port(),
+                socks_port: 0,
+                ..ListenerConfig::default()
+            },
+            ..Proxy::default()
+        }
+    }
+
+    /// A Manual Tunnel to a closed loopback port.
+    fn manual_tunnel(name: &str) -> Tunnel {
+        Tunnel {
+            name: name.into(),
+            start_mode: TunnelStartMode::Manual { autostart: false },
+            hops: vec![hop("", free_port(), Vec::new())],
+            ..Tunnel::default()
+        }
+    }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum Call {
@@ -533,6 +666,129 @@ mod tests {
         }
         assert_eq!(shell.calls(), vec![Call::Open]);
         bridge.abort();
+    }
+
+    #[tokio::test]
+    async fn tray_bridge_proxy_and_tunnel_logs_open_the_log_drawer() {
+        let (proxy, tunnel) = (ProxyId::new(), TunnelId::new());
+        for (action, id) in [
+            (TrayAction::ViewProxyLogs(proxy), proxy.as_uuid()),
+            (TrayAction::ViewTunnelLogs(tunnel), tunnel.as_uuid()),
+        ] {
+            let shell = Arc::new(FakeShell::default());
+            assert_eq!(
+                dispatch(&shell, action).await,
+                vec![Call::Ui(UiEvent::ViewLogs { session_id: id })]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tray_bridge_model_lists_proxies_and_tunnels() {
+        let dir = TempDir::new();
+        let controller = controller(&dir);
+        controller.upsert_proxy(direct_proxy("work")).await.unwrap();
+        controller.upsert_proxy(direct_proxy("lab")).await.unwrap();
+        controller.upsert_tunnel(manual_tunnel("bastion")).unwrap();
+
+        let model = current_model(&controller);
+        let names: Vec<&str> = model.proxies.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["lab", "work"], "sorted by name");
+        assert_eq!(model.proxies[0].label(), "○ lab — Stopped → Start");
+        assert_eq!(model.tunnels[0].label(), "○ bastion — Stopped → Start");
+        assert_eq!(model.summary, "0 proxies running · 0 tunnels need attention");
+        assert!(model.global_items[0].enabled, "Start All has something to start");
+    }
+
+    #[tokio::test]
+    async fn tray_bridge_proxy_actions_reach_the_controller() {
+        let dir = TempDir::new();
+        let controller = controller(&dir);
+        let id = controller.upsert_proxy(direct_proxy("work")).await.unwrap().profile.id;
+        let shell = Arc::new(FakeShell::default());
+        let quit = QuitGuard::default();
+
+        handle_action(&controller, &shell, &quit, TrayAction::StartProxy(id)).await;
+        let model = current_model(&controller);
+        assert!(model.proxies[0].status.starts_with("Auto Switch"), "{}", model.proxies[0].status);
+        assert!(model.proxies[0].http_url.is_some());
+
+        let force_direct = TrayAction::SetProxyOverride { id, profile: Some("direct".into()) };
+        handle_action(&controller, &shell, &quit, force_direct).await;
+        assert!(current_model(&controller).proxies[0].status.starts_with("Override: direct"));
+
+        let auto = TrayAction::SetProxyOverride { id, profile: None };
+        handle_action(&controller, &shell, &quit, auto).await;
+        assert!(current_model(&controller).proxies[0].status.starts_with("Auto Switch"));
+
+        handle_action(&controller, &shell, &quit, TrayAction::RestartProxy(id)).await;
+        handle_action(&controller, &shell, &quit, TrayAction::StopProxy(id)).await;
+        assert_eq!(current_model(&controller).proxies[0].status, "Stopped → Start");
+
+        // Unknown ids are reported, and must not panic.
+        for action in [
+            TrayAction::StartProxy(ProxyId::new()),
+            TrayAction::SetProxyOverride { id: ProxyId::new(), profile: None },
+            TrayAction::StartTunnel(TunnelId::new()),
+            TrayAction::StopTunnel(TunnelId::new()),
+            TrayAction::RestartTunnel(TunnelId::new()),
+        ] {
+            handle_action(&controller, &shell, &quit, action).await;
+        }
+        assert!(shell.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tray_bridge_start_all_and_stop_all_cover_proxies() {
+        let dir = TempDir::new();
+        let controller = controller(&dir);
+        controller.upsert_proxy(direct_proxy("work")).await.unwrap();
+        let shell = Arc::new(FakeShell::default());
+        let quit = QuitGuard::default();
+
+        handle_action(&controller, &shell, &quit, TrayAction::StartAll).await;
+        let model = current_model(&controller);
+        assert_eq!(model.summary, "1 proxy running · 0 tunnels need attention");
+        assert!(model.quit_needs_confirmation, "Quit asks while a Proxy runs");
+
+        handle_action(&controller, &shell, &quit, TrayAction::StopAll).await;
+        let model = current_model(&controller);
+        assert_eq!(model.proxies[0].status, "Stopped → Start");
+        assert!(!model.quit_needs_confirmation);
+    }
+
+    #[tokio::test]
+    async fn tray_bridge_redraws_on_proxy_events() {
+        let dir = TempDir::new();
+        let controller = controller(&dir);
+        let id = controller.upsert_proxy(direct_proxy("work")).await.unwrap().profile.id;
+        let backend = Arc::new(MockTrayBackend::default());
+        let shell = Arc::new(FakeShell::default());
+        let bridge = tokio::spawn(run_bridge(
+            controller.clone(),
+            Arc::clone(&backend),
+            Arc::clone(&shell),
+            false,
+        ));
+
+        while backend.update_count() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        controller.start_proxy(id).await.unwrap();
+        // Well inside REFRESH_INTERVAL, so only the event can have triggered the redraw.
+        for _ in 0..200 {
+            let running = backend
+                .last_model()
+                .is_some_and(|m| m.proxies[0].status.starts_with("Auto Switch"));
+            if running {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let model = backend.last_model().unwrap();
+        assert!(model.proxies[0].status.starts_with("Auto Switch"), "{}", model.proxies[0].status);
+        bridge.abort();
+        controller.stop_all_v2().await;
     }
 
     #[test]

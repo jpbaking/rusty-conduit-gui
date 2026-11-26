@@ -1,12 +1,15 @@
 <script lang="ts">
-  import { store } from "../stores.svelte";
+  import { chainEditor } from "./JumpChainBuilder.svelte";
   import type { SessionProfile, TunnelConfig } from "../types";
   import NumberField from "./NumberField.svelte";
 
   const uid = $props.id();
-  const draft = $derived(store.draft as SessionProfile);
+  const ed = chainEditor();
+  const startMode = $derived(ed.startMode);
+  const manual = $derived(typeof startMode === "object" ? startMode.manual : null);
+  const draft = $derived(ed.draft as SessionProfile);
   const tunnel = $derived(draft.tunnel);
-  const errors = $derived(store.draftErrors);
+  const errors = $derived(ed.draftErrors);
 
   // Worst case for the OS to drop a dead peer: idle, then every unanswered probe.
   const tcpDeadAfter = $derived(
@@ -19,7 +22,7 @@
   );
 
   function setTunnel(patch: Partial<TunnelConfig>) {
-    store.updateDraft((p) => ({ ...p, tunnel: { ...p.tunnel, ...patch } }));
+    ed.updateDraft((p) => ({ ...p, tunnel: { ...p.tunnel, ...patch } }));
   }
 </script>
 
@@ -127,19 +130,72 @@
   {#if tunnel.startup_timeout === 0}
     <p class="warning">A timeout of 0 leaves no time to connect, so the session is likely to fail.</p>
   {/if}
-  <label class="check">
-    <input
-      type="checkbox"
-      checked={draft.autostart}
-      onchange={(e) => {
-        const autostart = e.currentTarget.checked;
-        store.updateDraft((p) => ({ ...p, autostart }));
-      }}
-    />
-    Start with the app
-  </label>
-  {#if !draft.enabled}
-    <p class="note">This session is disabled, so it does not start with the app or with Start All. Enable it from the session list's right-click menu.</p>
+  {#if startMode !== undefined && ed.setStartMode}
+    {@const setStartMode = ed.setStartMode}
+    <fieldset class="start-mode">
+      <legend>Start mode</legend>
+      <label class="check">
+        <input
+          type="radio"
+          name={`${uid}-start-mode`}
+          checked={startMode === "linked"}
+          onchange={() => setStartMode("linked")}
+        />
+        Linked: runs while a Proxy that uses it is running
+      </label>
+      <label class="check">
+        <input
+          type="radio"
+          name={`${uid}-start-mode`}
+          checked={manual !== null}
+          onchange={() => setStartMode({ manual: { autostart: false } })}
+        />
+        Manual: started and stopped by hand
+      </label>
+      {#if manual}
+        <label class="check nested">
+          <input
+            type="checkbox"
+            checked={manual.autostart}
+            onchange={(e) => setStartMode({ manual: { autostart: e.currentTarget.checked } })}
+          />
+          Start with the app
+        </label>
+      {/if}
+    </fieldset>
+    {#if !draft.enabled}
+      <p class="note">This tunnel is disabled, so it does not start with the app or with Start All. Enable it from the tunnel list's right-click menu.</p>
+    {/if}
+  {:else}
+    <label class="check">
+      <input
+        type="checkbox"
+        checked={draft.autostart}
+        onchange={(e) => {
+          const autostart = e.currentTarget.checked;
+          ed.updateDraft((p) => ({ ...p, autostart }));
+        }}
+      />
+      Start with the app
+    </label>
+    {#if !draft.enabled}
+      <p class="note">This session is disabled, so it does not start with the app or with Start All. Enable it from the session list's right-click menu.</p>
+    {/if}
   {/if}
 </section>
 </div>
+
+<style>
+  .start-mode {
+    border: none;
+    margin: 0.5rem 0 0;
+    padding: 0;
+  }
+  .start-mode legend {
+    font-weight: 600;
+    margin-bottom: 0.25rem;
+  }
+  .nested {
+    margin-left: 1.5rem;
+  }
+</style>

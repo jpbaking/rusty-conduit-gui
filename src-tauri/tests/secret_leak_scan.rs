@@ -1,13 +1,17 @@
-//! Scans everything the app writes or reports for sentinel secrets: exports, session logs,
-//! error messages, app data files, and the generated OpenSSH files.
+//! Scans everything the app writes or reports for sentinel secrets: exports, session, Proxy, and
+//! Tunnel logs, Route Tester and Test Upstream results, error messages, app data files, and the
+//! generated OpenSSH files.
 
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use conduit_core::{
     AuthMethod, ForwardConfig, HopEntry, HostKeyLookup, HostKeyRecord, HostProfile, KeyId,
-    KeySource, KnownHostsStore, MitmCaId, MitmConfig, SecretRef, SessionProfile, Timestamp,
+    KeySource, KnownHostsStore, ListenerConfig, MitmCaId, MitmConfig, Proxy, RouteInbound,
+    RouteOneOrMany, RoutingRule, RoutingTablesConfig, SecretRef, SessionProfile, Timestamp, Tunnel,
+    UpstreamKind, UpstreamPasswordSource, UpstreamProfile,
 };
 use conduit_openssh::{write_config, write_known_hosts, ConfigHop, SessionConfig};
 use conduit_runtime::{ManagerConfig, SessionState};
@@ -17,7 +21,8 @@ use russh::keys::PrivateKey;
 use russh::server::{self, Auth};
 use rusty_conduit_gui_lib::controller::mitm_ca::MitmCaUpload;
 use rusty_conduit_gui_lib::controller::{AppController, ControllerOptions, SecretInput};
-use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -26,6 +31,8 @@ const PASSWORD: &str = "leakscan-hop-password-c7d2";
 const MITM: &str = "leakscan-mitm-passphrase-19fa";
 const KEY_PASS: &str = "leakscan-key-passphrase-e04c";
 const EXPORT_PASS: &str = "Leakscan-Export-Passphrase-a83b";
+const UPSTREAM: &str = "leakscan-upstream-password-3d9e";
+const UPSTREAM_USER: &str = "leakscan-user";
 
 const FAST_ARGON: Argon2Params = Argon2Params {
     memory_kib: 8 * 1024,
@@ -147,7 +154,7 @@ impl Fixture {
             .unwrap()
             .id;
 
-        let mut forbidden: Vec<String> = [MASTER, PASSWORD, MITM, KEY_PASS, EXPORT_PASS]
+        let mut forbidden: Vec<String> = [MASTER, PASSWORD, MITM, KEY_PASS, EXPORT_PASS, UPSTREAM]
             .map(String::from)
             .to_vec();
         forbidden.push("PRIVATE KEY".into());
@@ -272,6 +279,55 @@ fn mitm_ca_p12() -> (Vec<u8>, String) {
     let mut store = KeyStore::new();
     store.add_entry("ca", KeyStoreEntry::PrivateKeyChain(chain));
     (store.writer(MITM).write().unwrap(), key.serialize_pem())
+}
+
+/// An upstream HTTP proxy that answers every request with `407`, after reading its headers
+/// (which carry the `Proxy-Authorization` credentials).
+async fn spawn_auth_rejecting_upstream() -> (u16, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let task = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut seen = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => seen.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+                          Proxy-Authenticate: Basic realm=\"leakscan\"\r\n\
+                          Content-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+            });
+        }
+    });
+    (port, task)
+}
+
+/// Sends one `CONNECT` through a local Proxy and returns the response head.
+async fn connect_through(proxy_port: u16, target: &str) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", proxy_port)).await.unwrap();
+    let request = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    let mut buf = [0u8; 1024];
+    let read = tokio::time::timeout(Duration::from_secs(10), async {
+        while !response.windows(4).any(|w| w == b"\r\n\r\n") {
+            match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => response.extend_from_slice(&buf[..n]),
+            }
+        }
+    })
+    .await;
+    assert!(read.is_ok(), "the Proxy did not answer the CONNECT");
+    String::from_utf8_lossy(&response).into_owned()
 }
 
 fn base64_encode(bytes: &[u8]) -> String {
@@ -514,4 +570,241 @@ async fn generated_openssh_files_hold_no_secrets() {
     assert!(String::from_utf8_lossy(&host_bytes).contains(&public));
     assert_clean("known_hosts", &host_bytes, &fx.forbidden);
     assert_eq!(assert_tree_clean(&runtime, &fx.forbidden), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn v2_proxies_tunnels_and_upstream_passwords_hold_no_secrets() {
+    let mut fx = Fixture::new().await;
+    // The upstream credentials as an HTTP Basic header would carry them.
+    fx.forbidden.push(base64_encode(format!("{UPSTREAM_USER}:{UPSTREAM}").as_bytes()));
+
+    let upstream_secret = fx
+        .controller
+        .set_upstream_password(None, SecretInput::new(UPSTREAM))
+        .await
+        .unwrap()
+        .secret_ref;
+    let (upstream_port, upstream) = spawn_auth_rejecting_upstream().await;
+    let closed_port = free_port();
+
+    // A Tunnel that logs in with the vault key, then the vault hop password, and is rejected.
+    let (host_key, _) = generate_key(KeyGenAlgorithm::Ed25519).unwrap();
+    let (ssh_port, ssh_server) = spawn_rejecting_server(Arc::new(Mutex::new(host_key))).await;
+    let tunnel = fx
+        .controller
+        .upsert_tunnel(Tunnel {
+            name: "leaky-tunnel".into(),
+            hops: vec![HopEntry {
+                hop_id: String::new(),
+                name: "hop-0".into(),
+                host: HostProfile {
+                    id: Uuid::nil(),
+                    name: "hop-0".into(),
+                    host: "127.0.0.1".into(),
+                    port: ssh_port,
+                    user: "tester".into(),
+                    auth: vec![
+                        AuthMethod::Key { key: fx.key.clone() },
+                        AuthMethod::Password { secret: fx.password.clone() },
+                    ],
+                    host_key_pin: None,
+                },
+            }],
+            ..Tunnel::default()
+        })
+        .unwrap()
+        .id;
+
+    // A Proxy whose `corp` profile authenticates with the vaulted upstream password, and whose
+    // `ssh` profile dials through the Tunnel.
+    let vaulted = |name: &str, port: u16| UpstreamProfile {
+        name: name.into(),
+        kind: UpstreamKind::Http,
+        host: Some("127.0.0.1".into()),
+        port: Some(port),
+        username: Some(UPSTREAM_USER.into()),
+        password: Some(UpstreamPasswordSource::Vault(upstream_secret.clone())),
+        bypass: Vec::new(),
+        color: None,
+    };
+    let proxy_port = free_port();
+    let draft = Proxy {
+        name: "leaky-proxy".into(),
+        listeners: ListenerConfig {
+            bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            http_port: proxy_port,
+            socks_port: 0,
+            ..ListenerConfig::default()
+        },
+        profiles: vec![
+            vaulted("corp", upstream_port),
+            vaulted("dead", closed_port),
+            UpstreamProfile {
+                name: "ssh".into(),
+                kind: UpstreamKind::Tunnel { tunnel_id: tunnel },
+                host: None,
+                port: None,
+                username: None,
+                password: None,
+                bypass: Vec::new(),
+                color: None,
+            },
+        ],
+        routing: RoutingTablesConfig {
+            default: RouteOneOrMany::One("direct".into()),
+            rules: vec![RoutingRule {
+                name: Some("corp-rule".into()),
+                host: Some(RouteOneOrMany::One("intranet.example".into())),
+                ..RoutingRule::to_target(RouteOneOrMany::One("corp".into()))
+            }],
+            ..RoutingTablesConfig::default()
+        },
+        ..Proxy::default()
+    };
+    let saved = fx.controller.upsert_proxy(draft).await.unwrap().profile;
+    let proxy = saved.id;
+
+    // config.json names the vault record, never the password.
+    let config = std::fs::read(fx.data_dir().join("config.json")).unwrap();
+    let config_text = String::from_utf8_lossy(&config);
+    assert!(config_text.contains("leaky-proxy") && config_text.contains("leaky-tunnel"));
+    assert!(config_text.contains(&upstream_secret.to_string()));
+    assert_clean("config.json", &config, &fx.forbidden);
+
+    // Route Tester, hit and miss, and a rejected target.
+    for (target, inbound) in [
+        ("intranet.example:443", RouteInbound::Http),
+        ("http://other.example/", RouteInbound::Socks),
+    ] {
+        let result = AppController::test_route(&saved, target, inbound).unwrap();
+        assert_clean("route test", &serde_json::to_vec(&result).unwrap(), &fx.forbidden);
+    }
+    let error = AppController::test_route(&saved, "", RouteInbound::Http).unwrap_err();
+    assert_clean("route test error", error.to_string().as_bytes(), &fx.forbidden);
+    assert_clean("route test error", &serde_json::to_vec(&error).unwrap(), &fx.forbidden);
+
+    // Test Upstream: rejected credentials, a closed port, a stopped Tunnel, and an unknown
+    // profile. Every result and error is scanned.
+    let mut probe_errors = 0;
+    for profile in ["corp", "dead", "ssh", "missing"] {
+        match fx.controller.test_upstream(&saved, profile, "intranet.example", 443, 3_000).await {
+            Ok(probe) => {
+                assert!(!probe.ok, "the {profile} probe cannot succeed");
+                assert_clean("upstream probe", &serde_json::to_vec(&probe).unwrap(), &fx.forbidden);
+                probe_errors += usize::from(probe.error.is_some());
+            }
+            Err(error) => {
+                assert_clean("upstream error", error.to_string().as_bytes(), &fx.forbidden);
+                assert_clean("upstream error", &serde_json::to_vec(&error).unwrap(), &fx.forbidden);
+                probe_errors += 1;
+            }
+        }
+    }
+    assert_eq!(probe_errors, 4, "every probe must fail");
+
+    // A running Proxy sends a CONNECT to the upstream, which rejects the credentials.
+    fx.controller.start_proxy(proxy).await.unwrap();
+    let response = connect_through(proxy_port, "intranet.example:443").await;
+    assert!(!response.starts_with("HTTP/1.1 200"), "the upstream must reject the CONNECT");
+    assert_clean("proxy response", response.as_bytes(), &fx.forbidden);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while fx.controller.get_proxy_access_records(proxy, None).unwrap().is_empty()
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let records = fx.controller.get_proxy_access_records(proxy, None).unwrap();
+    assert!(!records.is_empty(), "the CONNECT must be recorded");
+    assert_clean("access records", &serde_json::to_vec(&records).unwrap(), &fx.forbidden);
+    let proxy_logs = fx.controller.get_proxy_logs(proxy, None).unwrap();
+    assert!(!proxy_logs.is_empty(), "the Proxy must log its start");
+    for line in &proxy_logs {
+        assert_clean("proxy log", line.text.as_bytes(), &fx.forbidden);
+    }
+    assert_clean(
+        "proxy list",
+        &serde_json::to_vec(&fx.controller.list_proxies().unwrap()).unwrap(),
+        &fx.forbidden,
+    );
+
+    // The Tunnel asks for its host key, then fails to log in.
+    let tunnel_state = |fx: &Fixture| {
+        fx.controller
+            .list_tunnels()
+            .unwrap()
+            .into_iter()
+            .find(|view| view.profile.id == tunnel)
+            .unwrap()
+            .snapshot
+            .state
+    };
+    let wait_tunnel = |pick: fn(&SessionState) -> Option<String>| {
+        let fx = &fx;
+        async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            loop {
+                if let Some(value) = pick(&tunnel_state(fx)) {
+                    return value;
+                }
+                assert!(tokio::time::Instant::now() < deadline, "timed out waiting for the Tunnel");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    };
+    fx.controller.start_tunnel(tunnel).await.unwrap();
+    let sha256 = wait_tunnel(|state| match state {
+        SessionState::AwaitingHostKey(prompt) => Some(prompt.sha256.clone()),
+        _ => None,
+    })
+    .await;
+    fx.controller.approve_tunnel_host_key(tunnel, &sha256).unwrap();
+    let reason = wait_tunnel(|state| match state {
+        SessionState::NeedsAttention { reason } | SessionState::Failed { reason } => {
+            Some(reason.clone())
+        }
+        _ => None,
+    })
+    .await;
+    assert_clean("tunnel failure", reason.as_bytes(), &fx.forbidden);
+    let tunnel_logs = fx.controller.get_tunnel_logs(tunnel, None).unwrap();
+    assert!(!tunnel_logs.is_empty(), "the failed Tunnel attempt must be logged");
+    for line in &tunnel_logs {
+        assert_clean("tunnel log", line.text.as_bytes(), &fx.forbidden);
+    }
+    assert_clean(
+        "tunnel list",
+        &serde_json::to_vec(&fx.controller.list_tunnels().unwrap()).unwrap(),
+        &fx.forbidden,
+    );
+    assert_clean(
+        "state summary",
+        &serde_json::to_vec(&fx.controller.get_state_summary()).unwrap(),
+        &fx.forbidden,
+    );
+
+    fx.controller.stop_all_v2().await;
+    upstream.abort();
+    ssh_server.abort();
+
+    // Exports: the plain one holds no secrets; the encrypted one seals them.
+    let plain = fx.data_dir().join("v2-plain-export.json");
+    fx.controller.export_config(&plain, false, None).unwrap();
+    let plain_bytes = std::fs::read(&plain).unwrap();
+    assert!(String::from_utf8_lossy(&plain_bytes).contains("leaky-proxy"));
+    assert_clean("v2 plain export", &plain_bytes, &fx.forbidden);
+
+    let sealed = fx.data_dir().join("v2-encrypted-export.json");
+    let summary = fx
+        .controller
+        .export_config(&sealed, true, Some(SecretInput::new(EXPORT_PASS)))
+        .unwrap();
+    assert!(summary.encrypted && summary.secret_count >= 3, "keys and the MITM CA are sealed");
+    let sealed_bytes = std::fs::read(&sealed).unwrap();
+    assert_clean("v2 encrypted export", &sealed_bytes, &fx.forbidden);
+    let parsed: serde_json::Value = serde_json::from_slice(&sealed_bytes).unwrap();
+    let payload: Vec<u8> = serde_json::from_value(parsed["payload"].clone()).unwrap();
+    assert_clean("v2 encrypted payload", &payload, &fx.forbidden);
+
+    // config.json, known_hosts.json, and the raw vault.bin bytes.
+    assert!(assert_tree_clean(&fx.data_dir(), &fx.forbidden) >= 3);
 }

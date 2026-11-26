@@ -8,13 +8,13 @@
 use std::fmt;
 
 use base64::Engine as _;
-use conduit_core::{AppConfig, MitmCaId, Timestamp, VaultCaMeta};
+use conduit_core::{AppConfig, MitmCaId, Proxy, Timestamp, VaultCaMeta};
 use conduit_vault::VaultError;
 use rusty_conduit_engine::mitm::ca::{CaError, CaMaterial};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use super::keys::{require_name, DeleteResult, Usage, UsageRef};
+use super::keys::{proxy_ref, require_name, DeleteResult, Usage, UsageRef};
 use super::{run_blocking, usage_is_empty, AppController, AppError, SecretInput};
 
 pub(crate) const MITM_CA_RECORD: &str = "mitm_ca";
@@ -144,7 +144,13 @@ pub(crate) fn ca_usage(config: &AppConfig, id: &MitmCaId) -> Usage {
         .filter(|s| s.mitm.as_ref().and_then(|m| m.ca.as_ref()) == Some(id))
         .map(|s| UsageRef { id: s.id, name: s.name.clone() })
         .collect();
-    Usage { hosts: Vec::new(), sessions }
+    let proxies = config
+        .proxies
+        .iter()
+        .filter(|p| p.mitm.as_ref().and_then(|m| m.ca.as_ref()) == Some(id))
+        .map(proxy_ref)
+        .collect();
+    Usage { sessions, proxies, ..Usage::default() }
 }
 
 pub(crate) fn ca_id_from_record(id: &str) -> Result<MitmCaId, AppError> {
@@ -213,7 +219,7 @@ impl AppController {
             .iter()
             .map(|meta| {
                 let usage = ca_usage(&config, &meta.id);
-                CaView { meta: meta.clone(), used_by: usage.sessions.len(), usage }
+                CaView { meta: meta.clone(), used_by: usage.count(), usage }
             })
             .collect()
     }
@@ -231,18 +237,19 @@ impl AppController {
         })
     }
 
-    /// Deletes a CA. If a session uses it and `force` is false, nothing changes and the
-    /// sessions are returned. With `force`, those sessions are left with MITM on and no CA, and
-    /// any that are running are stopped, because a running session holds the CA in memory and
+    /// Deletes a CA. If a session or Proxy uses it and `force` is false, nothing changes and
+    /// the users are returned. With `force`, they are left with MITM on and no CA, and any that
+    /// are running are stopped, because a running session or Proxy holds the CA in memory and
     /// would otherwise keep signing with it. They cannot start again until a CA is chosen or
     /// MITM is turned off.
     pub async fn delete_mitm_ca(&self, id: &MitmCaId, force: bool) -> Result<DeleteResult, AppError> {
         let controller = self.clone();
         let ca = id.clone();
-        let outcome = run_blocking(move || controller.detach_mitm_ca(&ca, force)).await?;
+        let (outcome, proxies) = run_blocking(move || controller.detach_mitm_ca(&ca, force)).await?;
         if !outcome.deleted {
             return Ok(outcome);
         }
+        self.stop_and_sync_proxies(proxies).await?;
         for session in &outcome.usage.sessions {
             match self.manager().stop(session.id).await {
                 Ok(()) | Err(conduit_runtime::RuntimeError::UnknownSession(_)) => {}
@@ -260,20 +267,24 @@ impl AppController {
     }
 
     /// The config half of [`Self::delete_mitm_ca`]: drops the CA and every reference to it.
-    fn detach_mitm_ca(&self, id: &MitmCaId, force: bool) -> Result<DeleteResult, AppError> {
+    fn detach_mitm_ca(
+        &self,
+        id: &MitmCaId,
+        force: bool,
+    ) -> Result<(DeleteResult, Vec<Proxy>), AppError> {
         let config = self.config_snapshot();
         if !config.mitm_cas.iter().any(|c| c.id == *id) {
             return Err(AppError::NotFound { kind: "MITM CA", id: id.to_string() });
         }
         let usage = ca_usage(&config, id);
-        let used_by = usage.sessions.len();
+        let used_by = usage.count();
         if !usage_is_empty(&usage) && !force {
-            return Ok(DeleteResult { deleted: false, used_by, usage });
+            return Ok((DeleteResult { deleted: false, used_by, usage }, Vec::new()));
         }
         if !self.vault_read().is_unlocked() {
             return Err(VaultError::Locked.into());
         }
-        let changed = self.mutate_config(|config| {
+        let (changed, proxies) = self.mutate_config(|config| {
             config.mitm_cas.retain(|c| c.id != *id);
             let mut changed = Vec::new();
             for session in &mut config.sessions {
@@ -282,10 +293,17 @@ impl AppController {
                     changed.push(session.clone());
                 }
             }
-            Ok(changed)
+            let mut proxies = Vec::new();
+            for proxy in &mut config.proxies {
+                if let Some(mitm) = proxy.mitm.as_mut().filter(|m| m.ca.as_ref() == Some(id)) {
+                    mitm.ca = None;
+                    proxies.push(proxy.clone());
+                }
+            }
+            Ok((changed, proxies))
         })?;
         self.sync_profiles(changed);
-        Ok(DeleteResult { deleted: true, used_by, usage })
+        Ok((DeleteResult { deleted: true, used_by, usage }, proxies))
     }
 }
 

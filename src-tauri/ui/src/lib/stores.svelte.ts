@@ -1,9 +1,9 @@
 // Reactive application state. Holds metadata only: no secret ever enters this store.
 
-import { api, errorMessage, subscribeShellEvents } from "./api";
+import { api, errorMessage, subscribeShellEvents, subscribeV2Events } from "./api";
 import { authRefs, blankHost, profileRefs } from "./chain";
 import { isActive } from "./format";
-import { hostErrors, sessionErrors, type FieldErrors } from "./validate";
+import { hostErrors, proxyErrors, sessionErrors, tunnelErrors, type FieldErrors } from "./validate";
 import type {
   AuthMethod,
   CaView,
@@ -18,7 +18,22 @@ import type {
   KeyView,
   MigrationNoticePayload,
   MitmCaId,
+  Proxy,
+  ProxyEvent,
+  ProxyId,
+  ProxySnapshot,
+  ProxyView,
+  RouteInbound,
+  RouteTestResult,
   RuntimeEvent,
+  Tunnel,
+  TunnelChainTestResult,
+  TunnelEvent,
+  TunnelId,
+  TunnelSnapshot,
+  TunnelView,
+  UpstreamProbeResult,
+  UpstreamProfile,
   SessionProfile,
   SessionSnapshot,
   SessionView,
@@ -28,7 +43,47 @@ import type {
   VaultStatus,
 } from "./types";
 
-export type NavView = "sessions" | "hosts" | "keys" | "settings";
+/**
+ * The sidebar's active section. `proxy`, `tunnel`, `profileLibrary`, and `vault` are the v2
+ * sections; `sessions` and `keys` stay until the v2 components replace the v1 ones.
+ */
+export type NavView =
+  | "proxy"
+  | "tunnel"
+  | "hosts"
+  | "profileLibrary"
+  | "vault"
+  | "settings"
+  | "sessions"
+  | "keys";
+
+/** A starting point offered by the New Proxy wizard. */
+export type ProxyPreset = "direct" | "tunnel" | "switch";
+
+/** What the log drawer shows. Proxy, Tunnel, and session ids never collide (all UUIDs). */
+export type LogTarget =
+  | { kind: "proxy"; id: ProxyId }
+  | { kind: "tunnel"; id: TunnelId }
+  | { kind: "session"; id: Uuid };
+
+/** The outcome of the latest Proxy save, for the `gen #N · hot-reloaded` header. */
+export interface ProxySaveNote {
+  proxyId: ProxyId;
+  configGeneration: number;
+  reloaded: boolean;
+  reloadError: string | null;
+}
+/**
+ * A Log drawer quick action handed to the Proxy editor: open the Route Tester with `host`, or
+ * open the Routing Rules tab with a new draft rule for `host`. `nonce` makes repeats distinct.
+ */
+export interface ProxyQuickAction {
+  kind: "test_route" | "create_rule";
+  proxyId: ProxyId;
+  host: string;
+  inbound: RouteInbound;
+  nonce: number;
+}
 export type ClosePrompt = "close" | "quit";
 
 export interface PendingHostKey {
@@ -46,6 +101,87 @@ const NIL_HOST_ID: Uuid = NEW_SESSION_ID;
 const POLL_INTERVAL_MS = 2_000;
 
 type StateChangedEvent = Extract<RuntimeEvent, { event: "state_changed" }>;
+type V2Event = { kind: "proxy"; event: ProxyEvent } | { kind: "tunnel"; event: TunnelEvent };
+
+const DEFAULT_LOGGING = { level: "INFO", format: "text", http_access_log: null, socks_log: null };
+
+function blankTunnel(): Tunnel {
+  const session = blankProfile();
+  return {
+    id: NEW_SESSION_ID,
+    name: "New tunnel",
+    enabled: true,
+    start_mode: "linked",
+    engine: session.engine,
+    hops: [],
+    reverse: session.reverse,
+    port_forwards: [],
+    keepalive: session.tunnel,
+    logging: { ...DEFAULT_LOGGING },
+    openssh: session.openssh,
+  };
+}
+
+function blankProxy(name: string, httpPort: number, socksPort: number): Proxy {
+  return {
+    id: NEW_SESSION_ID,
+    name,
+    enabled: true,
+    autostart: false,
+    source: "managed",
+    listeners: { bind: "127.0.0.1", http_port: httpPort, socks_port: socksPort, max_connections: 4096 },
+    network: { connect_timeout: 10, tcp_keepalive: 60, tcp_keepalive_interval: 10, tcp_keepalive_retries: 5 },
+    profiles: [],
+    routing: { default: "direct", resolve_dns: false, rules: [] },
+    filter: "off",
+    mitm: null,
+    logging: { ...DEFAULT_LOGGING },
+  };
+}
+
+/** A profile name derived from a Tunnel's name: lower case, words joined by `-`. */
+export function tunnelProfileName(tunnelName: string): string {
+  const slug = tunnelName.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  return slug && slug !== "direct" && slug !== "block" ? slug : "tunnel";
+}
+
+/** Vault records an upstream profile's password points at. */
+export const proxySecretRefs = (proxy: Proxy): string[] =>
+  proxy.profiles.flatMap((p) => (p.password && "vault" in p.password ? [p.password.vault] : []));
+
+const sameJson = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+
+/** Applies a Proxy event to its snapshot. Returns the snapshot unchanged if nothing applies. */
+export function applyProxyEvent(snapshot: ProxySnapshot, event: ProxyEvent): ProxySnapshot {
+  switch (event.event) {
+    case "state_changed": {
+      const { state } = event;
+      return state.state === "running"
+        ? {
+            ...snapshot,
+            state,
+            override_profile: state.override_profile,
+            config_generation: state.config_generation,
+            restart_required: state.restart_required,
+          }
+        : { ...snapshot, state };
+    }
+    case "reloaded": {
+      const state =
+        snapshot.state.state === "running"
+          ? { ...snapshot.state, config_generation: event.config_generation }
+          : snapshot.state;
+      return { ...snapshot, state, config_generation: event.config_generation };
+    }
+    case "override_changed": {
+      const state =
+        snapshot.state.state === "running"
+          ? { ...snapshot.state, override_profile: event.override_profile }
+          : snapshot.state;
+      return { ...snapshot, state, override_profile: event.override_profile };
+    }
+  }
+}
 
 function blankProfile(): SessionProfile {
   return {
@@ -111,6 +247,9 @@ class AppStore {
   keys = $state.raw<KeyView[]>([]);
   cas = $state.raw<CaView[]>([]);
   pins = $state.raw<HostKeyEntry[]>([]);
+  proxies = $state.raw<ProxyView[]>([]);
+  tunnels = $state.raw<TunnelView[]>([]);
+  profileLibrary = $state.raw<UpstreamProfile[]>([]);
   vault = $state.raw<VaultStatus>({ initialized: false, unlocked: false, keyring: false });
   /** False until the backend has reported the vault, so a failed load never offers "create". */
   vaultKnown = $state(false);
@@ -125,6 +264,23 @@ class AppStore {
   /** The host profile being created or edited. */
   hostDraft = $state.raw<HostProfile | null>(null);
   savingHost = $state(false);
+
+  // v2 selection and drafts. A new Proxy or Tunnel is keyed by `NEW_SESSION_ID` until saved.
+  selectedProxyId = $state<ProxyId | null>(null);
+  selectedTunnelId = $state<TunnelId | null>(null);
+  proxyDrafts = $state.raw<Record<ProxyId, Proxy>>({});
+  tunnelDrafts = $state.raw<Record<TunnelId, Tunnel>>({});
+  savingProxy = $state(false);
+  savingTunnel = $state(false);
+  proxySaveNote = $state.raw<ProxySaveNote | null>(null);
+  routeTest = $state.raw<RouteTestResult | null>(null);
+  upstreamTest = $state.raw<UpstreamProbeResult | null>(null);
+  tunnelChainResult = $state.raw<TunnelChainTestResult | null>(null);
+  /** A Log drawer quick action the Proxy editor has not picked up yet. */
+  proxyQuickAction = $state.raw<ProxyQuickAction | null>(null);
+  #quickActionNonce = 0;
+  /** What the log drawer shows while `logsOpen`. */
+  logTarget = $state.raw<LogTarget | null>(null);
 
   // Shell.
   loaded = $state(false);
@@ -179,6 +335,34 @@ class AppStore {
     return errors;
   });
 
+  selectedProxy = $derived(this.proxies.find((p) => p.profile.id === this.selectedProxyId) ?? null);
+  selectedTunnel = $derived(
+    this.tunnels.find((t) => t.profile.id === this.selectedTunnelId) ?? null,
+  );
+
+  /** The Proxy being edited: unsaved changes if there are any, otherwise the saved one. */
+  proxyDraft = $derived.by<Proxy | null>(() => {
+    if (this.selectedProxyId === null) return null;
+    return this.proxyDrafts[this.selectedProxyId] ?? this.selectedProxy?.profile ?? null;
+  });
+
+  tunnelDraft = $derived.by<Tunnel | null>(() => {
+    if (this.selectedTunnelId === null) return null;
+    return this.tunnelDrafts[this.selectedTunnelId] ?? this.selectedTunnel?.profile ?? null;
+  });
+
+  proxyDirty = $derived(this.selectedProxyId !== null && this.selectedProxyId in this.proxyDrafts);
+  tunnelDirty = $derived(
+    this.selectedTunnelId !== null && this.selectedTunnelId in this.tunnelDrafts,
+  );
+  knownTunnelIds = $derived(this.tunnels.map((t) => t.profile.id));
+  proxyDraftErrors = $derived<FieldErrors>(
+    this.proxyDraft ? proxyErrors(this.proxyDraft, this.knownTunnelIds) : {},
+  );
+  proxyDraftValid = $derived(Object.keys(this.proxyDraftErrors).length === 0);
+  tunnelDraftErrors = $derived<FieldErrors>(this.tunnelDraft ? tunnelErrors(this.tunnelDraft) : {});
+  tunnelDraftValid = $derived(Object.keys(this.tunnelDraftErrors).length === 0);
+
   showUnlock = $derived(
     this.loaded && this.vaultKnown && this.unlockRequested && !this.vault.unlocked,
   );
@@ -205,6 +389,7 @@ class AppStore {
   #snapshotsInFlight = 0;
   /** Events received while a snapshot was loading. They may be newer than that snapshot. */
   #eventsDuringSnapshot: StateChangedEvent[] = [];
+  #v2EventsDuringSnapshot: V2Event[] = [];
   /** Password records no longer used by an edit. Deleted once nothing saved refers to them. */
   #orphanedSecrets = new Set<string>();
 
@@ -244,15 +429,23 @@ class AppStore {
   async refresh(): Promise<boolean> {
     this.#snapshotsInFlight += 1;
     try {
-      const [sessions, hosts, presets, keys, cas, vault, pins] = await Promise.all([
-        api.listSessions(),
-        api.listHosts(),
-        api.listForwardPresets(),
-        api.listKeys(),
-        api.listMitmCas(),
-        api.vaultStatus(),
-        api.listHostKeyPins(),
-      ]);
+      const [sessions, hosts, presets, keys, cas, vault, pins, proxies, tunnels, library] =
+        await Promise.all([
+          api.listSessions(),
+          api.listHosts(),
+          api.listForwardPresets(),
+          api.listKeys(),
+          api.listMitmCas(),
+          api.vaultStatus(),
+          api.listHostKeyPins(),
+          api.listProxies(),
+          api.listTunnels(),
+          api.listProfileLibrary(),
+        ]);
+      this.proxies = proxies;
+      this.tunnels = tunnels;
+      this.profileLibrary = library;
+      this.#reconcileV2Selection();
       this.sessions = sessions;
       this.hosts = hosts;
       this.presets = presets;
@@ -381,6 +574,10 @@ class AppStore {
         summary.host_count !== this.hosts.length ||
         summary.key_count !== this.keys.length;
       this.#mergeRuntime(summary.sessions);
+      const [proxies, tunnels] = await Promise.all([api.listProxies(), api.listTunnels()]);
+      needsReload ||=
+        proxies.length !== this.proxies.length || tunnels.length !== this.tunnels.length;
+      this.#mergeV2Runtime(proxies, tunnels);
     } catch {
       // A missed poll is harmless. The next one retries.
     } finally {
@@ -404,8 +601,7 @@ class AppStore {
         this.clipboardUrl = event.payload.url;
         break;
       case "view-logs":
-        this.selectSession(event.payload.session_id);
-        this.logsOpen = true;
+        this.openLogsFor(event.payload.session_id);
         break;
       case "unlock-vault":
         this.view = "keys";
@@ -712,6 +908,8 @@ class AppStore {
     const inDrafts = new Set([
       ...Object.values(this.drafts).flatMap(profileRefs),
       ...authRefs(this.hostDraft?.auth ?? []),
+      ...Object.values(this.proxyDrafts).flatMap(proxySecretRefs),
+      ...Object.values(this.tunnelDrafts).flatMap((t) => t.hops.flatMap((hop) => authRefs(hop.host.auth))),
     ]);
     for (const ref of [...this.#orphanedSecrets]) {
       if (inDrafts.has(ref)) continue;
@@ -777,6 +975,515 @@ class AppStore {
     this.testHostKey = null;
   }
 
+  // -------------------------------------------------------------------------------------------
+  // v2: Proxies, Tunnels, and the Profile Library.
+  // -------------------------------------------------------------------------------------------
+
+  /** Opens the log drawer for a Proxy, Tunnel, or legacy session id, whichever matches. */
+  openLogsFor(id: Uuid): void {
+    if (this.proxies.some((p) => p.profile.id === id)) {
+      this.selectProxy(id);
+      this.logTarget = { kind: "proxy", id };
+    } else if (this.tunnels.some((t) => t.profile.id === id)) {
+      this.selectTunnel(id);
+      this.logTarget = { kind: "tunnel", id };
+    } else if (this.sessions.some((s) => s.profile.id === id)) {
+      this.selectSession(id);
+      this.logTarget = { kind: "session", id };
+    } else {
+      return;
+    }
+    this.logsOpen = true;
+  }
+
+  /** Hands a Log drawer quick action to the Proxy editor, selecting the Proxy first. */
+  requestProxyQuickAction(kind: ProxyQuickAction["kind"], proxyId: ProxyId, host: string, inbound: RouteInbound): void {
+    if (!this.proxies.some((p) => p.profile.id === proxyId)) return;
+    this.selectProxy(proxyId);
+    this.#quickActionNonce += 1;
+    this.proxyQuickAction = { kind, proxyId, host, inbound, nonce: this.#quickActionNonce };
+  }
+
+  /** Takes the pending quick action for `proxyId`, if any, so it runs once. */
+  takeProxyQuickAction(proxyId: ProxyId | null): ProxyQuickAction | null {
+    const action = this.proxyQuickAction;
+    if (!action || action.proxyId !== proxyId) return null;
+    this.proxyQuickAction = null;
+    return action;
+  }
+
+  handleProxyEvent(event: ProxyEvent): void {
+    if (this.#snapshotsInFlight > 0) this.#v2EventsDuringSnapshot.push({ kind: "proxy", event });
+    this.#applyProxyEvent(event);
+  }
+
+  handleTunnelEvent(event: TunnelEvent): void {
+    if (this.#snapshotsInFlight > 0) this.#v2EventsDuringSnapshot.push({ kind: "tunnel", event });
+    this.#applyTunnelEvent(event);
+  }
+
+  /** Reloads only the v2 lists. */
+  async refreshV2(): Promise<boolean> {
+    this.#snapshotsInFlight += 1;
+    try {
+      const [proxies, tunnels, library] = await Promise.all([
+        api.listProxies(),
+        api.listTunnels(),
+        api.listProfileLibrary(),
+      ]);
+      this.proxies = proxies;
+      this.tunnels = tunnels;
+      this.profileLibrary = library;
+      this.#reconcileV2Selection();
+      return true;
+    } catch (error) {
+      this.notice = errorMessage(error);
+      return false;
+    } finally {
+      this.#finishSnapshot();
+    }
+  }
+
+  selectProxy(id: ProxyId): void {
+    if (this.selectedProxyId !== id) {
+      this.routeTest = null;
+      this.upstreamTest = null;
+    }
+    this.selectedProxyId = id;
+    this.view = "proxy";
+  }
+
+  selectTunnel(id: TunnelId): void {
+    if (this.selectedTunnelId !== id) this.tunnelChainResult = null;
+    this.selectedTunnelId = id;
+    this.view = "tunnel";
+  }
+
+  /** The first HTTP and SOCKS ports from the defaults up that no saved Proxy uses on 127.0.0.1. */
+  #freeProxyPorts(): [number, number] {
+    const used = new Set(
+      this.proxies.flatMap(({ profile }) => [profile.listeners.http_port, profile.listeners.socks_port]),
+    );
+    const next = (port: number, taken: Set<number>) => {
+      while (used.has(port) || taken.has(port)) port += 1;
+      return port;
+    };
+    const http = next(3128, new Set());
+    return [http, next(1080, new Set([http]))];
+  }
+
+  /**
+   * Starts a new Proxy draft from a New Proxy wizard preset and opens it.
+   * - `direct`: no upstream profiles, everything goes `direct` (plain `rusty-conduit`).
+   * - `tunnel`: one `tunnel` profile, used as the default target (`rusty-conduit-ssh`).
+   * - `switch`: Auto Switch (`rusty-conduit-switch`): default `direct`, rules to be added, and
+   *   the Tunnel as a profile when one is given or exists.
+   * `tunnelId` defaults to the first Tunnel. With no Tunnel at all the `tunnel` preset keeps a
+   * nil Tunnel id, which validation flags until one is chosen.
+   */
+  newProxyFromPreset(preset: ProxyPreset, tunnelId: TunnelId | null = null): Proxy {
+    const [httpPort, socksPort] = this.#freeProxyPorts();
+    const names: Record<ProxyPreset, string> = {
+      direct: "New proxy",
+      tunnel: "New tunnel proxy",
+      switch: "New Auto Switch proxy",
+    };
+    const proxy = blankProxy(names[preset], httpPort, socksPort);
+    const tunnel =
+      this.tunnels.find((t) => t.profile.id === tunnelId)?.profile ?? this.tunnels[0]?.profile ?? null;
+    if (preset !== "direct" && (preset === "tunnel" || tunnel)) {
+      const name = tunnel ? tunnelProfileName(tunnel.name) : "tunnel";
+      proxy.profiles = [
+        {
+          name,
+          kind: { type: "tunnel", tunnel_id: tunnel?.id ?? tunnelId ?? NEW_SESSION_ID },
+          host: null,
+          port: null,
+          username: null,
+          password: null,
+          bypass: [],
+          color: null,
+        },
+      ];
+      if (preset === "tunnel") proxy.routing = { ...proxy.routing, default: name };
+    }
+    this.proxyDrafts = { ...this.proxyDrafts, [NEW_SESSION_ID]: proxy };
+    this.selectProxy(NEW_SESSION_ID);
+    return proxy;
+  }
+
+  newTunnel(): Tunnel {
+    const tunnel = this.tunnelDrafts[NEW_SESSION_ID] ?? blankTunnel();
+    this.tunnelDrafts = { ...this.tunnelDrafts, [NEW_SESSION_ID]: tunnel };
+    this.selectTunnel(NEW_SESSION_ID);
+    return tunnel;
+  }
+
+  /** Applies an edit to the selected Proxy. Undoing every change clears the draft. */
+  updateProxyDraft(edit: (proxy: Proxy) => Proxy): void {
+    const id = this.selectedProxyId;
+    const current = this.proxyDraft;
+    if (id === null || !current) return;
+    const next = edit(current);
+    if (next.routing !== current.routing || next.profiles !== current.profiles) this.routeTest = null;
+    this.#noteDroppedSecrets(proxySecretRefs(current), proxySecretRefs(next));
+    const saved = this.selectedProxy?.profile;
+    if (saved && sameJson(saved, next)) {
+      const { [id]: _dropped, ...rest } = this.proxyDrafts;
+      this.proxyDrafts = rest;
+    } else {
+      this.proxyDrafts = { ...this.proxyDrafts, [id]: next };
+    }
+  }
+
+  updateTunnelDraft(edit: (tunnel: Tunnel) => Tunnel): void {
+    const id = this.selectedTunnelId;
+    const current = this.tunnelDraft;
+    if (id === null || !current) return;
+    const next = edit(current);
+    if (next.hops !== current.hops) this.tunnelChainResult = null;
+    this.#noteDroppedSecrets(
+      current.hops.flatMap((hop) => authRefs(hop.host.auth)),
+      next.hops.flatMap((hop) => authRefs(hop.host.auth)),
+    );
+    const saved = this.selectedTunnel?.profile;
+    if (saved && sameJson(saved, next)) {
+      const { [id]: _dropped, ...rest } = this.tunnelDrafts;
+      this.tunnelDrafts = rest;
+    } else {
+      this.tunnelDrafts = { ...this.tunnelDrafts, [id]: next };
+    }
+  }
+
+  /** Throws away the selected Proxy's unsaved edits (or the unsaved new Proxy). */
+  async discardProxyDraft(): Promise<void> {
+    const id = this.selectedProxyId;
+    const draft = id === null ? undefined : this.proxyDrafts[id];
+    if (id === null || !draft) return;
+    const { [id]: _dropped, ...rest } = this.proxyDrafts;
+    this.proxyDrafts = rest;
+    proxySecretRefs(draft).forEach((ref) => this.#orphanedSecrets.add(ref));
+    if (id === NEW_SESSION_ID) this.selectedProxyId = this.proxies[0]?.profile.id ?? null;
+    await this.#deleteOrphanedSecrets();
+  }
+
+  async discardTunnelDraft(): Promise<void> {
+    const id = this.selectedTunnelId;
+    const draft = id === null ? undefined : this.tunnelDrafts[id];
+    if (id === null || !draft) return;
+    const { [id]: _dropped, ...rest } = this.tunnelDrafts;
+    this.tunnelDrafts = rest;
+    draft.hops.flatMap((hop) => authRefs(hop.host.auth)).forEach((ref) => this.#orphanedSecrets.add(ref));
+    if (id === NEW_SESSION_ID) this.selectedTunnelId = this.tunnels[0]?.profile.id ?? null;
+    await this.#deleteOrphanedSecrets();
+  }
+
+  /**
+   * Saves the selected Proxy. A running Proxy hot-reloads; the outcome is kept in
+   * `proxySaveNote` for the `gen #N · hot-reloaded` / `Restart to Apply` header.
+   */
+  async saveProxy(): Promise<void> {
+    const id = this.selectedProxyId;
+    const proxy = this.proxyDraft;
+    if (id === null || !proxy || !this.proxyDirty || this.savingProxy || !this.proxyDraftValid) return;
+    this.savingProxy = true;
+    try {
+      const result = await api.upsertProxy(proxy);
+      const savedId = result.profile.id;
+      const latest = this.proxyDrafts[id];
+      const { [id]: _dropped, ...rest } = this.proxyDrafts;
+      this.proxyDrafts = latest && latest !== proxy ? { ...rest, [savedId]: { ...latest, id: savedId } } : rest;
+      if (this.selectedProxyId === id) this.selectedProxyId = savedId;
+      this.proxySaveNote = {
+        proxyId: savedId,
+        configGeneration: result.snapshot.config_generation,
+        reloaded: result.reloaded,
+        reloadError: result.reload_error,
+      };
+      const viewed: ProxyView = { profile: result.profile, snapshot: result.snapshot };
+      this.proxies = this.proxies.some((p) => p.profile.id === savedId)
+        ? this.proxies.map((p) => (p.profile.id === savedId ? viewed : p))
+        : [...this.proxies, viewed];
+      await this.refreshV2();
+      await this.#deleteOrphanedSecrets();
+    } catch (error) {
+      this.notice = errorMessage(error);
+    } finally {
+      this.savingProxy = false;
+    }
+  }
+
+  async saveTunnel(): Promise<void> {
+    const id = this.selectedTunnelId;
+    const tunnel = this.tunnelDraft;
+    if (id === null || !tunnel || !this.tunnelDirty || this.savingTunnel || !this.tunnelDraftValid) return;
+    this.savingTunnel = true;
+    try {
+      const saved = await api.upsertTunnel(tunnel);
+      const latest = this.tunnelDrafts[id];
+      const { [id]: _dropped, ...rest } = this.tunnelDrafts;
+      this.tunnelDrafts =
+        latest && latest !== tunnel ? { ...rest, [saved.id]: { ...latest, id: saved.id } } : rest;
+      if (this.selectedTunnelId === id) this.selectedTunnelId = saved.id;
+      await this.refreshV2();
+      await this.#deleteOrphanedSecrets();
+    } catch (error) {
+      this.notice = errorMessage(error);
+    } finally {
+      this.savingTunnel = false;
+    }
+  }
+
+  async duplicateProxy(id: ProxyId): Promise<void> {
+    try {
+      const copy = await api.duplicateProxy(id);
+      await this.refreshV2();
+      this.selectProxy(copy.profile.id);
+    } catch (error) {
+      this.notice = errorMessage(error);
+    }
+  }
+
+  async duplicateTunnel(id: TunnelId): Promise<void> {
+    try {
+      const copy = await api.duplicateTunnel(id);
+      await this.refreshV2();
+      this.selectTunnel(copy.id);
+    } catch (error) {
+      this.notice = errorMessage(error);
+    }
+  }
+
+  async deleteProxy(id: ProxyId): Promise<void> {
+    const proxy = this.proxies.find((p) => p.profile.id === id);
+    if (!proxy) return;
+    try {
+      await api.deleteProxy(id);
+      const draft = this.proxyDrafts[id];
+      const { [id]: _dropped, ...rest } = this.proxyDrafts;
+      this.proxyDrafts = rest;
+      [...proxySecretRefs(proxy.profile), ...(draft ? proxySecretRefs(draft) : [])].forEach((ref) =>
+        this.#orphanedSecrets.add(ref),
+      );
+      if (this.proxySaveNote?.proxyId === id) this.proxySaveNote = null;
+      await this.refreshV2();
+      await this.#deleteOrphanedSecrets();
+    } catch (error) {
+      this.notice = errorMessage(error);
+    }
+  }
+
+  /**
+   * Deletes a Tunnel the user confirmed, with the same contract as {@link deleteKey}: forces
+   * only past the Proxies the user was shown, otherwise returns the fresh usage.
+   */
+  async deleteTunnel(id: TunnelId, confirmed: Usage | null = null): Promise<Usage | null> {
+    const tunnel = this.tunnels.find((t) => t.profile.id === id);
+    if (!tunnel) return null;
+    try {
+      const first = await api.deleteTunnel(id);
+      if (!first.deleted) {
+        const seen = new Set((confirmed?.proxies ?? []).map((ref) => ref.id));
+        if (!confirmed || (first.usage.proxies ?? []).some((ref) => !seen.has(ref.id))) return first.usage;
+        const forced = await api.deleteTunnel(id, true);
+        if (!forced.deleted) return forced.usage;
+      }
+      const draft = this.tunnelDrafts[id];
+      const { [id]: _dropped, ...rest } = this.tunnelDrafts;
+      this.tunnelDrafts = rest;
+      [...tunnel.profile.hops, ...(draft?.hops ?? [])]
+        .flatMap((hop) => authRefs(hop.host.auth))
+        .forEach((ref) => this.#orphanedSecrets.add(ref));
+      await this.refreshV2();
+      await this.#deleteOrphanedSecrets();
+      return null;
+    } catch (error) {
+      this.notice = errorMessage(error);
+      return null;
+    }
+  }
+
+  /** Includes or leaves out a saved Proxy from Start All and autostart. Saved right away. */
+  async setProxyEnabled(id: ProxyId, enabled: boolean): Promise<void> {
+    const proxy = this.proxies.find((p) => p.profile.id === id);
+    if (!proxy) return;
+    try {
+      await api.upsertProxy({ ...proxy.profile, enabled });
+      const draft = this.proxyDrafts[id];
+      if (draft) this.proxyDrafts = { ...this.proxyDrafts, [id]: { ...draft, enabled } };
+      await this.refreshV2();
+    } catch (error) {
+      this.notice = errorMessage(error);
+    }
+  }
+
+  async setTunnelEnabled(id: TunnelId, enabled: boolean): Promise<void> {
+    const tunnel = this.tunnels.find((t) => t.profile.id === id);
+    if (!tunnel) return;
+    try {
+      await api.upsertTunnel({ ...tunnel.profile, enabled });
+      const draft = this.tunnelDrafts[id];
+      if (draft) this.tunnelDrafts = { ...this.tunnelDrafts, [id]: { ...draft, enabled } };
+      await this.refreshV2();
+    } catch (error) {
+      this.notice = errorMessage(error);
+    }
+  }
+
+  async #runV2(action: () => Promise<unknown>): Promise<void> {
+    try {
+      await action();
+      await this.refreshV2();
+    } catch (error) {
+      this.notice = errorMessage(error);
+    }
+  }
+
+  startProxy = (id: ProxyId) => this.#runV2(() => api.startProxy(id));
+  stopProxy = (id: ProxyId) => this.#runV2(() => api.stopProxy(id));
+  restartProxy = (id: ProxyId) => this.#runV2(() => api.restartProxy(id));
+  startTunnel = (id: TunnelId) => this.#runV2(() => api.startTunnel(id));
+  stopTunnel = (id: TunnelId) => this.#runV2(() => api.stopTunnel(id));
+  restartTunnel = (id: TunnelId) => this.#runV2(() => api.restartTunnel(id));
+  approveTunnelHostKey = (id: TunnelId, sha256: string) =>
+    this.#runV2(() => api.approveTunnelHostKey(id, sha256));
+  rejectTunnelHostKey = (id: TunnelId) => this.#runV2(() => api.rejectTunnelHostKey(id));
+  startAllV2 = () => this.#runV2(() => api.startAllV2());
+  stopAllV2 = () => this.#runV2(() => api.stopAllV2());
+
+  /** Tray-style override: a profile name (`direct` included), or `null` for Auto Switch. */
+  async setProxyOverride(id: ProxyId, profile: string | null): Promise<void> {
+    try {
+      const snapshot = await api.setProxyOverride(id, profile);
+      this.#setProxySnapshot(id, snapshot);
+    } catch (error) {
+      this.notice = errorMessage(error);
+    }
+  }
+
+  /** Route Tester against the selected Proxy's draft. */
+  async testRoute(rawTarget: string, inbound: RouteInbound): Promise<RouteTestResult | null> {
+    const proxy = this.proxyDraft;
+    if (!proxy) return null;
+    try {
+      const result = await api.testRoute(proxy, rawTarget, inbound);
+      if (this.proxyDraft === proxy) this.routeTest = result;
+      return result;
+    } catch (error) {
+      this.notice = errorMessage(error);
+      return null;
+    }
+  }
+
+  /** Test Upstream: dials `host:port` through one profile of the selected Proxy's draft. */
+  async testUpstream(
+    profileName: string,
+    host: string,
+    port: number,
+    timeoutMs = 5_000,
+  ): Promise<UpstreamProbeResult | null> {
+    const proxy = this.proxyDraft;
+    if (!proxy) return null;
+    try {
+      const result = await api.testUpstream(proxy, profileName, host, port, timeoutMs);
+      this.upstreamTest = result;
+      return result;
+    } catch (error) {
+      this.notice = errorMessage(error);
+      return null;
+    }
+  }
+
+  async testTunnelChain(id: TunnelId): Promise<TunnelChainTestResult | null> {
+    this.tunnelChainResult = null;
+    try {
+      const result = await api.testTunnelChain(id);
+      if (this.selectedTunnelId === id) this.tunnelChainResult = result;
+      return result;
+    } catch (error) {
+      this.notice = errorMessage(error);
+      return null;
+    }
+  }
+
+  async saveLibraryProfile(profile: UpstreamProfile): Promise<UpstreamProfile | null> {
+    try {
+      const saved = await api.upsertLibraryProfile(profile);
+      this.profileLibrary = await api.listProfileLibrary();
+      return saved;
+    } catch (error) {
+      this.notice = errorMessage(error);
+      return null;
+    }
+  }
+
+  async deleteLibraryProfile(name: string): Promise<void> {
+    try {
+      await api.deleteLibraryProfile(name);
+      this.profileLibrary = await api.listProfileLibrary();
+    } catch (error) {
+      this.notice = errorMessage(error);
+    }
+  }
+
+  /** Copies a Profile Library entry into the selected Proxy's draft. Returns false on a clash. */
+  addLibraryProfileToDraft(name: string): boolean {
+    const entry = this.profileLibrary.find((p) => p.name === name);
+    const proxy = this.proxyDraft;
+    if (!entry || !proxy || proxy.profiles.some((p) => p.name === name)) return false;
+    this.updateProxyDraft((p) => ({ ...p, profiles: [...p.profiles, structuredClone(entry)] }));
+    return true;
+  }
+
+  #setProxySnapshot(id: ProxyId, snapshot: ProxySnapshot): void {
+    this.proxies = this.proxies.map((p) => (p.profile.id === id ? { ...p, snapshot } : p));
+  }
+
+  #applyProxyEvent(event: ProxyEvent): void {
+    const proxy = this.proxies.find((p) => p.profile.id === event.proxy_id);
+    if (!proxy) return;
+    this.#setProxySnapshot(event.proxy_id, applyProxyEvent(proxy.snapshot, event));
+  }
+
+  #applyTunnelEvent(event: TunnelEvent): void {
+    if (!this.tunnels.some((t) => t.profile.id === event.tunnel_id)) return;
+    this.tunnels = this.tunnels.map((t) =>
+      t.profile.id === event.tunnel_id ? { ...t, snapshot: { ...t.snapshot, state: event.state } } : t,
+    );
+  }
+
+  #mergeV2Runtime(proxies: ProxyView[], tunnels: TunnelView[]): void {
+    const proxyById = new Map<ProxyId, ProxySnapshot>(proxies.map((p) => [p.profile.id, p.snapshot]));
+    const tunnelById = new Map<TunnelId, TunnelSnapshot>(tunnels.map((t) => [t.profile.id, t.snapshot]));
+    this.proxies = this.proxies.map((p) => {
+      const snapshot = proxyById.get(p.profile.id);
+      return snapshot ? { ...p, snapshot } : p;
+    });
+    this.tunnels = this.tunnels.map((t) => {
+      const snapshot = tunnelById.get(t.profile.id);
+      return snapshot ? { ...t, snapshot } : t;
+    });
+  }
+
+  #reconcileV2Selection(): void {
+    const proxyIds = new Set(this.proxies.map((p) => p.profile.id));
+    const tunnelIds = new Set(this.tunnels.map((t) => t.profile.id));
+    const keep = <T>(drafts: Record<Uuid, T>, ids: Set<Uuid>) => {
+      const kept = Object.entries(drafts).filter(([id]) => id === NEW_SESSION_ID || ids.has(id));
+      return kept.length === Object.keys(drafts).length ? drafts : Object.fromEntries(kept);
+    };
+    this.proxyDrafts = keep(this.proxyDrafts, proxyIds);
+    this.tunnelDrafts = keep(this.tunnelDrafts, tunnelIds);
+    const proxyNew = this.selectedProxyId === NEW_SESSION_ID && NEW_SESSION_ID in this.proxyDrafts;
+    if (!proxyNew && (this.selectedProxyId === null || !proxyIds.has(this.selectedProxyId))) {
+      this.selectedProxyId = this.proxies[0]?.profile.id ?? null;
+    }
+    const tunnelNew = this.selectedTunnelId === NEW_SESSION_ID && NEW_SESSION_ID in this.tunnelDrafts;
+    if (!tunnelNew && (this.selectedTunnelId === null || !tunnelIds.has(this.selectedTunnelId))) {
+      this.selectedTunnelId = this.tunnels[0]?.profile.id ?? null;
+    }
+  }
+
   #dropDraft(id: Uuid): void {
     const { [id]: _dropped, ...rest } = this.drafts;
     this.drafts = rest;
@@ -786,7 +1493,13 @@ class AppStore {
     this.#snapshotsInFlight -= 1;
     // Replay so a snapshot read before these events cannot leave an older state on screen.
     this.#eventsDuringSnapshot.forEach((event) => this.#applyStateChange(event));
-    if (this.#snapshotsInFlight === 0) this.#eventsDuringSnapshot = [];
+    this.#v2EventsDuringSnapshot.forEach((item) =>
+      item.kind === "proxy" ? this.#applyProxyEvent(item.event) : this.#applyTunnelEvent(item.event),
+    );
+    if (this.#snapshotsInFlight === 0) {
+      this.#eventsDuringSnapshot = [];
+      this.#v2EventsDuringSnapshot = [];
+    }
   }
 
   #applyStateChange(event: StateChangedEvent): void {
@@ -821,7 +1534,24 @@ class AppStore {
   }
 }
 
-function subscribeStore(store: AppStore) {
+async function subscribeStore(store: AppStore): Promise<() => void> {
+  const unlistenShell = await subscribeShellListeners(store);
+  try {
+    const unlistenV2 = await subscribeV2Events({
+      onProxyEvent: (event) => store.handleProxyEvent(event),
+      onTunnelEvent: (event) => store.handleTunnelEvent(event),
+    });
+    return () => {
+      unlistenShell();
+      unlistenV2();
+    };
+  } catch (error) {
+    unlistenShell();
+    throw error;
+  }
+}
+
+function subscribeShellListeners(store: AppStore) {
   return subscribeShellEvents({
     onTrayStatus: ({ tray_available }) => {
       store.trayAvailable = tray_available;

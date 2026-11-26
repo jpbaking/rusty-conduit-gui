@@ -1,7 +1,7 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 
-import type { SessionProfile } from "./types.ts";
+import type { Proxy, SessionProfile, Tunnel } from "./types.ts";
 import {
   denylistedFlag,
   filterRuleError,
@@ -11,6 +11,9 @@ import {
   redactArgs,
   sessionErrors,
   configLineArgs,
+  portSpecError,
+  proxyErrors,
+  tunnelErrors,
 } from "./validate.ts";
 
 function validProfile(): SessionProfile {
@@ -474,5 +477,195 @@ describe("configLineArgs", () => {
   test("has no -o fix for Host and Match blocks", () => {
     assert.deepEqual(configLineArgs(["Host example"]), [{ index: 0, keyword: "Host", fix: null }]);
     assert.deepEqual(configLineArgs(["match all"]), [{ index: 0, keyword: "match", fix: null }]);
+  });
+});
+
+// ---- v2: Tunnels and Proxies ----
+
+const TUNNEL_ID = "a1111111-1111-4111-8111-111111111111";
+
+function validTunnel(): Tunnel {
+  const session = validProfile();
+  return {
+    id: TUNNEL_ID,
+    name: "Bastion",
+    enabled: true,
+    start_mode: "linked",
+    engine: session.engine,
+    hops: session.hops,
+    reverse: session.reverse,
+    port_forwards: [],
+    keepalive: session.tunnel,
+    logging: session.logging,
+    openssh: session.openssh,
+  };
+}
+
+function validProxy(): Proxy {
+  return {
+    id: "b1111111-1111-4111-8111-111111111111",
+    name: "Work",
+    enabled: true,
+    autostart: false,
+    source: "managed",
+    listeners: { bind: "127.0.0.1", http_port: 3128, socks_port: 1080, max_connections: 4096 },
+    network: { connect_timeout: 10, tcp_keepalive: 60, tcp_keepalive_interval: 10, tcp_keepalive_retries: 5 },
+    profiles: [
+      { name: "corp", kind: { type: "http" }, host: "192.0.2.80", port: 8080, username: null, password: { vault: "00000000-0000-4000-8000-0000000000aa" }, bypass: [], color: null },
+      { name: "ssh", kind: { type: "tunnel", tunnel_id: TUNNEL_ID }, host: null, port: null, username: null, password: null, bypass: [], color: null },
+    ],
+    routing: {
+      default: "ssh",
+      resolve_dns: false,
+      rules: [{ host_wildcard: "*.corp.example", match_all: false, disabled: false, target: ["corp", "direct"] }],
+    },
+    filter: "off",
+    mitm: null,
+    logging: { level: "INFO", format: "text", http_access_log: null, socks_log: null },
+  };
+}
+
+describe("tunnelErrors", () => {
+  test("accepts a tunnel without listeners", () => {
+    assert.deepEqual(tunnelErrors(validTunnel()), {});
+  });
+
+  test("needs a hop with a target host", () => {
+    const t = validTunnel();
+    assert.ok(tunnelErrors({ ...t, hops: [] }).hops);
+    const blank = { ...t, hops: [{ ...t.hops[0]!, host: { ...t.hops[0]!.host, host: " " } }] };
+    assert.ok(tunnelErrors(blank)["hop:hop-1:host"]);
+  });
+
+  test("checks the denylist, reconnect order, and keepalive", () => {
+    const t = validTunnel();
+    assert.ok(tunnelErrors({ ...t, openssh: { ...t.openssh, extra_args: ["-oProxyCommand=nc"] } })["openssh.extra_args:0"]);
+    const delays = { ...t.keepalive, reconnect_initial_delay: 100, reconnect_max_delay: 1 };
+    assert.ok(tunnelErrors({ ...t, keepalive: delays })["keepalive.reconnect_initial_delay"]);
+    assert.ok(tunnelErrors({ ...t, keepalive: { ...t.keepalive, tcp_keepalive_retries: 0 } })["keepalive.tcp_keepalive_retries"]);
+    assert.ok(tunnelErrors({ ...t, keepalive: { ...t.keepalive, ip_version: "5" } })["keepalive.ip_version"]);
+  });
+
+  test("checks reverse filters", () => {
+    const t = validTunnel();
+    const both = { ...t.reverse, reverse_allow: ["a.example"], reverse_block: ["b.example"] };
+    assert.ok(tunnelErrors({ ...t, reverse: both })["filters.reverse.conflict"]);
+    const bad = { ...t.reverse, reverse_block: [""] };
+    assert.ok(tunnelErrors({ ...t, reverse: bad })["filters.reverse.block:0"]);
+  });
+
+  test("local forwards may use any port; remote ones must not hit the reverse proxy", () => {
+    const t = validTunnel();
+    const reverse = { ...t.reverse, enabled: true, reverse_http_port: 9000, reverse_socks_port: 9001 };
+    const fwd = (id: string, direction: "local" | "remote", port: number) => ({
+      id, enabled: true, direction, name: "", bind: "127.0.0.1", port, dest_host: "db.internal", dest_port: 5432,
+    });
+    const local = { ...t, reverse, port_forwards: [fwd("l1", "local", 3128)] };
+    assert.deepEqual(tunnelErrors(local), {});
+    const clash = { ...local, port_forwards: [...local.port_forwards, fwd("r1", "remote", 9000)] };
+    assert.ok(tunnelErrors(clash)["forwards:r1:port"]);
+    const twice = { ...local, port_forwards: [...local.port_forwards, fwd("l2", "local", 3128)] };
+    assert.ok(tunnelErrors(twice)["forwards:l2:port"]);
+  });
+
+  test("checks logging", () => {
+    const t = validTunnel();
+    assert.ok(tunnelErrors({ ...t, logging: { ...t.logging, level: "loud" } })["logging.level"]);
+    assert.ok(tunnelErrors({ ...t, logging: { ...t.logging, format: "xml" } })["logging.format"]);
+  });
+});
+
+describe("proxyErrors", () => {
+  test("accepts a valid proxy", () => {
+    assert.deepEqual(proxyErrors(validProxy(), [TUNNEL_ID]), {});
+  });
+
+  test("needs a listener", () => {
+    const p = validProxy();
+    const none = { ...p, listeners: { ...p.listeners, http_port: 0, socks_port: 0 } };
+    assert.ok(proxyErrors(none, [TUNNEL_ID])["listeners.ports"]);
+    assert.deepEqual(proxyErrors({ ...none, listeners: { ...none.listeners, socks_port: 1081 } }, [TUNNEL_ID]), {});
+  });
+
+  test("checks MITM, network, filter, and logging", () => {
+    const p = validProxy();
+    assert.ok(proxyErrors({ ...p, mitm: { ca: null, cert_ttl: 3600, cert_cache_max_entries: 0, socks_block_web: false } }, [TUNNEL_ID])["mitm.ca"]);
+    assert.ok(proxyErrors({ ...p, mitm: { ca: "c", cert_ttl: 1, cert_cache_max_entries: 0, socks_block_web: false } }, [TUNNEL_ID])["mitm.cert_ttl"]);
+    assert.ok(proxyErrors({ ...p, network: { ...p.network, connect_timeout: 0 } }, [TUNNEL_ID])["network.connect_timeout"]);
+    assert.ok(proxyErrors({ ...p, network: { ...p.network, tcp_keepalive_interval: 0 } }, [TUNNEL_ID])["network.tcp_keepalive_interval"]);
+    assert.deepEqual(proxyErrors({ ...p, network: { ...p.network, tcp_keepalive: 0, tcp_keepalive_retries: 0 } }, [TUNNEL_ID]), {});
+    assert.ok(proxyErrors({ ...p, filter: { block: ["ok.example", "bad*.example"] } }, [TUNNEL_ID])["filter.block:1"]);
+    assert.ok(proxyErrors({ ...p, logging: { ...p.logging, level: "loud" } }, [TUNNEL_ID])["logging.level"]);
+  });
+
+  test("checks profile names, tunnels, hosts, and ports", () => {
+    const p = validProxy();
+    const [corp, ssh] = p.profiles as [Proxy["profiles"][0], Proxy["profiles"][0]];
+    assert.ok(proxyErrors({ ...p, profiles: [{ ...corp, name: "direct" }, ssh] }, [TUNNEL_ID])["profiles:0:name"]);
+    assert.ok(proxyErrors({ ...p, profiles: [corp, { ...corp }, ssh] }, [TUNNEL_ID])["profiles:1:name"]);
+    assert.ok(proxyErrors(p, [])["profiles:1:tunnel"]);
+    assert.ok(proxyErrors({ ...p, profiles: [{ ...corp, host: "" }, ssh] }, [TUNNEL_ID])["profiles:0:host"]);
+    assert.ok(proxyErrors({ ...p, profiles: [{ ...corp, port: 0 }, ssh] }, [TUNNEL_ID])["profiles:0:port"]);
+  });
+
+  test("flags a profile that points at the proxy's own listener", () => {
+    const p = validProxy();
+    const [corp, ssh] = p.profiles as [Proxy["profiles"][0], Proxy["profiles"][0]];
+    const loop = { ...corp, host: "localhost", port: 3128 };
+    assert.match(proxyErrors({ ...p, profiles: [loop, ssh] }, [TUNNEL_ID])["profiles:0:port"] ?? "", /loop/);
+    const wild = { ...p, listeners: { ...p.listeners, bind: "0.0.0.0" }, profiles: [{ ...corp, host: "127.0.0.1", port: 1080 }, ssh] };
+    assert.ok(proxyErrors(wild, [TUNNEL_ID])["profiles:0:port"]);
+    const elsewhere = { ...p, profiles: [{ ...corp, host: "192.0.2.80", port: 3128 }, ssh] };
+    assert.deepEqual(proxyErrors(elsewhere, [TUNNEL_ID]), {});
+  });
+
+  test("checks composite profiles", () => {
+    const p = validProxy();
+    const empty = { name: "split", kind: { type: "composite" as const, http: "", https: "", fallback: "" }, host: null, port: null, username: null, password: null, bypass: [], color: null };
+    assert.ok(proxyErrors({ ...p, profiles: [...p.profiles, empty] }, [TUNNEL_ID])["profiles:2:composite"]);
+    const unknown = { ...empty, kind: { ...empty.kind, http: "corp", fallback: "nope" } };
+    assert.ok(proxyErrors({ ...p, profiles: [...p.profiles, unknown] }, [TUNNEL_ID])["profiles:2:composite.fallback"]);
+    const good = { ...empty, kind: { ...empty.kind, http: "corp", https: "ssh", fallback: "direct" } };
+    assert.deepEqual(proxyErrors({ ...p, profiles: [...p.profiles, good] }, [TUNNEL_ID]), {});
+  });
+
+  test("checks routing targets in every table", () => {
+    const p = validProxy();
+    assert.ok(proxyErrors({ ...p, routing: { ...p.routing, default: "missing" } }, [TUNNEL_ID])["routing.default"]);
+    assert.ok(proxyErrors({ ...p, routing: { ...p.routing, default: [] } }, [TUNNEL_ID])["routing.default"]);
+    const rule = { match_all: true, disabled: false, target: ["corp", "nope"] };
+    assert.ok(proxyErrors({ ...p, routing: { ...p.routing, rules: [rule] } }, [TUNNEL_ID])["routing.rules:0:target"]);
+    const socks = { ...p.routing, socks: { default: "block", inherit: true, rules: [{ ...rule, target: "x" }] } };
+    const errors = proxyErrors({ ...p, routing: socks }, [TUNNEL_ID]);
+    assert.equal(errors["routing.socks.default"], undefined);
+    assert.ok(errors["routing.socks.rules:0:target"]);
+    const http = { ...p.routing, http: { default: "gone", inherit: false, rules: [] } };
+    assert.ok(proxyErrors({ ...p, routing: http }, [TUNNEL_ID])["routing.http.default"]);
+  });
+
+  test("checks rule conditions", () => {
+    const p = validProxy();
+    const withRule = (extra: object) => ({
+      ...p,
+      routing: { ...p.routing, rules: [{ match_all: false, disabled: false, target: "direct", ...extra }] },
+    });
+    assert.deepEqual(proxyErrors(withRule({ port: [443, "8000-8080"], cidr: "10.0.0.0/8", ip: "192.0.2.1" }), [TUNNEL_ID]), {});
+    assert.ok(proxyErrors(withRule({ port: "9000-8000" }), [TUNNEL_ID])["routing.rules:0:port"]);
+    assert.ok(proxyErrors(withRule({ cidr: "10.0.0.0" }), [TUNNEL_ID])["routing.rules:0:cidr"]);
+    assert.ok(proxyErrors(withRule({ ip: "not-an-ip" }), [TUNNEL_ID])["routing.rules:0:ip"]);
+    assert.ok(proxyErrors(withRule({ host_levels: { min: 3, max: 1 } }), [TUNNEL_ID])["routing.rules:0:host_levels"]);
+  });
+});
+
+describe("portSpecError", () => {
+  test("mirrors the engine's port spec parser", () => {
+    assert.equal(portSpecError(443), null);
+    assert.equal(portSpecError("443"), null);
+    assert.equal(portSpecError("8000-8080"), null);
+    assert.equal(portSpecError(" 80 - 81 "), null);
+    assert.ok(portSpecError("8080-8000"));
+    assert.ok(portSpecError("70000"));
+    assert.ok(portSpecError("a-b"));
+    assert.ok(portSpecError(1.5));
   });
 });
