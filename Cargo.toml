@@ -17,7 +17,7 @@ members = [
 # Shared workspace dependencies so every crate pins identical versions.
 [workspace.dependencies]
 # Library-first proxy engine (U1, pinned via git tag).
-rusty-conduit-engine = { git = "https://github.com/jpbaking/rusty-conduit-engine", tag = "v0.4.0" }
+rusty-conduit-engine = { git = "https://github.com/jpbaking/rusty-conduit-engine", tag = "v0.4.1" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
