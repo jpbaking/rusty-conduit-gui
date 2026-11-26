@@ -1,55 +1,57 @@
-# phase-0003 — Bump app backup format to v2 (Tunnels, Proxies, Profile Library, upstream passwords, v1 migration) and update secret_leak_scan
+# phase-0003 — Rebuild src-tauri/ui/dist/ if needed and run full low-disk verification suite plus version check
 
 - Status: done
 - Owner: executor
 - Depends on: phase-0002
-- Goal: Bump `src-tauri/src/controller/export.rs` backup format to `VERSION = 2` so plain and encrypted app backups include v2 `tunnels`, `proxies`, `profile_library`, and vaulted `UPSTREAM_PASSWORD_RECORD` secrets (while still importing v1 backups through §6.4 `migrate_v1_sessions`), and extend `src-tauri/tests/secret_leak_scan.rs` to verify v2 backups and CLI TOML exports never leak secrets.
-- Done when: `cargo test -p rusty-conduit-gui --lib export` and `cargo test -p rusty-conduit-gui --test secret_leak_scan` and `cargo clippy -p rusty-conduit-gui --all-targets -- -D warnings` pass with zero warnings.
-- Pattern to follow: `src-tauri/src/controller/export.rs:1-350`, `src-tauri/tests/secret_leak_scan.rs:576-820`, `docs/MASTER-PLAN.md:185-195`
+- Goal: Run the complete low-disk U5 verification suite across Rust, Python scripts, and Svelte UI, rebuild `src-tauri/ui/dist/` if the frontend build produces any changes, verify `rusty-conduit-gui --version` reports `0.2.0`, and confirm disk usage remains healthy.
+- Done when: All `## Verify` commands exit 0, `rusty-conduit-gui --version` prints `0.2.0`, any `src-tauri/ui/dist/` updates are committed cleanly, and root `/` has >= 10 GB free.
+- Pattern to follow: `.goal-ledger/GOAL.md` Full verification command
 
 ## Context
-- Disk constraint: ALWAYS pass `CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_NET_GIT_FETCH_WITH_CLI=true` on every `cargo` command.
-- **`src-tauri/src/controller/export.rs`**:
-  - Bump `const VERSION: u32 = 2;` (keep accepting `version == 1` on import for backwards compatibility!).
-  - Use versioned AADs: `config-bundle-v2` / `config-only-v2` when writing v2, while still accepting `config-bundle-v1` / `config-only-v1` when decrypting v1 encrypted backups.
-  - On **export**:
-    - Collect referenced secret IDs across `sessions`, `hosts`, **`tunnels`**, **`proxies`** (`UpstreamPasswordSource::Vault(ref)` and `mitm.ca`), and **`profile_library`** (`UpstreamPasswordSource::Vault(ref)`).
-    - Seal `UPSTREAM_PASSWORD_RECORD` records alongside `KEY_RECORD`, `PASSWORD_RECORD`, and `MITM_CA_RECORD` in encrypted-with-secrets bundles.
-    - Add v2 counts to `ExportSummary`: `proxy_count`, `tunnel_count`, `library_profile_count` (keep existing `session_count`, `host_count`, `key_count`, `ca_count`, `secret_count`, `missing_secrets`).
-  - On **import**:
-    - If an imported backup has `version == 1` (or `config.schema_version < 2` with non-empty `sessions` and empty `tunnels`/`proxies`), run `conduit_core::migrate_v1_sessions(&mut config)` so older v1 backups import cleanly into v2 `tunnels` + `proxies`! (Check existing v1 export tests in `export.rs` — keep all existing security/tampering/plain-credential-stripping guarantees intact; update v1 round-trip assertions only where v1 sessions now migrate or if a v2 backup is tested.)
-    - Validate imported `tunnels` (`validate_tunnel`) and `proxies` (`validate_proxy`), assign missing UUIDs, neutralize untrusted `openssh.ssh_bin` / log file paths on unauthenticated plain imports, and strip unverified `KeyId` / `SecretRef` / `MitmCaId` references on unauthenticated plain imports (same security contract as v1 sessions!).
-    - For encrypted-with-secrets imports, restore `UPSTREAM_PASSWORD_RECORD` records under fresh `SecretRef` IDs and remap all Proxy & Profile Library references; restore `tunnels`, `proxies`, and `profile_library` into `AppConfig` and sync `TunnelManager` + `ProxyManager`.
-    - Add v2 counts to `ImportSummary`: `proxies_added`, `proxies_updated`, `proxies_skipped`, `tunnels_added`, `tunnels_updated`, `tunnels_skipped`, `library_profiles_added`, `library_profiles_updated`, `library_profiles_skipped`.
-- **`src-tauri/tests/secret_leak_scan.rs`**:
-  - Update `v2_proxies_tunnels_and_upstream_passwords_hold_no_secrets` to assert `summary.secret_count >= 4` (now that the vaulted upstream password IS sealed in encrypted v2 backups!) AND also run `export_proxy_toml` for `RustyConduitSwitch` (and `RustyConduitSsh` if applicable) and scan the resulting TOML bytes for zero plaintext secret leaks!
+- Disk constraint: ALWAYS pass `CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_NET_GIT_FETCH_WITH_CLI=true` on every `cargo` command. Check `df -h /` and `du -sh target` at the end.
+- `src-tauri/ui/dist/` is tracked in Git (required by `tauri::generate_context!()`). After `npm run build`, if `git status --short src-tauri/ui/dist` shows changes, stage and commit them cleanly (removing any stale hashed assets); if unchanged, commit only the ledger update.
+- Verify `cargo run -p rusty-conduit-gui -- --version` prints `0.2.0`.
 
 ## Scope
-- In: `src-tauri/src/controller/export.rs`, `src-tauri/tests/secret_leak_scan.rs`
-- Out: `crates/`, `src-tauri/src/controller/{proxies,tunnels,import_export,keys,mitm_ca,sessions}.rs`, `src-tauri/ui/`
+- In: `src-tauri/ui/dist/` (only if `npm run build` changes it)
+- Out: `crates/`, `src-tauri/src/`, `src-tauri/ui/src/`, `scripts/`, `.github/`, `docs/`, `README.md`
 
 ## Sub-tasks
-1. [done] Upgrade `src-tauri/src/controller/export.rs` to backup format `VERSION = 2` (v2 AADs, v1 backwards-compat + §6.4 migration on v1 import, Tunnels/Proxies/Profile Library + `UPSTREAM_PASSWORD_RECORD` sealing/restoring, plain-import credential/path neutralization, v2 summary counts, and unit tests) — done when: `cargo test -p rusty-conduit-gui --lib export` passes.
-2. [done] Update `src-tauri/tests/secret_leak_scan.rs` to assert `secret_count >= 4` on v2 encrypted backup and scan `export_proxy_toml` output for zero plaintext leaks — done when: `cargo test -p rusty-conduit-gui --test secret_leak_scan` passes.
-3. [done] Run `## Verify` and record observed results in `## Evidence` — done when: `## Verify` exits 0.
+1. [done] Run the frontend checks and production build (`cd src-tauri/ui && npm run check && npm test && npm run build`) and inspect `git status --short src-tauri/ui/dist` — done when: `svelte-check` reports 0 errors/warnings, all frontend tests pass, and `vite build` succeeds.
+2. [done] Run the full Rust and Python verification suite, check `rusty-conduit-gui --version` prints `0.2.0`, verify disk usage (`df -h / && du -sh target`), and record observed results in `## Evidence` — done when: all `## Verify` commands exit 0 and `target/` + disk space are healthy.
 
 ## Verify
 ```sh
-CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test -p rusty-conduit-gui --lib && CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test -p rusty-conduit-gui --test secret_leak_scan && CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_NET_GIT_FETCH_WITH_CLI=true cargo clippy -p rusty-conduit-gui --all-targets -- -D warnings
+CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_NET_GIT_FETCH_WITH_CLI=true cargo clippy --workspace --all-targets -- -D warnings && CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test --workspace && CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test -p rusty-conduit-gui --test secret_leak_scan && CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_NET_GIT_FETCH_WITH_CLI=true RUSTFLAGS="--cfg conduit_check_tauri_tray" cargo check -p rusty-conduit-gui --tests --features tauri/tray-icon && CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_NET_GIT_FETCH_WITH_CLI=true cargo run -p rusty-conduit-gui -- --version && python3 scripts/check-pure-rust-crypto.py && python3 scripts/validate-release-config.py && python3 scripts/smoke-test-bundle.py --self-test && (cd src-tauri/ui && npm run check && npm test && npm run build) && df -h / && du -sh target
 ```
 
 ## Escalate when
-- An existing `export.rs` security test conflicts with running `migrate_v1_sessions` on v1 imports and needs a planner decision on v1 vs v2 test semantics → stop, set Status: needs-human — reason: list the exact conflicting test(s) and why
+- Any test, clippy check, Python script, frontend check, or `--version` check fails and requires editing files outside `src-tauri/ui/dist/` → stop, set Status: needs-human — reason: paste the failing command and output.
+- Free space on `/` drops below 10 GB → stop, set Status: needs-human — reason: report `df -h /` and `du -sh target`.
 
 ## Log
 - (append-only, one line per event)
-- sub-task 1: bumped `export.rs` to `VERSION = 2` with `config-bundle-v2`/`config-only-v2` AADs (v1 AADs still accepted, picked by header version); export collects Tunnel hop, Proxy MITM CA, and Proxy/Profile Library vaulted upstream refs (sealing `UPSTREAM_PASSWORD_RECORD`) and reports `proxy_count`/`tunnel_count`/`library_profile_count`; import runs `migrate_v1_sessions` for v1 files (or schema < 2), validates Tunnels (`validate_tunnel`), Proxies (`validate_proxy`), and library names, assigns ids, strips untrusted hop creds / Proxy MITM CA (MITM switched off) / upstream passwords (vault, env, file) on unauthenticated imports, neutralizes Tunnel `ssh_bin`, Tunnel/Proxy log paths, and Proxy External TOML source, restores and remaps upstream passwords in bundles, merges Tunnels/Proxies/library with new `ImportSummary` counts, and syncs TunnelManager + ProxyManager; added 6 unit tests
-- sub-task 1: one test assertion was wrong (a replace re-import on a *different* install makes new password records, as v1 always did); moved the no-new-records check to the source install, matching the existing v1 test
-- sub-task 2: `secret_leak_scan` v2 test now asserts `secret_count >= 4` and proxy/tunnel counts, and scans `export_proxy_toml` output, notes, and written file for RustyConduitSwitch (must succeed, uses `password_env`) and RustyConduitSsh (refused for this routed Proxy: the error text is scanned and no file is written)
-- sub-task 3: `## Verify` exit 0
+- sub-task 1: ran `npm run check && npm test && npm run build` in src-tauri/ui; all passed; `src-tauri/ui/dist/` unchanged (no dist commit needed)
+- sub-task 2: ran the `## Verify` block verbatim (output to scratchpad verify.log); every command exited 0; `--version` prints `rusty-conduit-gui 0.2.0`; dist still unchanged after second build
+- phase verify: `## Verify` chain → VERIFY_EXIT=0; phase done
 
 ## Evidence
 - (append-only: command → observed result)
-- `cargo test -p rusty-conduit-gui --lib export` (with low-disk env) → `test result: ok. 32 passed; 0 failed` (26 existing + 6 new v2/v1 tests)
-- `cargo test -p rusty-conduit-gui --test secret_leak_scan` → `test result: ok. 6 passed; 0 failed`
-- `## Verify` block → EXIT=0: `--lib` `174 passed; 0 failed`; `secret_leak_scan` `6 passed; 0 failed`; `clippy -p rusty-conduit-gui --all-targets -- -D warnings` `Finished` with no warnings
+- `df -h /` (start) → 140G avail (43% used)
+- `npm run check` → svelte-check 198 files, 0 errors, 0 warnings, exit 0
+- `npm test` → tests 93, pass 93, fail 0, exit 0
+- `npm run build` → vite built in 3.54s (index-DHmNQCi3.js, index-CmjdL6Z5.css), exit 0
+- `git status --short src-tauri/ui/dist` → empty (no changes)
+- `## Verify` full chain (verbatim) → VERIFY_EXIT=0
+- `cargo clippy --workspace --all-targets -- -D warnings` → Finished, no warnings/errors
+- `cargo test --workspace` → all `test result: ok`, 0 failed (largest suites 174, 133, 91 passed; 1 ignored in a 44-test suite)
+- `cargo test -p rusty-conduit-gui --test secret_leak_scan` → ok, 0 failed
+- `RUSTFLAGS="--cfg conduit_check_tauri_tray" cargo check -p rusty-conduit-gui --tests --features tauri/tray-icon` → Finished, exit 0
+- `cargo run -p rusty-conduit-gui -- --version` → `rusty-conduit-gui 0.2.0`
+- `python3 scripts/check-pure-rust-crypto.py` → PURE_RUST_CRYPTO_OK
+- `python3 scripts/validate-release-config.py` → RELEASE_CONFIG_OK
+- `python3 scripts/smoke-test-bundle.py --self-test` → SMOKE_TEST_SELF_TEST_OK
+- `(cd src-tauri/ui && npm run check && npm test && npm run build)` → 0 errors/0 warnings; 93/93 pass; built in 3.73s
+- `df -h /` → 139G avail (43% used), >= 10 GB OK
+- `du -sh target` → 6.8G
+- `git status --short` after Verify → only `.goal-ledger/phase-0003.md` modified; dist unchanged

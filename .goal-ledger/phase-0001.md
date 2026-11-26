@@ -1,65 +1,56 @@
-# phase-0001 — Add AirSwitch/ZeroOmega/SwitchyOmega .bak importer and 3-CLI config.toml import/export in conduit-core
+# phase-0001 — Add §3.3 deb/rpm/NSIS upgrade-path packaging metadata and bump release version to 0.2.0
 
 - Status: done
 - Owner: executor
 - Depends on: none
-- Goal: Implement AirSwitch / ZeroOmega / SwitchyOmega `.bak` import (`crates/conduit-core/src/airswitch_import.rs`) and 3-CLI `config.toml` import & export (`crates/conduit-core/src/toml_io.rs`) in `conduit-core`, extracting inline passwords into zeroized `ExtractedSecret` items (never stored plaintext in `Proxy`) and emitting `password_env` placeholders on export.
-- Done when: `cargo test -p conduit-core` and `cargo clippy -p conduit-core --all-targets -- -D warnings` pass with unit tests covering AirSwitch `.bak` import, all 3 CLI TOML formats (import + export + round-trip), warning collection, and secret extraction/redaction.
-- Pattern to follow: `crates/conduit-core/src/v2_model.rs`, `crates/conduit-core/src/v2_mapping.rs`, `crates/conduit-core/src/v2_validate.rs`, `docs/MASTER-PLAN.md:303-311`
+- Goal: Implement the remaining `docs/MASTER-PLAN.md` §3.3 upgrade-path packaging metadata for Linux (`.deb` / `.rpm`) and Windows (NSIS legacy uninstall prompt), and bump the release version consistently from `0.1.0` to `0.2.0` across all release manifests and lockfiles.
+- Done when: `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml`, `src-tauri/ui/package.json`, `Cargo.lock`, and `src-tauri/ui/package-lock.json` all report `0.2.0` with no unrelated dependency bumps, `.deb`/`.rpm` replacement metadata and NSIS legacy uninstall detection are in place, and `## Verify` exits 0.
+- Pattern to follow: `docs/MASTER-PLAN.md:72-97`, `src-tauri/tauri.conf.json`, `src-tauri/windows/nsis-hooks.nsh`
 
 ## Context
-- Disk constraint: ALWAYS pass `CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_NET_GIT_FETCH_WITH_CLI=true` on every `cargo` command.
-- `toml` is already in `Cargo.lock` (check version in `Cargo.lock` and pin a compatible `toml` entry in `[workspace.dependencies]` in `Cargo.toml` and `crates/conduit-core/Cargo.toml` so no network fetch is needed).
-- **`airswitch_import.rs`** (AirSwitch / ZeroOmega / SwitchyOmega `.bak` JSON):
-  - `.bak` files are JSON objects where profile entries are keyed by `+<ProfileName>` with `profileType` (`FixedProfile`, `SwitchProfile`, `PacProfile`, `RuleListProfile`, `VirtualProfile`, etc.), `fallbackProxy` (`scheme`, `host`, `port`, optional `auth: { username, password }`), `bypassList` (`[{ conditionType, pattern }]`), `color`, `defaultProfileName`, and `rules` (`[{ condition: { conditionType, pattern, ... }, profileName }]`).
-  - Map `FixedProfile` → `UpstreamProfile` (`http`, `https`, `socks5`, `socks4`/`socks4a`), preserving color, username, bypass patterns (`BypassCondition` / `BypassList`), and extracting any non-empty `password` into `ExtractedSecret { profile_name, password: Zeroizing<String> }` while leaving `profile.password = None` (the controller in phase-0002 will store extracted passwords in the Vault and attach `UpstreamPasswordSource::Vault(ref)`).
-  - Map `SwitchProfile` → `RoutingTablesConfig` (`default` from `defaultProfileName`, `rules` mapped from `HostWildcardCondition`, `HostRegexCondition`, `UrlWildcardCondition`, `UrlRegexCondition`, `KeywordCondition`, `IpCondition`, `HostLevelsCondition`, `BypassCondition`, `TimeCondition`, `WeekdayCondition`; built-ins `direct` / `system` → `"direct"` with warning for `system`).
-  - Browser-only / unsupported items (`PacProfile`, `RuleListProfile`, `VirtualProfile`, unsupported condition types, `system` profile) are skipped and listed in `warnings: Vec<String>` — never silently dropped.
-  - Export `import_airswitch_bak(json: &str, name: Option<&str>) -> Result<AirSwitchImport, ImportError>` where `AirSwitchImport` holds `proxy: Proxy`, `extracted_secrets: Vec<ExtractedSecret>`, `warnings: Vec<String>`, `profile_count: usize`, `rule_count: usize`.
-- **`toml_io.rs`** (3-CLI `config.toml` per `docs/MASTER-PLAN.md` §9.3):
-  - Define `CliTomlFormat { RustyConduit, RustyConduitSsh, RustyConduitSwitch }` (plus `detect_cli_toml_format(toml_str: &str) -> CliTomlFormat`).
-  - **`rusty-conduit` `config.toml`**:
-    - Import → `Proxy` (direct, no rules; listeners, network, filter, mitm, logging mapped).
-    - Export → allowed only for Proxies with no rules and default routing only to `"direct"` (otherwise return a clear `TomlExportError` explaining why and suggesting `rusty-conduit-switch`).
-  - **`rusty-conduit-ssh` `config.toml`**:
-    - Import → `Tunnel` (with placeholder hop from `destination` / `ssh` target + reverse/port_forwards/keepalive/logging, plus a `notes: Vec<String>` warning that `~/.ssh/config` aliases and auth must be completed by hand) + `Option<Proxy>` (when forward listeners are enabled, routing default to a `tunnel` profile referencing that `Tunnel`).
-    - Export → allowed for Proxies routing only to a single `tunnel` profile (no rules); writes the target hop's `user@host:port` as destination + listeners/filter/mitm/reverse/port_forwards/keepalive/logging, and returns `notes: Vec<String>` listing vault keys, passwords, and jump hosts as `~/.ssh/config` setup notes (NEVER writes secrets).
-  - **`rusty-conduit-switch` `config.toml`**:
-    - Import → `Proxy` + `extracted_secrets: Vec<ExtractedSecret>` (any inline `password` in `[profiles.<name>]` is extracted into `ExtractedSecret`, NEVER left plaintext in `Proxy`, while `password_env` / `password_file` are preserved as `UpstreamPasswordSource::Env` / `File`) + `warnings: Vec<String>`.
-    - Export → any `Proxy`; `UpstreamKind::Tunnel` profiles are exported as commented `# socks5` placeholder blocks with explanatory notes, and `UpstreamPasswordSource::Vault(_)` is exported as `password_env = "CONDUIT_UPSTREAM_<PROFILE_UPPER>_PASSWORD"` (NEVER plaintext secrets).
-  - Re-export all public types & functions from `crates/conduit-core/src/lib.rs`.
+- Disk constraint: ALWAYS pass `CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_NET_GIT_FETCH_WITH_CLI=true` on every `cargo` command (`rusty-conduit-engine` is fetched via git tag `v0.2.0`, root `/` has ~19 GB free).
+- **`src-tauri/tauri.conf.json`**:
+  - Bump `"version"` from `"0.1.0"` to `"0.2.0"`.
+  - Under `bundle.linux.deb`, add `"replaces": ["rusty-conduit-ssh-gui"]` and `"conflicts": ["rusty-conduit-ssh-gui"]` (verify Tauri v2 config schema accepts these exact keys via `cargo check -p rusty-conduit-gui`).
+  - Under `bundle.linux.rpm`, add `"obsoletes": ["rusty-conduit-ssh-gui"]` and `"conflicts": ["rusty-conduit-ssh-gui"]` (verify Tauri v2 config schema accepts these exact keys; check `tauri-utils` schema in Cargo registry if `tauri-build` rejects any field name).
+- **`src-tauri/windows/nsis-hooks.nsh`**:
+  - Preserve existing `NSIS_HOOK_PREINSTALL` and `NSIS_HOOK_PREUNINSTALL` process-stop hooks (`rusty-conduit-gui.exe`, `rusty-conduit-ssh-gui.exe`, `conduit-worker.exe`).
+  - In `NSIS_HOOK_PREINSTALL`, detect a legacy `Rusty Conduit (SSH)` installation by reading `HKCU` `"Software\Microsoft\Windows\CurrentVersion\Uninstall\Rusty Conduit (SSH)"` `"UninstallString"` (with `HKLM` fallback if empty).
+  - When a legacy `UninstallString` is found and the installer is NOT running silently (`IfSilent`), prompt with `MessageBox MB_YESNO|MB_ICONQUESTION` offering to uninstall the legacy `Rusty Conduit (SSH)` app (mentioning that settings and vault are migrated automatically on first launch) and, if Yes, run `ExecWait` on the uninstall string.
+- **Version bump to `0.2.0`**:
+  - `src-tauri/Cargo.toml`: `[package] version = "0.2.0"`.
+  - `Cargo.lock`: refresh cleanly for `rusty-conduit-gui` `0.2.0` (do NOT bump third-party dependency versions).
+  - `src-tauri/ui/package.json` and `src-tauri/ui/package-lock.json`: `"version": "0.2.0"` (`npm install --package-lock-only` in `src-tauri/ui`, keeping dependencies untouched).
 
 ## Scope
-- In: `Cargo.toml`, `Cargo.lock`, `crates/conduit-core/Cargo.toml`, `crates/conduit-core/src/lib.rs`, `crates/conduit-core/src/airswitch_import.rs` (create), `crates/conduit-core/src/toml_io.rs` (create)
-- Out: `crates/conduit-vault/`, `crates/conduit-runtime/`, `crates/conduit-tray/`, `src-tauri/`
+- In: `src-tauri/tauri.conf.json`, `src-tauri/windows/nsis-hooks.nsh`, `src-tauri/Cargo.toml`, `Cargo.lock`, `src-tauri/ui/package.json`, `src-tauri/ui/package-lock.json`
+- Out: `scripts/`, `.github/`, `docs/`, `README.md`, `src-tauri/ui/dist/`, `src-tauri/src/`, `crates/`
 
 ## Sub-tasks
-1. [done] Add `toml` workspace dependency (matching existing `Cargo.lock` version) to `Cargo.toml` and `crates/conduit-core/Cargo.toml` — done when: `cargo check -p conduit-core` passes offline/without breaking `check-pure-rust-crypto.py`.
-2. [done] Implement `crates/conduit-core/src/airswitch_import.rs` with full `.bak` parsing, profile/rule mapping, zeroized `ExtractedSecret` extraction, browser-only warning collection, and unit tests — done when: `cargo test -p conduit-core airswitch` passes.
-3. [done] Implement `crates/conduit-core/src/toml_io.rs` for `rusty-conduit`, `rusty-conduit-ssh`, and `rusty-conduit-switch` import/export (including format detection, `password_env` placeholders, commented `tunnel` placeholders, setup notes, and unit tests), and re-export from `crates/conduit-core/src/lib.rs` — done when: `cargo test -p conduit-core toml_io` passes.
+1. [done] Add `.deb` (`replaces`/`conflicts`) and `.rpm` (`obsoletes`/`conflicts`) upgrade-path metadata to `src-tauri/tauri.conf.json` and verify Tauri v2 accepts the schema — done when: `cargo check -p rusty-conduit-gui` passes with the new keys.
+2. [done] Update `src-tauri/windows/nsis-hooks.nsh` `NSIS_HOOK_PREINSTALL` to detect legacy `Rusty Conduit (SSH)` (`UninstallString`) and offer to uninstall it when non-silent — done when: hook handles HKCU/HKLM lookup, `IfSilent` guard, `MessageBox MB_YESNO`, and `ExecWait`.
+3. [done] Bump version from `0.1.0` to `0.2.0` in `src-tauri/Cargo.toml`, `src-tauri/tauri.conf.json`, `src-tauri/ui/package.json`, and refresh `Cargo.lock` and `src-tauri/ui/package-lock.json` without upgrading third-party dependencies — done when: `git diff` shows only the `0.1.0 -> 0.2.0` package version bump in manifests and lockfiles.
 4. [done] Run `## Verify` and record observed results in `## Evidence` — done when: `## Verify` exits 0.
-5. [done] Fix-up: box the `CliTomlImport` variants to clear clippy `large_enum_variant` (`-D warnings`) reported by the first `## Verify` run — done when: `## Verify` exits 0.
 
 ## Verify
 ```sh
-CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test -p conduit-core && CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_NET_GIT_FETCH_WITH_CLI=true cargo clippy -p conduit-core --all-targets -- -D warnings && python3 scripts/check-pure-rust-crypto.py
+CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_NET_GIT_FETCH_WITH_CLI=true cargo check -p rusty-conduit-gui && python3 scripts/validate-release-config.py && python3 scripts/check-pure-rust-crypto.py
 ```
 
 ## Escalate when
-- `Cargo.lock` does not contain a `toml` crate version usable with `serde` or adding `toml` trips `scripts/check-pure-rust-crypto.py` → stop, set Status: needs-human — reason: report the exact Cargo/crypto-check output
+- Tauri v2 (`tauri-build` / `tauri-utils`) does not support any of `deb.replaces`, `deb.conflicts`, `rpm.obsoletes`, or `rpm.conflicts` in `tauri.conf.json` → stop, set Status: needs-human — reason: report the exact `tauri-utils` schema fields available.
 
 ## Log
 - (append-only, one line per event)
-- sub-task 1: added `toml = "1.2"` to `[workspace.dependencies]` (matches locked `toml 1.2.2+spec-1.1.0`, already in the registry cache) and `toml = { workspace = true }` to conduit-core; Cargo.lock gained only the conduit-core → toml 1.2.2 edge
-- sub-task 2: created `crates/conduit-core/src/airswitch_import.rs` (`import_airswitch_bak`, `AirSwitchImport`, `ExtractedSecret` with redacted Debug + `Zeroizing<String>`, `ImportError`), modelled on `rusty-conduit-switch/src/import/airswitch.rs`; `name` selects the SwitchProfile to import (like the switch CLI `--profile`); re-exported from lib.rs
-- sub-task 3: created `crates/conduit-core/src/toml_io.rs` (file shapes mirror each CLI's `FileConfig` with `deny_unknown_fields`, read from the sibling CLI repos); `CliTomlFormat` + `detect_cli_toml_format`, per-CLI import/export fns, `import_cli_toml` / `export_cli_toml` dispatch, `upstream_password_env_var`, `TomlExport { toml, notes }`; re-exported from lib.rs
-- sub-task 3 note: the real `rusty-conduit-ssh` config.toml has `[ssh] target` (no `destination` key) and no port-forward keys, so export writes `target = "user@host"` + `port = N` and lists port forwards as `LocalForward`/`RemoteForward` `~/.ssh/config` notes; import has no forwards to read
-- sub-task 4: first `## Verify` run failed on clippy `large_enum_variant` (toml_io.rs:137 `CliTomlImport`); appended fix-up sub-task 5 (boxed the variants); second run exit 0
+- sub-task 1: confirmed `tauri-utils` 2.10.4 `DebConfig.replaces`/`conflicts` and `RpmConfig.obsoletes`/`conflicts`; added them for `rusty-conduit-ssh-gui` in `src-tauri/tauri.conf.json`.
+- sub-task 2: added `CONDUIT_OFFER_LEGACY_UNINSTALL` macro (HKCU then HKLM `UninstallString`, `IfSilent` skip, `MessageBox MB_YESNO|MB_ICONQUESTION`, `ExecWait`) and inserted it in `NSIS_HOOK_PREINSTALL` after `CONDUIT_STOP_ALL`; existing stop hooks kept. Not compiled: `makensis` is not installed here.
+- sub-task 3: bumped `0.1.0 -> 0.2.0` in `src-tauri/Cargo.toml`, `src-tauri/tauri.conf.json`, `src-tauri/ui/package.json`; refreshed `Cargo.lock` (via `cargo check`) and `package-lock.json` (`npm install --package-lock-only --ignore-scripts`).
+- sub-task 4: ran `## Verify` verbatim; exit 0.
 
 ## Evidence
 - (append-only: command → observed result)
-- `cargo check -p conduit-core --offline` (disk-safe env) → `Finished dev profile` (only an expected unused-dependency warning before the modules existed); `python3 scripts/check-pure-rust-crypto.py` → `PURE_RUST_CRYPTO_OK`
-- `cargo test -p conduit-core --offline airswitch` → `test result: ok. 7 passed; 0 failed` (covers profiles/rules/all listed condition types, composite, base64, SwitchProfile selection errors, warnings, password extraction + no plaintext in JSON/Debug, imported Proxy passes `validate_proxy`)
-- `cargo test -p conduit-core --offline toml_io` → `test result: ok. 14 passed; 0 failed` (format detection; import of all 3 CLIs; export + round-trip of all 3; export refusals; MITM/vault/jump/auth/port-forward setup notes; `password_env = "CONDUIT_UPSTREAM_CORP_PASSWORD"`; commented `# type = "socks5"` tunnel placeholder; inline switch password extracted, absent from Proxy JSON/Debug and from exported TOML)
-- `## Verify` run 1 → clippy `error: large size difference between variants --> crates/conduit-core/src/toml_io.rs:137:1`, EXIT=101
-- `## Verify` run 2 (after fix-up 5) → `cargo test -p conduit-core`: `test result: ok. 133 passed; 0 failed`; `cargo clippy -p conduit-core --all-targets -- -D warnings`: `Finished`, no warnings; `check-pure-rust-crypto.py`: `PURE_RUST_CRYPTO_OK`; EXIT=0
+- `grep -n 'pub replaces\|pub conflicts\|pub obsoletes' ~/.cargo/registry/src/*/tauri-utils-2.10.4/src/config.rs` → deb `conflicts` (349), `replaces` (351); rpm `conflicts` (449), `obsoletes` (452). `Cargo.lock` pins `tauri-utils` 2.10.4.
+- `cargo check -p rusty-conduit-gui` (low-disk env) with new keys → `Finished dev profile`; `-v` shows `Fresh rusty-conduit-gui v0.2.0`.
+- `grep -n conduit_legacy_done src-tauri/windows/nsis-hooks.nsh` → lines 27 (StrCmp), 28 (IfSilent), 29 (MessageBox IDNO), 31 (label); HKCU/HKLM `ReadRegStr` at 24/26; `ExecWait $0` at 30. `which makensis` → not found (not compiled).
+- `git diff Cargo.lock src-tauri/ui/package-lock.json` → only `rusty-conduit-gui` / `rusty-conduit-gui-ui` `0.1.0 -> 0.2.0` (1 line Cargo.lock, 2 lines package-lock); no dependency changes.
+- `## Verify` → `Finished dev profile`, `RELEASE_CONFIG_OK`, `PURE_RUST_CRYPTO_OK`, EXIT=0.

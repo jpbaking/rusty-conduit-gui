@@ -39,6 +39,20 @@ PACKAGE_COMMANDS = (
     "scripts/smoke-test-bundle.py",
 )
 RELEASE_COMMANDS = ("SHA256SUMS.txt", "gh release create", "--draft")
+# MASTER-PLAN §3.3: v0.2.0 (rusty-conduit-gui) replaces v0.1.0 (rusty-conduit-ssh-gui).
+LEGACY_PACKAGE = "rusty-conduit-ssh-gui"
+LEGACY_UPGRADE_FIELDS = {"deb": ("replaces", "conflicts"), "rpm": ("obsoletes", "conflicts")}
+LEGACY_UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Rusty Conduit (SSH)"
+PREINSTALL_NEEDLES = (
+    "taskkill",
+    "rusty-conduit-gui.exe",
+    "rusty-conduit-ssh-gui.exe",
+    "conduit-worker.exe",
+    LEGACY_UNINSTALL_KEY,
+    "UninstallString",
+    "MessageBox",
+    "ExecWait",
+)
 
 
 def load_json(path, errors):
@@ -66,6 +80,15 @@ def check_base_config(config, errors):
     for package in ("deb", "rpm", "appimage"):
         if package not in linux:
             errors.append(f"tauri.conf.json: bundle.linux.{package} is required")
+    for package, fields in LEGACY_UPGRADE_FIELDS.items():
+        section = linux.get(package)
+        section = section if isinstance(section, dict) else {}
+        for field in fields:
+            values = section.get(field)
+            if not isinstance(values, list) or LEGACY_PACKAGE not in values:
+                errors.append(
+                    f"tauri.conf.json: bundle.linux.{package}.{field} must include {LEGACY_PACKAGE}"
+                )
     if not bundle.get("macOS", {}).get("minimumSystemVersion"):
         errors.append("tauri.conf.json: bundle.macOS.minimumSystemVersion is required")
 
@@ -89,6 +112,54 @@ def check_bundle_overlay(overlay, errors):
         errors.append("tauri.bundle.conf.json: externalBin must include binaries/conduit-worker")
 
 
+def nsis_macros(text):
+    """Maps each `!macro NAME PARAM...` to its parameter names and body."""
+    pattern = re.compile(r"^\s*!macro\s+(\w+)([^\n]*)\n(.*?)^\s*!macroend", re.MULTILINE | re.DOTALL)
+    return {m.group(1): (m.group(2).split(), m.group(3)) for m in pattern.finditer(text)}
+
+
+def nsis_defines(text):
+    pattern = re.compile(r'^\s*!define\s+(\w+)\s+"([^"]*)"', re.MULTILINE)
+    return {match.group(1): match.group(2) for match in pattern.finditer(text)}
+
+
+def nsis_arguments(text):
+    return [quoted or bare for quoted, bare in re.findall(r'"([^"]*)"|(\S+)', text)]
+
+
+def expand_nsis_macro(name, macros, defines, arguments=(), depth=0):
+    """Inlines nested `!insertmacro` calls, their arguments, and `${DEFINE}` values."""
+    if depth > 8 or name not in macros:
+        return ""
+    params, body = macros[name]
+    values = {**defines, **dict(zip(params, arguments))}
+    body = re.sub(r"\$\{(\w+)\}", lambda match: values.get(match.group(1), match.group(0)), body)
+    return re.sub(
+        r"^\s*!insertmacro\s+(\w+)([^\n]*)$",
+        lambda match: expand_nsis_macro(
+            match.group(1), macros, defines, nsis_arguments(match.group(2)), depth + 1
+        ),
+        body,
+        flags=re.MULTILINE,
+    )
+
+
+def check_nsis_text(text, errors):
+    macros = nsis_macros(text)
+    defines = nsis_defines(text)
+    for hook in ("NSIS_HOOK_PREINSTALL", "NSIS_HOOK_PREUNINSTALL"):
+        if hook not in macros:
+            errors.append(f"nsis-hooks.nsh: missing !macro {hook}")
+    preinstall = expand_nsis_macro("NSIS_HOOK_PREINSTALL", macros, defines)
+    for needle in PREINSTALL_NEEDLES:
+        if needle not in preinstall:
+            errors.append(f"nsis-hooks.nsh: NSIS_HOOK_PREINSTALL must use {needle}")
+    preuninstall = expand_nsis_macro("NSIS_HOOK_PREUNINSTALL", macros, defines)
+    for needle in ("taskkill", "rusty-conduit-gui.exe", "conduit-worker.exe"):
+        if needle not in preuninstall:
+            errors.append(f"nsis-hooks.nsh: NSIS_HOOK_PREUNINSTALL must use {needle}")
+
+
 def check_nsis_hooks(errors):
     path = TAURI / "windows" / "nsis-hooks.nsh"
     try:
@@ -96,16 +167,7 @@ def check_nsis_hooks(errors):
     except OSError as error:
         errors.append(f"nsis-hooks.nsh: {error}")
         return
-    required = (
-        "!macro NSIS_HOOK_PREINSTALL",
-        "!macro NSIS_HOOK_PREUNINSTALL",
-        "rusty-conduit-gui.exe",
-        "conduit-worker.exe",
-        "taskkill",
-    )
-    for needle in required:
-        if needle not in text:
-            errors.append(f"nsis-hooks.nsh: missing {needle}")
+    check_nsis_text(text, errors)
 
 
 def png_size(data):
@@ -218,10 +280,18 @@ def check_ci(document, errors):
     require_commands("ci.yml", "rust-and-e2e", rust, CI_COMMANDS, errors)
     if "actions/checkout" not in job_uses(rust):
         errors.append("ci.yml: rust-and-e2e must check out the repository")
-    steps = rust.get("steps", []) if isinstance(rust, dict) else []
-    paths = {(step.get("with") or {}).get("path") for step in steps if isinstance(step, dict)}
-    if not {"rusty-conduit-gui", "rusty-conduit-engine"} <= paths:
-        errors.append("ci.yml: rust-and-e2e must check out both sibling repositories")
+    check_no_sibling_checkout("ci.yml", "rust-and-e2e", rust, errors)
+
+
+def check_no_sibling_checkout(name, job_name, job, errors):
+    """Cargo.toml fetches rusty-conduit-engine from a git tag, not a sibling directory."""
+    steps = job.get("steps", []) if isinstance(job, dict) else []
+    for step in steps:
+        options = (step.get("with") or {}) if isinstance(step, dict) else {}
+        if not isinstance(options, dict):
+            continue
+        if options.get("repository") or options.get("path") == "rusty-conduit-engine":
+            errors.append(f"{name}: job {job_name} must not check out a sibling repository")
 
 
 def check_release(document, text, errors):
@@ -248,6 +318,9 @@ def check_release(document, text, errors):
     if found != RELEASE_TARGETS:
         errors.append(f"release.yml: package matrix must be exactly {RELEASE_TARGETS}")
     require_commands("release.yml", "package", package, PACKAGE_COMMANDS, errors)
+    if "actions/checkout" not in job_uses(package):
+        errors.append("release.yml: package must check out the repository")
+    check_no_sibling_checkout("release.yml", "package", package, errors)
     if not any(entry.get("stage_args") == "--universal-macos" for entry in include):
         errors.append("release.yml: macOS must stage with --universal-macos")
     if "rpm" not in job_runs(package).split():

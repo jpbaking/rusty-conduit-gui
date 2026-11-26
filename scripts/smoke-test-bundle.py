@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Checks that built installers are present, non-empty, and contain both app binaries."""
+"""Checks that built installers are present, non-empty, contain both app binaries, and
+replace the legacy rusty-conduit-ssh-gui package (.deb Replaces/Conflicts, .rpm Obsoletes/Conflicts)."""
 
 import argparse
 import hashlib
@@ -14,6 +15,10 @@ MAIN = "rusty-conduit-gui"
 WORKER = "conduit-worker"
 MAC_ARCHES = {"x86_64", "arm64"}
 CHECKSUMS = "SHA256SUMS.txt"
+# MASTER-PLAN §3.3: v0.2.0 (rusty-conduit-gui) replaces v0.1.0 (rusty-conduit-ssh-gui).
+LEGACY_PACKAGE = "rusty-conduit-ssh-gui"
+DEB_UPGRADE_FIELDS = ("Replaces", "Conflicts")
+RPM_UPGRADE_FIELDS = ("obsoletes", "conflicts")
 
 
 class CheckError(Exception):
@@ -56,14 +61,58 @@ def rpm_names(listing):
     return [PurePosixPath(line.strip()).name for line in listing.splitlines() if line.strip()]
 
 
+def deb_control_fields(control):
+    """Parses `dpkg-deb -f` output into a field map. Continuation lines are joined."""
+    fields, current = {}, None
+    for line in control.splitlines():
+        if line[:1] in (" ", "\t") and current:
+            fields[current] += " " + line.strip()
+        elif ":" in line:
+            current, value = line.split(":", 1)
+            current = current.strip().lower()
+            fields[current] = value.strip()
+    return fields
+
+
+def deb_relation_names(value):
+    """Package names in a relation field such as `a (<< 2), b | c`."""
+    names = set()
+    for alternatives in value.split(","):
+        for relation in alternatives.split("|"):
+            parts = relation.replace("(", " (").split()
+            if parts:
+                names.add(parts[0].split(":")[0])
+    return names
+
+
+def rpm_relation_names(listing):
+    """Package names in `rpm -qp --obsoletes` or `--conflicts` output, one relation a line."""
+    return {line.split()[0] for line in listing.splitlines() if line.split()}
+
+
+def require_replaces_legacy(label, field, names):
+    if LEGACY_PACKAGE not in names:
+        raise CheckError(f"{label} {field} does not include {LEGACY_PACKAGE}")
+
+
+def check_deb_upgrade(label, control):
+    fields = deb_control_fields(control)
+    for field in DEB_UPGRADE_FIELDS:
+        require_replaces_legacy(label, field, deb_relation_names(fields.get(field.lower(), "")))
+
+
 def check_deb(path):
     require_non_empty(path)
     require_binaries(path.name, deb_names(run(["dpkg-deb", "-c", str(path)])))
+    check_deb_upgrade(path.name, run(["dpkg-deb", "-f", str(path)]))
 
 
 def check_rpm(path):
     require_non_empty(path)
     require_binaries(path.name, rpm_names(run(["rpm", "-qlp", str(path)])))
+    for field in RPM_UPGRADE_FIELDS:
+        names = rpm_relation_names(run(["rpm", "-qp", f"--{field}", str(path)]))
+        require_replaces_legacy(path.name, field.capitalize(), names)
 
 
 def check_appimage(path):
@@ -170,11 +219,12 @@ def write(path, data=b"data", mode=None):
     return path
 
 
-def build_deb(root, name, files):
+def build_deb(root, name, files, relations=DEB_UPGRADE_FIELDS):
     tree = root / f"{name}-tree"
+    extra = "".join(f"{field}: {LEGACY_PACKAGE}\n" for field in relations)
     write(
         tree / "DEBIAN" / "control",
-        f"Package: {name}\nVersion: 0.0.1\nArchitecture: all\n"
+        f"Package: {name}\nVersion: 0.0.1\nArchitecture: all\n{extra}"
         "Maintainer: Self Test <test@example.invalid>\nDescription: smoke test fixture\n".encode(),
     )
     (tree / "DEBIAN").chmod(0o755)
@@ -202,12 +252,45 @@ def self_test_listings():
     expect_fail("rpm without main", require_binaries, "rpm", rpm_names(f"/usr/bin/{WORKER}-old\n"))
 
 
+def self_test_upgrade_metadata():
+    control = (
+        "Package: rusty-conduit-gui\nVersion: 0.2.0\n"
+        f"Replaces: foo (<< 1), {LEGACY_PACKAGE}\nConflicts: bar | {LEGACY_PACKAGE}:amd64\n"
+        "Description: fixture\n continued line\n"
+    )
+    check_deb_upgrade("deb control", control)
+    for field in DEB_UPGRADE_FIELDS:
+        missing = "".join(
+            line + "\n" for line in control.splitlines() if not line.startswith(f"{field}:")
+        )
+        expect_fail(f"deb without {field}", check_deb_upgrade, "deb", missing)
+    # A longer name that merely starts with the legacy name does not replace it.
+    expect_fail(
+        "deb lookalike relation",
+        check_deb_upgrade,
+        "deb",
+        f"Replaces: {LEGACY_PACKAGE}-extra\nConflicts: {LEGACY_PACKAGE}\n",
+    )
+    # No real .rpm is built here (that needs rpmbuild); check_rpm feeds these same parsers.
+    listing = f"{LEGACY_PACKAGE}\nother < 2.0\n"
+    for field in RPM_UPGRADE_FIELDS:
+        require_replaces_legacy("rpm", field, rpm_relation_names(listing))
+        require_replaces_legacy("rpm", field, rpm_relation_names(f"{LEGACY_PACKAGE} < 0.2.0\n"))
+        expect_fail(f"rpm without {field}", require_replaces_legacy, "rpm", field, rpm_relation_names(""))
+        lookalike = rpm_relation_names(f"{LEGACY_PACKAGE}-old\n")
+        expect_fail(f"rpm lookalike {field}", require_replaces_legacy, "rpm", field, lookalike)
+
+
 def self_test_deb(root):
     if shutil.which("dpkg-deb") is None:
         print("self-test: dpkg-deb not found, real .deb check skipped")
         return
     check_deb(build_deb(root, "complete", [MAIN, WORKER]))
     expect_fail("real deb without worker", check_deb, build_deb(root, "partial", [MAIN]))
+    for field in DEB_UPGRADE_FIELDS:
+        others = tuple(f for f in DEB_UPGRADE_FIELDS if f != field)
+        fixture = build_deb(root, f"no-{field.lower()}", [MAIN, WORKER], others)
+        expect_fail(f"real deb without {field}", check_deb, fixture)
 
 
 def self_test_directories(root):
@@ -261,6 +344,7 @@ def self_test():
     with tempfile.TemporaryDirectory(prefix="conduit-smoke-") as temp:
         root = Path(temp)
         self_test_listings()
+        self_test_upgrade_metadata()
         self_test_deb(root)
         self_test_directories(root)
         self_test_checksums(root)

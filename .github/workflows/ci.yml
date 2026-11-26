@@ -11,9 +11,9 @@ permissions:
   contents: read
 
 env:
-  # Override with the repository variables UPSTREAM_REPO and UPSTREAM_REF.
-  UPSTREAM_REPO: ${{ vars.UPSTREAM_REPO || 'jpbaking/rusty-conduit-engine' }}
-  UPSTREAM_REF: ${{ vars.UPSTREAM_REF || 'v0.2.0' }}
+  # Cargo.toml pulls rusty-conduit-engine from its git tag (v0.2.0); fetching it with the
+  # git CLI is more reliable on CI runners than Cargo's built-in git client.
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -63,15 +63,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: rusty-conduit-gui
-          persist-credentials: false
-
-      # Cargo.toml depends on ../rusty-conduit-engine, so upstream must be a sibling directory.
-      - name: Check out upstream rusty-conduit-engine
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ env.UPSTREAM_REPO }}
-          ref: ${{ env.UPSTREAM_REF }}
-          path: rusty-conduit-engine
           persist-credentials: false
 
       - name: Set up Python

@@ -1,12 +1,12 @@
-# GOAL — U4 Import / Export
+# GOAL — U5 Packaging & Release
 
 ## Goal
-- Goal ID: 20261126-u4-import-export
-- Outcome: Complete Milestone U4 (`docs/MASTER-PLAN.md` §6.3, §9.2, §9.3 & §10 U4): AirSwitch / ZeroOmega / SwitchyOmega `.bak` import wizard (extracting inline passwords into Vault), CLI `config.toml` import & export for all 3 CLIs (`rusty-conduit`, `rusty-conduit-ssh`, `rusty-conduit-switch`, using `password_env` placeholders and never plaintext secrets), External TOML link mode with live debounced hot-reload, and backup format v2 (sealing Tunnels, Proxies, Profile Library, and vaulted upstream passwords, while importing v1 backups through §6.4 migration).
-- Done when: All Rust workspace tests (including new `conduit-core` AirSwitch/TOML tests, `conduit-runtime` External TOML watcher tests, `src-tauri` v2 backup & import/export tests, and updated `secret_leak_scan`), `clippy -D warnings`, Linux `conduit_check_tauri_tray` check, `check-pure-rust-crypto.py`, `validate-release-config.py`, `smoke-test-bundle.py --self-test`, and frontend (`npm run check && npm test && npm run build`) pass with zero errors.
+- Goal ID: 20261126-u5-packaging-release
+- Outcome: Complete Milestone U5 (`docs/MASTER-PLAN.md` §3.3 & §10 U5): add Linux `.deb`/`.rpm` package replacement metadata (`Replaces`/`Conflicts` and `Obsoletes`/`Conflicts` for `rusty-conduit-ssh-gui`) and Windows NSIS legacy `Rusty Conduit (SSH)` uninstall detection/prompt, bump release version to `0.2.0` across all manifests and lockfiles, update release validation/smoke-test scripts, CI/release workflows, `docs/RELEASING.md`, and `README.md`, and run the full low-disk verification suite.
+- Done when: All manifests/lockfiles report `0.2.0`, `.deb`/`.rpm` and NSIS §3.3 upgrade-path rules are configured and covered by `validate-release-config.py` and `smoke-test-bundle.py --self-test`, docs/workflows reflect `rusty-conduit-engine` `v0.2.0` and the unified GUI, and the full verification suite (`clippy -D warnings`, `cargo test --workspace`, `secret_leak_scan`, `conduit_check_tauri_tray`, `check-pure-rust-crypto.py`, `validate-release-config.py`, `smoke-test-bundle.py --self-test`, `npm run check && npm test && npm run build`) exits 0 with `rusty-conduit-gui --version` reporting `0.2.0`.
 - Goal status: completed
 - Goal status meaning: drafting | approved | executing | blocked-on-human | in-review | awaiting-acceptance | completed | abandoned
-- Last completed phase: phase-0005
+- Last completed phase: phase-0003
 
 ## Execution
 - Execution mode: delegated
@@ -18,43 +18,37 @@
 - Repository: yes
 - Strategy: isolated-branch
 - Starting branch: feat/one-gui
-- Work branch: goal/20261126-u4-import-export
-- Baseline commit: 566f3bd42110e23bbedefb6167a53e5db8a3bf3a
+- Work branch: goal/20261126-u5-packaging-release
+- Baseline commit: ccd7f76763d120da69bc799a4880f27147219e0b
 - Starting upstream at start: origin/feat/one-gui@5ad227c55f4815e91c3354f7736b6c105917bf28
 - Work upstream at start: none
 
 ## Phases
-- [done] phase-0001 — Add AirSwitch/ZeroOmega/SwitchyOmega .bak importer and 3-CLI config.toml import/export in conduit-core
-- [done] phase-0002 — Add External TOML link watcher in conduit-runtime and wire import/export/link IPC commands in src-tauri
-- [done] phase-0003 — Bump app backup format to v2 (Tunnels, Proxies, Profile Library, upstream passwords, v1 migration) and update secret_leak_scan
-- [done] phase-0004 — Build Svelte UI for Sidebar Import modal, full ProxyImportExportTab (incl. External TOML link), and v2 BackupSection
-- [done] phase-0005 — Rebuild src-tauri/ui/dist/ and run full low-disk verification suite
+- [done] phase-0001 — Add §3.3 deb/rpm/NSIS upgrade-path packaging metadata and bump release version to 0.2.0
+- [done] phase-0002 — Update release validation/smoke scripts, CI/release workflows, RELEASING.md, and README.md for v0.2.0
+- [done] phase-0003 — Rebuild src-tauri/ui/dist/ if needed and run full low-disk verification suite plus version check
 
 ## Handoff
 - Current position: completed
 - Next role: planner
 - Next action: none
-- Last verified evidence: User accepted U4 (#1); squashed into 1 commit on `goal/20261126-u4-import-export` and merged into `feat/one-gui`. Full verification exit 0 (clippy -D warnings clean, workspace Rust tests + secret_leak_scan 6/6 passed, conduit_check_tauri_tray clean, 3 Python checks OK, svelte-check 0/0, npm test 93/93, vite build ok).
+- Last verified evidence: User accepted U5 (#1); squashed into 1 commit on `goal/20261126-u5-packaging-release` and fast-forward merged into `feat/one-gui`. Gate D full verification exit 0 (clippy -D warnings clean, workspace tests + secret_leak_scan passed, conduit_check_tauri_tray clean, `rusty-conduit-gui --version` → `0.2.0`, 3 Python checks OK, svelte-check 0/0, npm test 93/93, vite build ok).
 - Blockers: none
 
 ## Review
 - Reviewed by: planner (primary session)
-- Verification result: Full verification exit 0 (clippy -D warnings clean, workspace Rust tests incl. conduit-core 133, conduit-runtime 91, gui lib 174, secret_leak_scan 6/6 passed, conduit_check_tauri_tray clean, check-pure-rust-crypto/validate-release-config/smoke-test-bundle OK, svelte-check 0/0, npm test 93/93, vite build ok; target 6.1G, 19G free)
-- Diff reviewed: 566f3bd42110..c95258b (34 changed files verified against phases 1–5 Scope: In; 0 scope drift; 16 matching Goal-ID commits, 0 foreign/merge commits)
+- Verification result: Full verification exit 0 (clippy -D warnings clean, workspace Rust tests + secret_leak_scan passed, conduit_check_tauri_tray clean, `rusty-conduit-gui 0.2.0`, check-pure-rust-crypto/validate-release-config/smoke-test-bundle OK, svelte-check 0/0, npm test 93/93, vite build ok; 139G free, target 6.8G)
+- Diff reviewed: ccd7f76763d1..bff2d49 (18 changed files across phases 1–3 + .goal-ledger/; 0 scope drift; 7 commits on goal branch, 0 foreign/merge commits)
 - Findings: none
 
 ## Log
-- created ledger with 5 phases for Milestone U4 (replacing completed U3 ledger `20261126-u3-manage-window-tray`, preserved in git history)
-- approved Gates A–C; created isolated branch `goal/20261126-u4-import-export` off `feat/one-gui` (`566f3bd42110`)
-- started Gate C and delegated `phase-0001` to `sub-u4-p1` (`claude --model opus --effort medium`)
-- phase-0001 done: added `airswitch_import.rs` + `toml_io.rs` to conduit-core (21 new tests); Verify passed after one clippy fix-up
-- planner verified phase-0001 independently (133/133 tests, clippy clean, PURE_RUST_CRYPTO_OK, scope clean), closed `sub-u4-p1`, and delegated `phase-0002` to `sub-u4-p2` (`claude --model opus --effort medium`)
-- phase-0002 done: added `toml_watcher.rs` + ProxyManager watcher wiring, `controller/import_export.rs`, and 8 U4 IPC commands (tests: runtime 91, gui lib 168); Verify passed with no fix-ups
-- planner verified phase-0002 independently (91+168 tests, clippy clean, scope clean), closed `sub-u4-p2`, and delegated `phase-0003` to `sub-u4-p3` (`claude --model opus --effort medium`)
-- phase-0003 done: backup format v2 in `export.rs` (v2 AADs, v1 import via §6.4 migration, Tunnels/Proxies/Profile Library + upstream password sealing/restoring, plain-import stripping/neutralizing, v2 counts, 6 new tests); `secret_leak_scan` checks `secret_count >= 4` and CLI TOML exports; Verify passed with no fix-ups
-- planner verified phase-0003 independently (174 lib + 6 leak-scan tests, clippy clean, scope clean), closed `sub-u4-p3`, and delegated `phase-0004` to `sub-u4-p4` (`claude --model opus --effort medium`)
-- phase-0004 done: U4 UI — wire types/api/mocks/store helpers, Sidebar `Import…` + ImportModal (.bak + 3-CLI config.toml), full ProxyImportExportTab (External TOML link/unlink/reload, TOML export preview/copy/save, .bak import into Proxy), v2 BackupSection counts; Verify passed with no fix-ups
-- planner verified phase-0004 independently (svelte-check 0/0, 93/93 tests, vite build ok, scope clean), closed `sub-u4-p4`, and delegated `phase-0005` to `sub-u4-p5` (`claude --model opus --effort medium`)
-- phase-0005 done: rebuilt `src-tauri/ui/dist/` (stale hashed assets removed) and full Verify passed with no fix-ups (target 6.1G, 19G free)
-- planner completed Gate D review: independent full verification exit 0, 0 scope drift across all 34 changed files, closed `sub-u4-p5`, set Goal status `awaiting-acceptance`
-- user accepted U4 (#1); squashed 17 commits into 1 commit on `goal/20261126-u4-import-export` and merged into `feat/one-gui`
+- created ledger with 3 phases for Milestone U5 (replacing completed U4 ledger `20261126-u4-import-export`, preserved in git history)
+- user approved Gates A–C; created isolated branch `goal/20261126-u5-packaging-release` off `feat/one-gui` (`ccd7f76763d120`)
+- started Gate C and delegated `phase-0001` to `sub-u5-p1` (`claude --model opus --effort medium`)
+- phase-0001 done: deb/rpm replacement metadata, NSIS legacy `Rusty Conduit (SSH)` uninstall prompt, version 0.2.0 in manifests/lockfiles; Verify exit 0 (NSIS not compiled locally: no `makensis`).
+- planner verified phase-0001 independently (`5073a41`, scope clean, checks exit 0), closed `sub-u5-p1`, and delegated `phase-0002` to `sub-u5-p2` (`claude --model opus --effort medium`)
+- phase-0002 done: validator enforces deb/rpm/NSIS §3.3 rules, smoke test checks .deb/.rpm replacement metadata, workflows drop sibling engine checkout, RELEASING.md/README updated for v0.2.0; Verify exit 0 (no real .rpm built locally: no rpm/rpmbuild).
+- planner verified phase-0002 independently (`aee4f33`, scope clean, checks exit 0), closed `sub-u5-p2`, and delegated `phase-0003` to `sub-u5-p3` (`claude --model opus --effort medium`)
+- phase-0003 done: full low-disk verification suite exit 0, `--version` reports 0.2.0, `src-tauri/ui/dist/` unchanged by build (no dist commit), 139G free / target 6.8G.
+- planner completed Gate D review: independent full verification exit 0, 0 scope drift across all 18 changed files, closed `sub-u5-p3`, set Goal status `awaiting-acceptance`
+- user accepted U5 (#1); squashed 8 commits into 1 commit on `goal/20261126-u5-packaging-release` and fast-forward merged into `feat/one-gui`

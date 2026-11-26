@@ -30,26 +30,20 @@ python3 scripts/validate-release-config.py
 
 Tags use the format `vX.Y.Z`, for example `v0.2.0`. The tag must point at the commit that contains the version bump.
 
-## 2. Sibling repository layout
+## 2. Engine dependency
 
-`Cargo.toml` depends on `rusty-conduit-ssh` by relative path, so both repositories must sit in the same parent directory:
+The workspace `Cargo.toml` pulls the shared engine, `rusty-conduit-engine`, from its pinned Git tag:
 
-```text
-parent/
-├── rusty-conduit-ssh/   # upstream engine
-└── rusty-conduit-gui/   # this repository
+```toml
+rusty-conduit-engine = { git = "https://github.com/jpbaking/rusty-conduit-engine", tag = "v0.2.0" }
 ```
 
-CI creates the same layout. Two optional GitHub repository variables choose what it checks out:
+No sibling checkout is needed, locally or in CI. Cargo fetches the tag on the first build, and `Cargo.lock` records the exact commit.
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `UPSTREAM_REPO` | `jpbaking/rusty-conduit-ssh` | Upstream repository |
-| `UPSTREAM_REF` | `v1.3.0` | Branch, tag, or commit to build against |
-
-**Pin `UPSTREAM_REF` to a tag or commit for a release.** The default follows `main`, so rebuilding the same tag later can produce different code.
-
-If the upstream repository is private, the workflows also need a checkout credential. They do not configure one today.
+- **To move to a new engine release,** change the `tag`, run `cargo update -p rusty-conduit-engine`, and commit both `Cargo.toml` and `Cargo.lock`.
+- **Release builds always use a tag,** never a branch, so rebuilding the same app tag later produces the same code.
+- The workflows set `CARGO_NET_GIT_FETCH_WITH_CLI=true`, so Cargo fetches the engine with the `git` command line. Set it locally too if Cargo's built-in Git client fails behind a proxy.
+- The old `UPSTREAM_REPO` and `UPSTREAM_REF` repository variables are no longer read. You can delete them.
 
 ## 3. Build locally
 
@@ -145,15 +139,23 @@ Linux builds run on Ubuntu 22.04, so the binaries link against its glibc (the co
 
 ## 7. Pre-release smoke-test checklist
 
-Automated checks confirm that the installers exist and contain both binaries. They do not launch the app, so test these by hand.
+Automated checks confirm that the installers exist, contain both binaries, and (for `.deb` and `.rpm`) replace `rusty-conduit-ssh-gui`. They do not launch the app, so test these by hand.
 
 ### All platforms
 
 - [ ] The app installs and launches, and the version is correct.
 - [ ] A vault can be created, locked, and unlocked.
+- [ ] **Upgrade from v0.1.0:** with `rusty-conduit-ssh-gui` installed and holding data, installing v0.2.0 replaces it. The first launch shows the rename banner, and the old vault, sessions, host-key pins, and presets load unchanged.
 - [ ] A direct SSH connection works, and an unknown host key prompts for approval.
 - [ ] A multi-hop connection works, and **Test Connection** names the failing hop when one is broken.
 - [ ] Forward and reverse proxies pass traffic.
+- [ ] The Manage Window shows both **Proxies** and **Tunnels**. A Proxy can be created, started, and stopped from each.
+- [ ] Each Proxy mode routes traffic: **Direct**, **Forward** (through an upstream profile or a Tunnel), **Auto Switch** (rules and the Route Tester agree), **PAC**, and **External TOML** (edits to the linked file are picked up).
+- [ ] Saving a routing change on a running Proxy applies it without dropping open connections.
+- [ ] An AirSwitch / ZeroOmega `.bak` file imports through the wizard.
+- [ ] A `config.toml` from each CLI (`rusty-conduit`, `rusty-conduit-ssh`, `rusty-conduit-switch`) imports, and export writes one back with no plaintext secrets.
+- [ ] A new backup uses format v2 and restores. A v1 backup from v0.1.0 imports and migrates.
+- [ ] The tray menu lists **PROXIES** and **TUNNELS** sections, and their start, stop, and mode actions work.
 - [ ] The OpenSSH engine starts `conduit-worker` and connects.
 - [ ] Closing the window keeps sessions running in the tray.
 - [ ] A second launch focuses the existing instance.
@@ -165,6 +167,7 @@ Automated checks confirm that the installers exist and contain both binaries. Th
 
 - [ ] The NSIS installer works per-user, without an admin prompt.
 - [ ] Upgrading over a running app stops the app and `conduit-worker`, then succeeds.
+- [ ] With `Rusty Conduit (SSH)` installed, the installer offers to uninstall it, and both answers leave a working install.
 - [ ] The `.msi` installs and uninstalls.
 - [ ] The signature is valid on signed builds (file Properties, Digital Signatures).
 - [ ] OpenSSH askpass and the named-pipe agent work on OpenSSH 8.4 or newer.
@@ -172,6 +175,7 @@ Automated checks confirm that the installers exist and contain both binaries. Th
 ### macOS (Apple silicon and Intel)
 
 - [ ] The `.dmg` mounts and the app runs on both architectures.
+- [ ] Replacing `Rusty Conduit (SSH).app` with the new app keeps the vault and sessions.
 - [ ] `lipo -archs` lists `x86_64 arm64` for the app and `conduit-worker`.
 - [ ] `spctl --assess --type execute` accepts signed and notarized builds.
 - [ ] The app runs from the tray without a Dock icon, and the Dock icon returns when the window opens.
@@ -180,7 +184,23 @@ Automated checks confirm that the installers exist and contain both binaries. Th
 
 - [ ] The `.deb` installs on Ubuntu 22.04 and Debian 12.
 - [ ] The `.rpm` installs on a current Fedora release.
+- [ ] `dpkg-deb -f` shows `Replaces` and `Conflicts`, and `rpm -qp --obsoletes` and `--conflicts` show `rusty-conduit-ssh-gui`. Installing over the old package removes it.
 - [ ] The `.AppImage` runs on the baseline.
 - [ ] The tray works on XFCE.
 - [ ] The app works on a Wayland session, including the no-tray fallback where no tray exists.
 - [ ] Without an unlocked Secret Service, the vault stays locked until the Master Password is entered, and never falls back to plaintext.
+
+## 8. Upgrading from v0.1.0 (`rusty-conduit-ssh-gui`)
+
+`v0.2.0` renames the app from **Rusty Conduit (SSH)** (`rusty-conduit-ssh-gui`) to **Rusty Conduit GUI** (`rusty-conduit-gui`). The installers handle the switch (MASTER-PLAN §3.3):
+
+| Platform | What happens |
+| --- | --- |
+| Linux `.deb` | The package declares `Replaces` and `Conflicts` on `rusty-conduit-ssh-gui`, so installing it removes the old package. |
+| Linux `.rpm` | The package declares `Obsoletes` and `Conflicts` on `rusty-conduit-ssh-gui`, so `dnf` replaces the old package. |
+| Windows NSIS | Before installing, the installer stops `rusty-conduit-gui.exe`, `rusty-conduit-ssh-gui.exe`, and `conduit-worker.exe`. If `Rusty Conduit (SSH)` is still installed, it offers to uninstall it. Silent installs skip the offer. |
+| macOS | The new `.app` has a new name. Users drag it to Applications and delete the old `Rusty Conduit (SSH).app`. The Keychain may ask once to let the renamed app read the vault key. |
+
+On first launch, the app **moves the old data directory** (vault, sessions, host-key pins, presets, and settings) to the new one and moves login autostart to the new name. It refuses to start while the old app is still running.
+
+`scripts/validate-release-config.py` checks this packaging config, and `scripts/smoke-test-bundle.py` checks the metadata inside the built `.deb` and `.rpm` files.
