@@ -4,7 +4,6 @@
   import HeaderBar from "./HeaderBar.svelte";
   import HostKeyModal from "./HostKeyModal.svelte";
   import HostProfilesView from "./HostProfilesView.svelte";
-  import ImportModal from "./ImportModal.svelte";
   import KeyVaultView from "./KeyVaultView.svelte";
   import LogDrawer from "./LogDrawer.svelte";
   import ModalDialog from "./ModalDialog.svelte";
@@ -20,7 +19,6 @@
 
   let copyFailed = $state(false);
   let wizardOpen = $state(false);
-  let importOpen = $state(false);
 
   /** A running Tunnel waiting for a host-key answer: the selected one first. */
   const tunnelHostKey = $derived.by<PendingHostKey | null>(() => {
@@ -60,7 +58,7 @@
 </script>
 
 <div class="shell">
-  <Sidebar onNewProxy={() => (wizardOpen = true)} onImport={() => (importOpen = true)} />
+  <Sidebar onNewProxy={() => (wizardOpen = true)} />
 
   <div class="workspace">
     {#if !store.trayAvailable && !store.trayBannerDismissed}
@@ -160,10 +158,6 @@
 
 {#if wizardOpen}
   <NewProxyWizardModal onClose={() => (wizardOpen = false)} />
-{/if}
-
-{#if importOpen}
-  <ImportModal onClose={() => (importOpen = false)} />
 {/if}
 
 {#if store.clipboardUrl}

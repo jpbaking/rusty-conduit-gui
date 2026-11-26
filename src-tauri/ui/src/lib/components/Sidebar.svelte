@@ -8,13 +8,11 @@
   import { proxyActive, proxyMode, proxyStatusOf } from "./ProxyEditor.svelte";
 
   interface Props {
-    /** Opens the New Proxy wizard. */
+    /** Opens the New Proxy wizard (including importing a backup or CLI config). */
     onNewProxy: () => void;
-    /** Opens the Import modal (`.bak` or CLI `config.toml`). */
-    onImport: () => void;
   }
 
-  let { onNewProxy, onImport }: Props = $props();
+  let { onNewProxy }: Props = $props();
 
   const NAV: { view: NavView; label: string; also?: NavView[] }[] = [
     { view: "hosts", label: "Host Profiles" },
@@ -151,7 +149,6 @@
       <div class="list-head">
         <h2 id="sidebar-proxies">Proxies</h2>
         <span class="list-actions">
-          <button class="small" onclick={onImport} title="Import an AirSwitch .bak or a CLI config.toml">Import…</button>
           <button class="primary small" onclick={onNewProxy}>+ New Proxy</button>
         </span>
       </div>
