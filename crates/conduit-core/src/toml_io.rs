@@ -1,6 +1,6 @@
 //! `conduit-core` — import and export of the three CLIs' `config.toml` files.
 //!
-//! See `docs/MASTER-PLAN.md` section 9.3. The file shapes mirror each CLI's `FileConfig`
+//! The file shapes mirror each CLI's `FileConfig`
 //! (unknown keys are rejected, as the CLIs do):
 //!
 //! | CLI | Import | Export |
@@ -169,8 +169,6 @@ struct MitmFile {
     /// `cert_cache_max_entries` in `rusty-conduit` / `-ssh`, `cert_cache_max` in `-switch`.
     #[serde(default, skip_serializing_if = "Option::is_none", alias = "cert_cache_max")]
     cert_cache_max_entries: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    socks_block_web: Option<bool>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -190,8 +188,6 @@ struct SwitchMitmFile {
     cert_ttl: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cert_cache_max: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    socks_block_web: Option<bool>,
 }
 
 impl From<SwitchMitmFile> for MitmFile {
@@ -204,7 +200,6 @@ impl From<SwitchMitmFile> for MitmFile {
             ca_passphrase_file: m.ca_passphrase_file,
             cert_ttl: m.cert_ttl,
             cert_cache_max_entries: m.cert_cache_max,
-            socks_block_web: m.socks_block_web,
         }
     }
 }
@@ -219,7 +214,6 @@ impl From<MitmFile> for SwitchMitmFile {
             ca_passphrase_file: m.ca_passphrase_file,
             cert_ttl: m.cert_ttl,
             cert_cache_max: m.cert_cache_max_entries,
-            socks_block_web: m.socks_block_web,
         }
     }
 }
@@ -579,7 +573,6 @@ fn mitm_to_file(mitm: &MitmConfig, notes: &mut Vec<String>) -> MitmFile {
     MitmFile {
         cert_ttl: Some(format_duration(mitm.cert_ttl)),
         cert_cache_max_entries: Some(mitm.cert_cache_max_entries),
-        socks_block_web: Some(mitm.socks_block_web),
         ..MitmFile::default()
     }
 }
@@ -668,8 +661,7 @@ pub fn import_rusty_conduit_toml(
     const CLI: &str = "rusty-conduit";
     let f: ConduitFile = parse_file(CLI, toml_str)?;
     let mut warnings = Vec::new();
-    let socks_block_web =
-        f.socks_block_web.or(f.mitm.as_ref().and_then(|m| m.socks_block_web)).unwrap_or(false);
+    let socks_block_web = f.socks_block_web.unwrap_or(false);
     let proxy = Proxy {
         name: name.to_string(),
         listeners: listeners_of(f.bind, f.http_port, f.socks_port, f.max_connections),
@@ -912,8 +904,7 @@ pub fn import_rusty_conduit_ssh_toml(
 
     let listeners = listeners_of(f.bind, f.http_port, f.socks_port, f.max_connections);
     let filter = filter_of(CLI, f.allow, f.block)?;
-    let socks_block_web =
-        f.socks_block_web.or(f.mitm.as_ref().and_then(|m| m.socks_block_web)).unwrap_or(false);
+    let socks_block_web = f.socks_block_web.unwrap_or(false);
     let mitm = mitm_of(f.mitm, &mut warnings);
     let proxy = if listeners.http_port == 0 && listeners.socks_port == 0 {
         if !filter_is_off(&filter) || mitm.is_some() {
@@ -1185,8 +1176,7 @@ pub fn import_rusty_conduit_switch_toml(
     let network = network_of(CLI, &f.connect_timeout, &ka.idle, &ka.interval, ka.retries)?;
     let filter = f.filter.unwrap_or_default();
     let filter = filter_of(CLI, filter.allow, filter.block)?;
-    let socks_block_web =
-        f.socks_block_web.or(f.mitm.as_ref().and_then(|m| m.socks_block_web)).unwrap_or(false);
+    let socks_block_web = f.socks_block_web.unwrap_or(false);
     let mitm = mitm_of(f.mitm.map(MitmFile::from), &mut warnings);
 
     let mut aliases = BTreeMap::new();
@@ -1661,6 +1651,23 @@ inherit = true
         assert!(!out.toml.contains("\nca_cert"));
         assert!(out.notes.iter().any(|n| n.contains("MITM")));
         assert!(out.toml.contains("# Setup notes:"));
+    }
+
+    #[test]
+    fn toml_io_socks_block_web_is_top_level_only() {
+        let mut proxy = direct_proxy();
+        proxy.mitm = Some(MitmConfig { socks_block_web: true, ..MitmConfig::default() });
+        let out = export_rusty_conduit_toml(&proxy).unwrap();
+        let table: toml::Table = out.toml.parse().unwrap();
+        assert_eq!(table.get("socks_block_web"), Some(&toml::Value::Boolean(true)));
+        let mitm = table.get("mitm").and_then(toml::Value::as_table).unwrap();
+        assert!(!mitm.contains_key("socks_block_web"), "{}", out.toml);
+        // The CLIs retired `[mitm] socks_block_web`; importing it is an error, as in the CLIs.
+        let legacy =
+            CONDUIT_TOML.replace("cert_ttl = \"1h\"\n", "cert_ttl = \"1h\"\nsocks_block_web = true\n");
+        assert_ne!(legacy, CONDUIT_TOML);
+        let err = import_rusty_conduit_toml(&legacy, "legacy").unwrap_err().to_string();
+        assert!(err.contains("socks_block_web"), "{err}");
     }
 
     #[test]
