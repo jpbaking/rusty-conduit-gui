@@ -220,7 +220,7 @@ def check_ci(document, errors):
         errors.append("ci.yml: rust-and-e2e must check out the repository")
     steps = rust.get("steps", []) if isinstance(rust, dict) else []
     paths = {(step.get("with") or {}).get("path") for step in steps if isinstance(step, dict)}
-    if not {"rusty-conduit-gui", "rusty-conduit-ssh"} <= paths:
+    if not {"rusty-conduit-gui", "rusty-conduit-engine"} <= paths:
         errors.append("ci.yml: rust-and-e2e must check out both sibling repositories")
 
 

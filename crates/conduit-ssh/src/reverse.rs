@@ -5,7 +5,6 @@ use std::net::SocketAddr;
 
 use russh::client::Msg;
 use russh::Channel;
-use rusty_conduit_ssh::ssh::ReverseForward;
 use thiserror::Error;
 use tokio::io::copy_bidirectional;
 use tokio::net::TcpStream;
@@ -23,16 +22,6 @@ pub struct RemoteForward {
     /// Destination host, resolved by this machine. A name or an IP literal.
     pub host: String,
     pub port: u16,
-}
-
-impl From<&ReverseForward> for RemoteForward {
-    fn from(forward: &ReverseForward) -> Self {
-        Self {
-            remote: forward.remote,
-            host: forward.local.ip().to_string(),
-            port: forward.local.port(),
-        }
-    }
 }
 
 /// A reverse forward could not be established.

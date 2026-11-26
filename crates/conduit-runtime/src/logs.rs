@@ -405,7 +405,7 @@ mod tests {
 
     #[test]
     fn logs_writer_plugs_into_the_engine_logger() {
-        use rusty_conduit_ssh::logging::{LogLevel, Logger};
+        use rusty_conduit_engine::logging::{LogLevel, Logger};
         let ring = LogRingBuffer::new(4);
         let logger = Logger::with_writer(LogLevel::Info, Box::new(ring.writer()));
         logger.info("engine password=hunter2");

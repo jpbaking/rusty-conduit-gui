@@ -7,6 +7,7 @@ pub mod agent_server;
 pub mod askpass;
 pub mod binary;
 pub mod config;
+pub mod dialer;
 pub mod env;
 pub mod known_hosts;
 pub mod orphan;
@@ -19,6 +20,7 @@ pub use binary::{
     check_openssh_binary, check_version_for_platform, parse_openssh_version, version_note,
     OpenSshBinaryInfo, FORCED_ASKPASS_VERSION, MIN_VERSION, MIN_WINDOWS_VERSION,
 };
+pub use dialer::{OpenSshDialer, TunnelState};
 pub use config::{
     hop_alias, render_config, write_config, ConfigError, ConfigHop, SessionConfig, WriteConfigError,
 };

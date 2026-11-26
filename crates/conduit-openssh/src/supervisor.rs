@@ -9,7 +9,6 @@ use std::time::{Duration, Instant};
 
 use conduit_core::KnownHostsStore;
 use conduit_ssh::ScopedAgent;
-use rusty_conduit_ssh::net::TunnelState;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -19,6 +18,7 @@ use tokio::task::JoinHandle;
 use zeroize::Zeroizing;
 
 use crate::agent_server::IsolatedAgentServer;
+use crate::dialer::TunnelState;
 use crate::askpass::AskpassServer;
 use crate::binary::check_openssh_binary;
 use crate::config::{hop_alias, write_config, ConfigHop, SessionConfig, WriteConfigError};

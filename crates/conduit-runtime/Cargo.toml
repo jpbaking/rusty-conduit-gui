@@ -10,7 +10,7 @@ conduit-core = { path = "../conduit-core" }
 conduit-openssh = { path = "../conduit-openssh" }
 conduit-ssh = { path = "../conduit-ssh" }
 conduit-vault = { path = "../conduit-vault" }
-rusty-conduit-ssh = { workspace = true }
+rusty-conduit-engine = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

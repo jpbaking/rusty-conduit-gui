@@ -6,7 +6,7 @@ description = "UI-agnostic data model, validation, config mapping, and atomic pe
 license = "BSD-3-Clause"
 
 [dependencies]
-rusty-conduit-ssh = { workspace = true }
+rusty-conduit-engine = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

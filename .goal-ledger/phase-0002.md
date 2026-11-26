@@ -1,39 +1,50 @@
-# phase-0002 — Implement §3.3 one-time upgrade migration (data-dir, autostart, single-instance, banner)
+# phase-0002 — Port conduit-ssh and conduit-openssh to rusty-conduit-engine
 
 - Status: done
-- Owner: planner
+- Owner: executor
 - Depends on: phase-0001
-- Goal: Implement `src-tauri/src/migration.rs` and wire it into startup and the Manage Window UI to migrate v0.1.0 `io.github.rusty-conduit-ssh-gui` data directories and login autostart entries, refuse startup if the old `Rusty Conduit (SSH)` is still running, log the migration, and display a one-time notice banner.
-- Done when: Unit tests for fresh install, same-volume upgrade, cross-volume copy-verify-remove, non-empty new dir (no merge + notice), autostart migration, and old-app-running guard all pass, and frontend checks/tests/build pass.
-- Pattern to follow: `src-tauri/src/window.rs:20-62` and `src-tauri/ui/src/lib/components/App.svelte:47-58`
+- Goal: Port `conduit-ssh` (`RusshDialer` & `StatsDialer` returning `UpstreamStream::Boxed` without loopback bridges) and `conduit-openssh` (`TunnelState` + `OpenSshDialer` delegating to `rusty_conduit_engine::upstream::Socks5Dialer`) onto `rusty-conduit-engine`.
+- Done when: `conduit-ssh` and `conduit-openssh` have zero `rusty_conduit_ssh` references, no loopback bridge in `dialer.rs` or `stats.rs`, and pass `cargo test` and `cargo clippy -D warnings`.
+- Pattern to follow: `../rusty-conduit-engine/src/upstream/mod.rs:53-164` (`UpstreamStream::boxed`, `UpstreamDialer`, `DialError`), `../rusty-conduit-engine/src/upstream/socks5.rs:28-97` (`Socks5Dialer`)
 
 ## Context
-Changing the bundle identifier from `io.github.rusty-conduit-ssh-gui` to `io.github.rusty-conduit-gui` moves Tauri's `app_data_dir()`. Per MASTER-PLAN §3.3, before `AppController::open` opens any store: (1) refuse to start with a clear error if the old `rusty-conduit-ssh-gui` process is still running, (2) move the old data dir to the new path if new does not exist (atomic rename, with copy-verify-remove fallback across volumes, preserving owner-only `0o700`/`0o600` permissions on Unix; never merge into a non-empty new dir — surface a notice instead), (3) migrate enabled login autostart from `rusty-conduit-ssh-gui` to `rusty-conduit-gui` and remove the old entry, (4) leave `conduit-vault` keyring entries untouched, and (5) log and show a one-time `"Rusty Conduit (SSH) is now Rusty Conduit GUI"` banner in the Manage Window.
+- `rusty_conduit_engine::upstream::UpstreamDialer` returns `DialFuture<'_>` (`Pin<Box<dyn Future<Output = io::Result<UpstreamStream>> + Send + 'a>>`) and also requires `fn redacted_upstream(&self) -> String`.
+- `RusshDialer` (`crates/conduit-ssh/src/dialer.rs`) no longer needs `loopback_pair()`, `accept_verified()`, or a per-dial `tokio::spawn(copy_bidirectional(...))` relay: `channel.into_stream()` implements `AsyncRead + AsyncWrite + Send + Unpin + 'static`, so return `Ok(UpstreamStream::boxed(channel.into_stream()))` directly. Keep `map_open_error` producing the exact `io::ErrorKind`s (`ConnectionRefused`, `PermissionDenied`, `Other`, `NotConnected`) and `TimedOut` for dial timeouts. Return `"ssh-tunnel".to_string()` from `redacted_upstream()`.
+- `StatsDialer` (`crates/conduit-ssh/src/stats.rs`) also drops `loopback_pair()` and the relay task: change `CountingStream` to hold `inner: UpstreamStream`, `stats: Arc<AtomicStats>`, and `_guard: ActiveGuard`, and return `Ok(UpstreamStream::boxed(CountingStream { inner: upstream, stats, _guard: guard }))`. Delegate `redacted_upstream()` to `self.inner.redacted_upstream()`.
+- `crates/conduit-ssh/src/reverse.rs` drops `use rusty_conduit_ssh::ssh::ReverseForward;` and `impl From<&ReverseForward> for RemoteForward`.
+- `crates/conduit-openssh`: define and export `pub enum TunnelState { Connecting, Ready(SocketAddr), Disconnected(String) }` and `pub struct OpenSshDialer` (holding `watch::Receiver<TunnelState>`). When `TunnelState::Ready(addr)`, delegate to `rusty_conduit_engine::upstream::Socks5Dialer::new(addr.ip().to_string(), addr.port()).connect(host, port, timeout)`; when `Connecting` or `Disconnected(reason)`, return `DialError::NotConnected { kind: io::ErrorKind::NotConnected, message }.into_io()`. Implement `redacted_upstream()` returning `format!("socks5://{addr}")` when `Ready(addr)` else `"ssh-tunnel".to_string()`.
+- Always use `CARGO_NET_GIT_FETCH_WITH_CLI=true` when running cargo commands.
 
 ## Scope
-- In: `src-tauri/src/migration.rs`, `src-tauri/src/lib.rs`, `src-tauri/src/window.rs`, `src-tauri/src/commands.rs`, `src-tauri/ui/src/lib/types.ts`, `src-tauri/ui/src/lib/stores.svelte.ts`, `src-tauri/ui/src/lib/components/App.svelte`, `src-tauri/ui/src/lib/mock.ts`
-- Out: `crates/conduit-vault/**`, `scripts/**`, `.github/**`, `docs/**`
+- In: `crates/conduit-ssh/Cargo.toml`, `crates/conduit-ssh/src/dialer.rs`, `crates/conduit-ssh/src/stats.rs`, `crates/conduit-ssh/src/reverse.rs`, `crates/conduit-ssh/tests/loopback_multihop.rs`, `crates/conduit-openssh/Cargo.toml`, `crates/conduit-openssh/src/lib.rs`, `crates/conduit-openssh/src/supervisor.rs`, `crates/conduit-openssh/src/dialer.rs` (new, or in `supervisor.rs`), `crates/conduit-openssh/tests/openssh_loopback.rs`, `Cargo.lock`
+- Out: `Cargo.toml`, `crates/conduit-core/`, `crates/conduit-runtime/`, `crates/conduit-tray/`, `crates/conduit-vault/`, `src-tauri/`, `.github/`, `scripts/`, `docs/`
 
 ## Sub-tasks
-1. [done] Create `src-tauri/src/migration.rs` with testable data-dir migration (atomic rename + cross-volume copy-verify-remove fallback + Unix owner-only permissions + non-empty new dir conflict notice), autostart migration helper, and cross-name old-instance running check — done when: `CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test -p rusty-conduit-gui migration::` passes with tests for all 6 scenarios (fresh install, same-volume upgrade, cross-volume fallback, non-empty new dir, autostart migration, old app running)
-2. [done] Wire migration startup hook in `src-tauri/src/lib.rs` (before `AppController::open`), record migration outcome in diagnostic log, and pass one-time banner notice through `ShellState` / `ShellSnapshot` (`src-tauri/src/window.rs`) — done when: `CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test -p rusty-conduit-gui` passes
-3. [done] Render dismissible migration info/warning banner in `src-tauri/ui/src/lib/components/App.svelte` wired via `types.ts`, `stores.svelte.ts`, and `mock.ts` — done when: `(cd src-tauri/ui && npm run check && npm test && npm run build)` passes
+1. [done] Switch `crates/conduit-ssh/Cargo.toml` to `rusty-conduit-engine = { workspace = true }`, refactor `crates/conduit-ssh/src/dialer.rs` to implement `rusty_conduit_engine::upstream::UpstreamDialer` returning `UpstreamStream::boxed(channel.into_stream())` (removing `loopback_pair`, `accept_verified`, and the bridge task), and update its unit tests — done when: `dialer.rs` has no `loopback_pair` or `TcpListener` bridge and compiles cleanly.
+2. [done] Refactor `crates/conduit-ssh/src/stats.rs` to wrap `UpstreamStream` + `ActiveGuard` directly in `CountingStream` returning `UpstreamStream::boxed(...)` (dropping `loopback_pair` and the spawned bridge task), and remove `rusty_conduit_ssh::ssh::ReverseForward` from `crates/conduit-ssh/src/reverse.rs` — done when: `stats.rs` and `reverse.rs` have zero `rusty_conduit_ssh` references and no loopback bridge.
+3. [done] Port `crates/conduit-ssh/tests/loopback_multihop.rs` to `rusty_conduit_engine` (`RoutingState::from_input` + `DialerOptions::default().with_external("ssh-tunnel", dialer)` + `EngineHandlers::from_routing` for forward proxy; direct-egress engine `Server` on ephemeral loopback ports for the reverse proxy test) — done when: `CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test -p conduit-ssh` passes all unit and E2E tests.
+4. [done] Switch `crates/conduit-openssh/Cargo.toml` to `rusty-conduit-engine = { workspace = true }`, define and export `TunnelState` and `OpenSshDialer` (backed by `rusty_conduit_engine::upstream::Socks5Dialer`), update `supervisor.rs` and `tests/openssh_loopback.rs`, and add unit tests for `OpenSshDialer` (`Connecting`, `Disconnected`, `Ready`) — done when: `CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test -p conduit-openssh` passes all tests.
+5. [done] Run `## Verify` and record observed results in `## Evidence` — done when: all tests, clippy `-D warnings`, and grep check exit 0.
 
 ## Verify
 ```sh
-CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test -p rusty-conduit-gui && CARGO_NET_GIT_FETCH_WITH_CLI=true cargo clippy -p rusty-conduit-gui --all-targets -- -D warnings && (cd src-tauri/ui && npm run check && npm test && npm run build)
+CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test -p conduit-ssh -p conduit-openssh && CARGO_NET_GIT_FETCH_WITH_CLI=true cargo clippy -p conduit-ssh -p conduit-openssh --all-targets -- -D warnings && ! git grep -n "rusty.conduit.ssh" -- crates/conduit-ssh/ crates/conduit-openssh/
 ```
 
 ## Escalate when
-- Cross-platform single-instance detection requires a new non-pure-Rust or platform-breaking crate → stop, set `Status: needs-human — reason: <constraint>`
+- `russh::ChannelStream` fails `AsyncRead + AsyncWrite + Send + Unpin + 'static` bounds for `UpstreamStream::boxed` → stop, set Status: needs-human — reason: ChannelStream trait bound mismatch
+- Any `loopback_multihop` or `openssh_loopback` test fails for a reason outside the engine API migration → stop, set Status: needs-human — reason: describe the failing test and error
 
 ## Log
 - (append-only, one line per event)
-- began phase-0002
-- sub-tasks 1–3 done & verified: implemented `src-tauri/src/migration.rs` (6 unit tests), wired startup hook & `UiEvent::MigrationNotice` banner in `lib.rs`, `window.rs`, and Svelte UI; tests, clippy `-D warnings`, and frontend build all passed
+- sub-task 1: switched both Cargo.toml deps to `rusty-conduit-engine`; `RusshDialer` now returns `UpstreamStream::boxed(channel.into_stream())`, removed `loopback_pair`/`accept_verified`/relay and their 2 tests, added `redacted_upstream()` = "ssh-tunnel" + test
+- sub-task 2: `StatsDialer` wraps `UpstreamStream` + `ActiveGuard` in `CountingStream` returned boxed (no relay), delegates `redacted_upstream()`; removed `ReverseForward` import and `From` impl from reverse.rs
 
 ## Evidence
 - (append-only: command → observed result)
-- `CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test -p rusty-conduit-gui` → 132 passed, 0 failed (including 6/6 `migration::tests::*`)
-- `CARGO_NET_GIT_FETCH_WITH_CLI=true cargo clippy -p rusty-conduit-gui --all-targets -- -D warnings` → exit 0
-- `cd src-tauri/ui && npm run check && npm test && npm run build` → `svelte-check` 0 errors/0 warnings, 78/78 tests passed, `vite build` succeeded
+- `grep -n "loopback_pair\|TcpListener\|copy_bidirectional" crates/conduit-ssh/src/dialer.rs` → no output; `cargo check -p conduit-ssh --lib --tests` → lib compiles (only errors in tests/loopback_multihop.rs, sub-task 3); ChannelStream satisfied `UpstreamStream::boxed` bounds
+- `grep -n "rusty_conduit_ssh\|loopback_pair" crates/conduit-ssh/src/{stats,reverse}.rs` → no output; `cargo test -p conduit-ssh --lib` → ok. 58 passed; 0 failed
+- `CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test -p conduit-ssh` → lib ok. 58 passed; loopback_multihop ok. 12 passed; doc ok. 0 passed
+- `CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test -p conduit-openssh` → lib ok. 57 passed; openssh_loopback ok. 6 passed (real /usr/bin/ssh); bin/doc 0
+- `## Verify` block → tests: 57+6+58+12 passed, 0 failed; clippy `-D warnings` → Finished, no warnings; `! git grep -n "rusty.conduit.ssh" -- crates/conduit-ssh/ crates/conduit-openssh/` → no matches; overall exit 0
+- `cargo check -p conduit-runtime` → 7 errors (expected; phase-0003)

@@ -1,22 +1,69 @@
-//! `conduit-core` — validation of a [`SessionProfile`] before it is mapped into a
-//! `rusty_conduit_ssh::config::Config`.
+//! `conduit-core` — validation of a [`SessionProfile`] before it is mapped into an
+//! [`crate::EngineConfig`] for `rusty_conduit_engine`.
 //!
-//! This mirrors the `FATAL` rules in [`rusty_conduit_ssh::config::Config::validate`], plus
-//! parsing of the human-friendly string fields (`ip_version`, `level`, `format`) and the
-//! `rusty-conduit-ssh` filter syntax that this crate stores as strings.
+//! This mirrors the `FATAL` rules the `rusty-conduit` CLI family applies to its configuration,
+//! plus parsing of the human-friendly string fields (`ip_version`, `level`, `format`) and the
+//! `rusty-conduit-engine` filter syntax that this crate stores as strings.
 
+use std::fmt;
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::time::Duration;
 
-use rusty_conduit_ssh::config::{
-    MAX_TCP_KEEPALIVE_DURATION, MAX_TCP_KEEPALIVE_RETRIES, MIN_MITM_CERT_TTL, SshIpVersion,
-};
-use rusty_conduit_ssh::filter::FilterRule;
-use rusty_conduit_ssh::logging::{LogFormat, LogLevel};
+use rusty_conduit_engine::filter::FilterRule;
+use rusty_conduit_engine::logging::{LogFormat, LogLevel};
+use rusty_conduit_engine::mitm::MIN_MITM_CERT_TTL;
 use thiserror::Error;
 
 use crate::{ForwardDirection, ForwardPreset, PortForward, SessionProfile};
+
+/// Largest accepted TCP keepalive idle time / probe interval (Linux caps both at 32767s).
+pub(crate) const MAX_TCP_KEEPALIVE_DURATION: Duration = Duration::from_secs(32_767);
+/// Largest accepted TCP keepalive probe count (Linux caps `TCP_KEEPCNT` at 127).
+pub(crate) const MAX_TCP_KEEPALIVE_RETRIES: u32 = 127;
+
+/// IP family used to reach the SSH target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SshIpVersion {
+    /// Force IPv4.
+    V4,
+    /// Force IPv6.
+    V6,
+    /// Let the resolver choose.
+    Auto,
+}
+
+impl SshIpVersion {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::V4 => "4",
+            Self::V6 => "6",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+impl fmt::Display for SshIpVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for SshIpVersion {
+    type Err = String;
+
+    /// Case-insensitive: `4`/`v4`/`ipv4`, `6`/`v6`/`ipv6`, or `auto`/`any`.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "4" | "v4" | "ipv4" => Ok(Self::V4),
+            "6" | "v6" | "ipv6" => Ok(Self::V6),
+            "auto" | "any" => Ok(Self::Auto),
+            _ => Err(format!(
+                "invalid SSH IP version {s:?} (expected 4, 6, or auto)"
+            )),
+        }
+    }
+}
 
 /// Errors raised when a [`SessionProfile`] fails validation. Every variant is `FATAL`.
 #[derive(Debug, Error)]
@@ -257,9 +304,9 @@ fn tcp_keepalive(profile: &SessionProfile) -> Result<(), ValidateError> {
 
 /// Validate a [`SessionProfile`], returning the first `FATAL` problem found.
 ///
-/// The rules here are a faithful port of [`rusty_conduit_ssh::config::Config::validate`],
-/// extended to parse the string-encoded fields this crate stores (`ip_version`, `level`,
-/// `format`) and the `rusty-conduit-ssh` filter syntax.
+/// The rules here are a faithful port of the `rusty-conduit` CLI family's configuration
+/// validation, extended to parse the string-encoded fields this crate stores (`ip_version`,
+/// `level`, `format`) and the `rusty-conduit-engine` filter syntax.
 pub fn validate(profile: &SessionProfile) -> Result<(), ValidateError> {
     // At least one listener must be enabled.
     if !forward_enabled(profile)
@@ -326,7 +373,7 @@ pub fn validate(profile: &SessionProfile) -> Result<(), ValidateError> {
         return Err(ValidateError::ConflictingFilter { scope: "reverse" });
     }
 
-    // Every filter rule must parse as a `rusty-conduit-ssh` `FilterRule`.
+    // Every filter rule must parse as a `rusty-conduit-engine` `FilterRule`.
     for rule in &profile.forward.allow {
         if let Err(message) = FilterRule::from_str(rule) {
             return Err(ValidateError::InvalidFilterRule {

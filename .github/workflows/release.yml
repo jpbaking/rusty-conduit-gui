@@ -15,8 +15,8 @@ permissions:
 
 env:
   # Override with the repository variables UPSTREAM_REPO and UPSTREAM_REF.
-  UPSTREAM_REPO: ${{ vars.UPSTREAM_REPO || 'jpbaking/rusty-conduit-ssh' }}
-  UPSTREAM_REF: ${{ vars.UPSTREAM_REF || 'v1.3.0' }}
+  UPSTREAM_REPO: ${{ vars.UPSTREAM_REPO || 'jpbaking/rusty-conduit-engine' }}
+  UPSTREAM_REF: ${{ vars.UPSTREAM_REF || 'v0.2.0' }}
   TAURI_CLI_VERSION: 2.12.6
   CARGO_TERM_COLOR: always
 
@@ -91,13 +91,13 @@ jobs:
           path: rusty-conduit-gui
           persist-credentials: false
 
-      # Cargo.toml depends on ../rusty-conduit-ssh, so upstream must be a sibling directory.
-      - name: Check out upstream rusty-conduit-ssh
+      # Cargo.toml depends on ../rusty-conduit-engine, so upstream must be a sibling directory.
+      - name: Check out upstream rusty-conduit-engine
         uses: actions/checkout@v4
         with:
           repository: ${{ env.UPSTREAM_REPO }}
           ref: ${{ env.UPSTREAM_REF }}
-          path: rusty-conduit-ssh
+          path: rusty-conduit-engine
           persist-credentials: false
 
       - name: Set up Python

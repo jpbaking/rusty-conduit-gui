@@ -6,6 +6,7 @@
 //! Secrets are read from the vault on every connect attempt and are not kept between attempts,
 //! so locking the vault also stops future reconnects.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -13,12 +14,12 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
 use conduit_core::{
-    to_config, validate, AuthMethod, ForwardDirection, HostKeyLookup, KnownHostsStore,
+    to_engine_config, validate, AuthMethod, EngineConfig, ForwardDirection, HostKeyLookup, KnownHostsStore,
     PortForward, SessionProfile, SshEngine,
 };
 use conduit_openssh::{
-    check_openssh_binary, render_known_hosts, LogFn, OpenSshError, OpenSshSupervisor,
-    SupervisorHop, SupervisorOptions,
+    check_openssh_binary, render_known_hosts, LogFn, OpenSshDialer, OpenSshError,
+    OpenSshSupervisor, SupervisorHop, SupervisorOptions, TunnelState,
 };
 use conduit_ssh::{
     connect_chain, reverse_policy, AtomicStats, ChainOptions, ChannelPolicy, DisconnectEvent,
@@ -26,15 +27,14 @@ use conduit_ssh::{
     RusshDialer, ScopedAgent, SignAudit, SignAuditFn, SshError, StatsDialer,
 };
 use conduit_vault::{import_key, Vault, VaultError};
-use rusty_conduit_ssh::build_engines;
-use rusty_conduit_ssh::config::Config;
-use rusty_conduit_ssh::logging::{AccessLogConfig, AccessLogger, Logger};
-use rusty_conduit_ssh::mitm::MitmState;
-use rusty_conduit_ssh::net::{FilteredDialer, Socks5UpstreamDialer, TunnelState, UpstreamDialer};
-use rusty_conduit_ssh::reverse::ReverseProxy;
-use rusty_conduit_ssh::ssh::ReverseForward;
-use rusty_conduit_ssh::server::{ProtocolHandlers, Server, ShutdownReport};
-use rusty_conduit_ssh::EngineHandlers;
+use rusty_conduit_engine::logging::{AccessLogConfig, AccessLogger, Logger, ProxyDirection};
+use rusty_conduit_engine::mitm::MitmState;
+use rusty_conduit_engine::routing::{
+    OneOrMany, ProfileConfig, ProfileType, RoutingConfig, RoutingInput, RoutingSetupError,
+    RoutingState, SharedRouting, DEFAULT_CONNECT_TIMEOUT,
+};
+use rusty_conduit_engine::server::{EngineHandlers, ProtocolHandlers, Server, ShutdownReport};
+use rusty_conduit_engine::upstream::{DialerOptions, UpstreamDialer};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, Instant};
@@ -43,8 +43,8 @@ use zeroize::Zeroizing;
 
 use crate::backoff::Backoff;
 use crate::logs::LogRingBuffer;
-use crate::mitm_ca_file::MitmCaFile;
 use crate::port_forward::{self, LocalForwards, SharedForwards};
+use crate::reverse::{ReverseForward, ReverseProxy};
 use crate::state::{HostKeyPrompt, ListenerInfo, SessionState, StateCell};
 
 /// Queued inbound reverse channels per connection.
@@ -53,6 +53,9 @@ const REVERSE_CHANNEL_CAPACITY: usize = 64;
 const LIVENESS_POLL: Duration = Duration::from_secs(1);
 /// A session has two forward ports, so a third pick is always different.
 const SOCKS_PORT_ATTEMPTS: usize = 3;
+/// The API-only `external` engine profile that carries all forward traffic through the SSH
+/// tunnel. Never shown in logs (routing fields are disabled).
+const TUNNEL_PROFILE: &str = "ssh-tunnel";
 
 pub(crate) type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub(crate) type SharedVault = Arc<RwLock<Vault>>;
@@ -543,6 +546,47 @@ impl Engine for DefaultEngine {
     }
 }
 
+/// Access-log settings: no `rule` / `profile` / `upstream` fields (there is no user-visible
+/// routing); each record is tagged with its `direction` by the logger clones.
+fn access_log_config(cfg: &EngineConfig) -> AccessLogConfig {
+    AccessLogConfig::new(
+        cfg.log_level,
+        cfg.log_format,
+        cfg.http_access_log.clone(),
+        cfg.socks_log.clone(),
+    )
+    .with_routing_fields(false)
+}
+
+/// Forward routing: every request goes to [`TUNNEL_PROFILE`] (served by `dialer`), with the
+/// forward allow/block filter checked on the requested name or IP literal by the router (no
+/// local DNS), the configured keepalive, and the default connect timeout.
+fn forward_routing(
+    cfg: &EngineConfig,
+    dialer: Arc<dyn UpstreamDialer>,
+) -> Result<RoutingState, RoutingSetupError> {
+    let profiles = BTreeMap::from([(
+        TUNNEL_PROFILE.to_string(),
+        ProfileConfig::of_kind(ProfileType::External),
+    )]);
+    let input = RoutingInput {
+        profiles,
+        routing: RoutingConfig {
+            default: OneOrMany::One(TUNNEL_PROFILE.to_string()),
+            ..RoutingConfig::default()
+        },
+        filter: cfg.forward_filter.clone(),
+        mitm_enabled: cfg.mitm_enabled,
+        listeners: Vec::new(),
+        keepalive: cfg.keepalive,
+        connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+    };
+    RoutingState::from_input(
+        &input,
+        DialerOptions::default().with_external(TUNNEL_PROFILE, dialer),
+    )
+}
+
 struct RunningServer {
     token: CancellationToken,
     run: JoinHandle<ShutdownReport>,
@@ -551,11 +595,12 @@ struct RunningServer {
 
 /// The proxy side of a session, shared by both SSH engines.
 struct ProxyStack {
-    cfg: Config,
+    cfg: EngineConfig,
     logger: Logger,
     access: AccessLogger,
     reverse: Option<ReverseProxy>,
-    upstream: Arc<dyn UpstreamDialer>,
+    /// Forward routing: everything to the tunnel, with the forward filter.
+    routing: SharedRouting,
     mitm: Option<MitmState>,
     server: Option<RunningServer>,
     listeners: SharedListeners,
@@ -577,35 +622,23 @@ impl ProxyStack {
         forward_states: SharedForwards,
         base: Arc<dyn UpstreamDialer>,
     ) -> Result<Self, LinkError> {
-        // Lives only until the MITM state below has loaded it.
-        let ca_file = {
+        // In memory only, and only until the MITM states below have loaded it.
+        let ca_pem: Option<Zeroizing<Vec<u8>>> = {
             let vault = vault.read().unwrap_or_else(PoisonError::into_inner);
             if needs_secrets(profile) && !vault.is_unlocked() {
                 return Err(LinkError::Locked);
             }
             match profile.mitm.as_ref().and_then(|m| m.ca.as_ref()) {
-                Some(ca) => {
-                    let pem = vault.get_secret(&ca.to_string()).map_err(vault_error)?;
-                    let staged = MitmCaFile::write(&pem).map_err(|e| {
-                        LinkError::Fatal(format!("failed to stage the MITM CA: {e}"))
-                    })?;
-                    Some(staged)
-                }
+                Some(ca) => Some(vault.get_secret(&ca.to_string()).map_err(vault_error)?),
                 None => None,
             }
         };
 
-        let cfg = to_config(profile, ca_file.as_ref().map(MitmCaFile::path))
-            .map_err(|e| LinkError::Fatal(e.to_string()))?;
+        let cfg = to_engine_config(profile).map_err(|e| LinkError::Fatal(e.to_string()))?;
 
         let logger = Logger::with_writer(cfg.log_level, Box::new(logs.writer()));
         let access = match AccessLogger::start_with_stdout(
-            AccessLogConfig::new(
-                cfg.log_level,
-                cfg.log_format,
-                cfg.http_access_log.clone(),
-                cfg.socks_log.clone(),
-            ),
+            access_log_config(&cfg),
             Box::new(logs.writer()),
             logger.clone(),
         )
@@ -617,18 +650,21 @@ impl ProxyStack {
             }
         };
 
-        let counted: Arc<dyn UpstreamDialer> = Arc::new(StatsDialer::new(base, stats));
-        // Port forwards name their destination on purpose, so the proxy's filters skip them.
-        let tunnel = Arc::clone(&counted);
-        let upstream: Arc<dyn UpstreamDialer> = match cfg.forward_filter() {
-            Some(filter) => Arc::new(FilteredDialer::new(counted, Arc::new(filter))),
-            None => counted,
-        };
+        // Port forwards name their destination on purpose, so the proxy's filter skips them:
+        // they dial the counted tunnel directly, while the proxy routes through the router.
+        let tunnel: Arc<dyn UpstreamDialer> = Arc::new(StatsDialer::new(base, stats));
 
-        let started = start_proxies(&cfg, &access, &logger, Arc::clone(&upstream)).await;
-        // The MITM state holds the CA in memory now, so its file goes.
-        drop(ca_file);
-        let (reverse, mitm) = match started {
+        let started = match forward_routing(&cfg, Arc::clone(&tunnel)) {
+            Ok(routing) => {
+                start_proxies(&cfg, ca_pem.as_deref().map(Vec::as_slice), &access, &logger)
+                    .await
+                    .map(|(reverse, mitm)| (routing.shared(), reverse, mitm))
+            }
+            Err(e) => Err(format!("forward routing setup failed: {e}")),
+        };
+        // The MITM states hold the CA now, so the vault copy goes.
+        drop(ca_pem);
+        let (routing, reverse, mitm) = match started {
             Ok(parts) => parts,
             Err(message) => {
                 let _ = access.shutdown().await;
@@ -642,7 +678,7 @@ impl ProxyStack {
             logger,
             access,
             reverse,
-            upstream,
+            routing,
             mitm,
             server: None,
             listeners,
@@ -703,18 +739,20 @@ impl ProxyStack {
                     .await,
             );
         }
-        if self.server.is_some() || !self.cfg.forward_enabled() {
+        if self.server.is_some() || !self.cfg.forward_enabled {
             return Ok(());
         }
-        let (http, socks) = build_engines(
-            &self.cfg,
-            self.mitm.as_ref(),
-            &self.access,
-            &self.logger,
-            Arc::clone(&self.upstream),
-        );
-        let handlers: Arc<dyn ProtocolHandlers> = Arc::new(EngineHandlers::new(http, socks));
-        let server = Server::from_config(&self.cfg, handlers, self.logger.clone())
+        let access = self.access.clone().with_direction(ProxyDirection::Forward);
+        let mut handlers =
+            EngineHandlers::from_routing(Arc::clone(&self.routing), access, self.logger.clone());
+        if let Some(m) = &self.mitm {
+            handlers = handlers.with_mitm(
+                Arc::new(m.interceptor.clone()),
+                self.cfg.socks_block_web_in_mitm,
+            );
+        }
+        let handlers: Arc<dyn ProtocolHandlers> = Arc::new(handlers);
+        let server = Server::from_options(&self.cfg.forward_server, handlers, self.logger.clone())
             .await
             .map_err(|e| LinkError::Fatal(e.to_string()))?;
         let bound: Vec<ListenerInfo> = server
@@ -876,17 +914,23 @@ fn remote_listener_info(
         .collect()
 }
 
+/// Starts the reverse proxy and loads the forward MITM state, both from the in-memory CA.
 async fn start_proxies(
-    cfg: &Config,
+    cfg: &EngineConfig,
+    mitm_ca_pem: Option<&[u8]>,
     access: &AccessLogger,
     logger: &Logger,
-    upstream: Arc<dyn UpstreamDialer>,
 ) -> Result<(Option<ReverseProxy>, Option<MitmState>), String> {
-    let reverse = ReverseProxy::start(cfg, access, logger).await?;
-    if !cfg.forward_enabled() {
+    let reverse = ReverseProxy::start(cfg, mitm_ca_pem, access, logger).await?;
+    if !cfg.forward_enabled {
         return Ok((reverse, None));
     }
-    let mitm = MitmState::from_config(cfg, upstream).map_err(|e| format!("MITM setup failed: {e}"));
+    let mitm = match mitm_ca_pem.filter(|_| cfg.mitm_enabled) {
+        Some(pem) => MitmState::from_pem_bytes(pem, pem, &cfg.mitm_options)
+            .map(Some)
+            .map_err(|e| format!("MITM setup failed: {e}")),
+        None => Ok(None),
+    };
     match mitm {
         Ok(mitm) => {
             if let Some(m) = &mitm {
@@ -912,7 +956,7 @@ impl Link for RusshLink {
                 .stack
                 .reverse
                 .as_ref()
-                .map(|reverse| reverse.forwards().iter().map(RemoteForward::from).collect())
+                .map(|reverse| reverse.forwards().iter().map(ReverseForward::to_remote_forward).collect())
                 .unwrap_or_default();
             let proxy_forwards = remote.len();
             remote.extend(self.stack.remote_forwards().map(|forward| RemoteForward {
@@ -1145,7 +1189,7 @@ impl OpenSshLink {
         }
 
         let (tunnel, state) = watch::channel(TunnelState::Connecting);
-        let base: Arc<dyn UpstreamDialer> = Arc::new(Socks5UpstreamDialer::new(state));
+        let base: Arc<dyn UpstreamDialer> = Arc::new(OpenSshDialer::new(state));
         let stack =
             ProxyStack::start(&profile, &vault, &logs, stats, listeners, forwards, base).await?;
 

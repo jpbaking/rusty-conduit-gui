@@ -3,8 +3,8 @@
 //! Every session, host, and vault data model lives here so future UI shells
 //! (Tauri v2 + Svelte 5) stay thin adapters. Filter rules, the SSH IP version, and the log
 //! settings are stored as human-friendly strings and parsed/validated in `validate` and
-//! `mapping`; this keeps the `rusty-conduit-ssh` types that lack `serde` (`FilterRule`,
-//! `SshIpVersion`, `LogLevel`, `LogFormat`) from needing any upstream change.
+//! `mapping`; this keeps the `rusty-conduit-engine` types that lack `serde` (`FilterRule`,
+//! `LogLevel`, `LogFormat`) and this crate's `SshIpVersion` out of the stored model.
 
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -302,10 +302,10 @@ pub struct ForwardConfig {
     pub socks_port: u16,
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
-    /// Destination allowlist rules in `rusty-conduit-ssh` filter syntax.
+    /// Destination allowlist rules in `rusty-conduit-engine` filter syntax.
     #[serde(default)]
     pub allow: Vec<String>,
-    /// Destination blocklist rules in `rusty-conduit-ssh` filter syntax.
+    /// Destination blocklist rules in `rusty-conduit-engine` filter syntax.
     #[serde(default)]
     pub block: Vec<String>,
 }

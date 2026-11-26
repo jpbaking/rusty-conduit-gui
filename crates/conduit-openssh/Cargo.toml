@@ -12,7 +12,7 @@ path = "src/bin/conduit-worker.rs"
 [dependencies]
 conduit-core = { path = "../conduit-core" }
 conduit-ssh = { path = "../conduit-ssh" }
-rusty-conduit-ssh = { workspace = true }
+rusty-conduit-engine = { workspace = true }
 tokio = { workspace = true, features = ["process", "net", "io-util", "sync", "time", "rt", "macros"] }
 serde = { workspace = true }
 thiserror = { workspace = true }

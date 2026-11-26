@@ -1,4 +1,4 @@
-//! End-to-end loopback tests: real `rusty_conduit_ssh` engines over in-process SSH servers.
+//! End-to-end loopback tests: real `rusty_conduit_engine` engines over in-process SSH servers.
 
 // Each test binary uses a different subset of the shared helpers.
 #[allow(dead_code)]
@@ -16,14 +16,15 @@ use conduit_ssh::{
     RusshDialer, SshChain, SshError, StatsDialer,
 };
 use russh::keys::PrivateKey;
-use rusty_conduit_ssh::config::Config;
-use rusty_conduit_ssh::http::HttpProxy;
-use rusty_conduit_ssh::logging::{AccessLogConfig, AccessLogger, LogFormat, LogLevel, Logger};
-use rusty_conduit_ssh::net::UpstreamDialer;
-use rusty_conduit_ssh::reverse::ReverseProxy;
-use rusty_conduit_ssh::server::{ListenPlan, ProtocolHandlers, Server, ShutdownReport};
-use rusty_conduit_ssh::socks::SocksProxy;
-use rusty_conduit_ssh::EngineHandlers;
+use rusty_conduit_engine::logging::{AccessLogConfig, AccessLogger, LogFormat, LogLevel, Logger};
+use rusty_conduit_engine::routing::{
+    OneOrMany, ProfileConfig, ProfileType, RoutingInput, RoutingState,
+};
+use rusty_conduit_engine::server::{
+    EngineHandlers, ListenPlan, ProtocolHandlers, Server, ShutdownReport,
+};
+use rusty_conduit_engine::upstream::{DialerOptions, UpstreamDialer};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use zeroize::Zeroizing;
@@ -31,6 +32,8 @@ use zeroize::Zeroizing;
 const PAYLOAD_LEN: usize = 256 * 1024;
 const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 const SOCKS_CONNECTION_REFUSED: u8 = 0x05;
+/// Name of the `external` profile that carries every forward-proxy request.
+const TUNNEL_PROFILE: &str = "ssh-tunnel";
 
 fn quiet_logger() -> Logger {
     Logger::with_writer(LogLevel::Quiet, Box::new(io::sink()))
@@ -39,6 +42,44 @@ fn quiet_logger() -> Logger {
 async fn quiet_access(logger: &Logger) -> AccessLogger {
     let config = AccessLogConfig::new(LogLevel::Quiet, LogFormat::Text, None, None);
     AccessLogger::start(config, logger.clone()).await.unwrap()
+}
+
+/// Engine handlers routing every request to `dialer` through the `external` tunnel profile,
+/// with no `direct` fallback.
+async fn tunnel_handlers(dialer: Arc<dyn UpstreamDialer>, logger: &Logger) -> EngineHandlers {
+    let mut input = RoutingInput::default();
+    input.routing.default = OneOrMany::One(TUNNEL_PROFILE.to_string());
+    input.profiles.insert(
+        TUNNEL_PROFILE.to_string(),
+        ProfileConfig::of_kind(ProfileType::External),
+    );
+    input.validate().unwrap();
+    let options = DialerOptions::default().with_external(TUNNEL_PROFILE, dialer);
+    let routing = RoutingState::from_input(&input, options).unwrap().shared();
+    let access = quiet_access(logger).await;
+    EngineHandlers::from_routing(routing, access, logger.clone())
+}
+
+/// Engine handlers that egress every request directly from this machine.
+async fn direct_handlers(logger: &Logger) -> EngineHandlers {
+    let input = RoutingInput::default();
+    input.validate().unwrap();
+    let routing = RoutingState::from_input(&input, DialerOptions::default())
+        .unwrap()
+        .shared();
+    let access = quiet_access(logger).await;
+    EngineHandlers::from_routing(routing, access, logger.clone())
+}
+
+/// Writes a small `data` to any upstream stream and reads the same number of bytes back.
+async fn stream_roundtrip<S>(mut stream: S, data: &[u8]) -> Vec<u8>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    stream.write_all(data).await.unwrap();
+    let mut echoed = vec![0u8; data.len()];
+    stream.read_exact(&mut echoed).await.unwrap();
+    echoed
 }
 
 /// Real forward HTTP and SOCKS engines on ephemeral loopback ports.
@@ -53,11 +94,7 @@ struct Engines {
 impl Engines {
     async fn start(dialer: Arc<dyn UpstreamDialer>) -> Self {
         let logger = quiet_logger();
-        let access = quiet_access(&logger).await;
-        let handlers: Arc<dyn ProtocolHandlers> = Arc::new(EngineHandlers::new(
-            HttpProxy::new(access.clone(), logger.clone(), Arc::clone(&dialer)),
-            SocksProxy::new(access, logger.clone(), dialer),
-        ));
+        let handlers: Arc<dyn ProtocolHandlers> = Arc::new(tunnel_handlers(dialer, &logger).await);
         let ephemeral = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
         let plan = ListenPlan::Separate {
             http: Some(ephemeral),
@@ -190,23 +227,26 @@ async fn assert_reverse_roundtrip(hops: &mut [HopSpec], verifier: &conduit_ssh::
     let echo = spawn_echo().await;
     let remote_port = free_port().await;
 
+    // The reverse proxy is a multiplexed engine on an ephemeral loopback port that egresses
+    // directly from this machine.
     let logger = quiet_logger();
-    let access = quiet_access(&logger).await;
-    let config = Config {
-        reverse_bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
-        reverse_http_port: remote_port,
-        reverse_socks_port: remote_port,
-        ..Config::default()
-    };
-    let proxy = ReverseProxy::start(&config, &access, &logger)
+    let handlers: Arc<dyn ProtocolHandlers> = Arc::new(direct_handlers(&logger).await);
+    let ephemeral = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+    let server = Server::bind(ListenPlan::Multiplexed(ephemeral), handlers, logger)
         .await
-        .unwrap()
-        .expect("reverse proxy is enabled");
+        .unwrap();
+    let local = server.listeners()[0].1;
+    let token = server.shutdown_token();
+    let run = tokio::spawn(server.run());
 
     let (policy, inbound) = reverse_policy(16);
     hops.last_mut().unwrap().policy = policy;
     let chain = connect_chain(hops, verifier, &options(), None).await.unwrap();
-    let remote: Vec<RemoteForward> = proxy.forwards().iter().map(RemoteForward::from).collect();
+    let remote = vec![RemoteForward {
+        remote: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), remote_port),
+        host: local.ip().to_string(),
+        port: local.port(),
+    }];
     let relay = ReverseRelay::start(&chain, &remote, inbound)
         .await
         .unwrap();
@@ -225,7 +265,8 @@ async fn assert_reverse_roundtrip(hops: &mut [HopSpec], verifier: &conduit_ssh::
     assert!(node.state.requested_hosts.lock().unwrap().is_empty());
     relay.stop(&chain).await;
     chain.disconnect().await;
-    proxy.shutdown().await;
+    token.cancel();
+    run.await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -260,7 +301,7 @@ async fn keyboard_interactive_hop_carries_traffic() {
     let echo = spawn_echo().await;
     let dialer = RusshDialer::with_chain(chain);
     let stream = dialer.connect("127.0.0.1", echo, DIAL_TIMEOUT).await.unwrap();
-    assert_eq!(echo_roundtrip(stream, b"kbd").await, b"kbd");
+    assert_eq!(stream_roundtrip(stream, b"kbd").await, b"kbd");
 }
 
 #[tokio::test]

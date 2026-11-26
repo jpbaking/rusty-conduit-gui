@@ -8,8 +8,9 @@
 use std::sync::{Arc, PoisonError};
 
 use conduit_core::{ForwardDirection, PortForward};
-use rusty_conduit_ssh::logging::Logger;
-use rusty_conduit_ssh::net::{UpstreamDialer, DEFAULT_CONNECT_TIMEOUT};
+use rusty_conduit_engine::logging::Logger;
+use rusty_conduit_engine::routing::DEFAULT_CONNECT_TIMEOUT;
+use rusty_conduit_engine::upstream::UpstreamDialer;
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
@@ -134,8 +135,8 @@ async fn relay(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusty_conduit_ssh::logging::LogLevel;
-    use rusty_conduit_ssh::net::DirectDialer;
+    use rusty_conduit_engine::logging::LogLevel;
+    use rusty_conduit_engine::upstream::DirectDialer;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn forward(port: u16, dest_port: u16) -> PortForward {

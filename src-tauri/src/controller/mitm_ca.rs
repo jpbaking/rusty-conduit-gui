@@ -10,7 +10,7 @@ use std::fmt;
 use base64::Engine as _;
 use conduit_core::{AppConfig, MitmCaId, Timestamp, VaultCaMeta};
 use conduit_vault::VaultError;
-use rusty_conduit_ssh::mitm::ca::{CaError, CaMaterial};
+use rusty_conduit_engine::mitm::ca::{CaError, CaMaterial};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 

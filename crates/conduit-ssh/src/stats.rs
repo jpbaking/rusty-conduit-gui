@@ -7,11 +7,8 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use rusty_conduit_ssh::net::{DialFuture, UpstreamDialer};
-use tokio::io::{copy_bidirectional, AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpStream;
-
-use crate::dialer::loopback_pair;
+use rusty_conduit_engine::upstream::{DialFuture, UpstreamDialer, UpstreamStream};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// Counters shared between a [`StatsDialer`] and its readers.
 #[derive(Debug, Default)]
@@ -67,22 +64,21 @@ impl UpstreamDialer for StatsDialer {
         let stats = Arc::clone(&self.stats);
         Box::pin(async move {
             let upstream = dial.await?;
-            let (client, mut bridge) = loopback_pair().await?;
             let guard = ActiveGuard::new(Arc::clone(&stats));
-            let mut counted = CountingStream {
+            Ok(UpstreamStream::boxed(CountingStream {
                 inner: upstream,
                 stats,
-            };
-            tokio::spawn(async move {
-                let _guard = guard;
-                let _ = copy_bidirectional(&mut bridge, &mut counted).await;
-            });
-            Ok(client)
+                _guard: guard,
+            }))
         })
+    }
+
+    fn redacted_upstream(&self) -> String {
+        self.inner.redacted_upstream()
     }
 }
 
-/// Holds one active-connection slot, released even if the relay task is cancelled.
+/// Holds one active-connection slot, released when the counted stream is dropped.
 struct ActiveGuard(Arc<AtomicStats>);
 
 impl ActiveGuard {
@@ -101,8 +97,9 @@ impl Drop for ActiveGuard {
 
 /// Counts bytes as they move, so totals stay live during long transfers.
 struct CountingStream {
-    inner: TcpStream,
+    inner: UpstreamStream,
     stats: Arc<AtomicStats>,
+    _guard: ActiveGuard,
 }
 
 impl AsyncRead for CountingStream {
@@ -150,7 +147,7 @@ impl AsyncWrite for CountingStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusty_conduit_ssh::net::DirectDialer;
+    use rusty_conduit_engine::upstream::DirectDialer;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 

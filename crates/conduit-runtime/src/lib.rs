@@ -12,7 +12,7 @@ pub mod hardening;
 pub mod logs;
 pub mod manager;
 mod port_forward;
-mod mitm_ca_file;
+mod reverse;
 pub(crate) mod runner;
 pub mod state;
 pub mod wake;

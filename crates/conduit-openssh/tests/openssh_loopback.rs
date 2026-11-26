@@ -8,13 +8,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use conduit_core::{HostKeyLookup, HostKeyRecord, KnownHostsStore, Timestamp};
-use conduit_openssh::{LogFn, OpenSshError, OpenSshSupervisor, SupervisorHop, SupervisorOptions};
+use conduit_openssh::{
+    LogFn, OpenSshError, OpenSshSupervisor, SupervisorHop, SupervisorOptions, TunnelState,
+};
 use conduit_ssh::ScopedAgent;
 use conduit_vault::{generate_key, KeyGenAlgorithm};
 use russh::keys::{HashAlg, PrivateKey, PublicKey};
 use russh::server::{self, Auth};
 use russh::{Channel, ChannelOpenFailure};
-use rusty_conduit_ssh::net::TunnelState;
 use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use zeroize::Zeroizing;

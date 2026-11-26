@@ -1,17 +1,15 @@
-//! Bridges `russh` `direct-tcpip` channels into the engine's [`UpstreamDialer`].
+//! Exposes `russh` `direct-tcpip` channels as the engine's [`UpstreamDialer`].
 //!
-//! The engine needs a real [`TcpStream`], so each dial relays its SSH channel through a private
-//! loopback TCP pair. Hostnames are passed to the SSH target unresolved, so DNS stays remote.
+//! Each dial returns its SSH channel stream directly as an [`UpstreamStream::Boxed`], so no
+//! loopback socket or relay task is involved. Hostnames are passed to the SSH target
+//! unresolved, so DNS stays remote.
 
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
 use russh::ChannelOpenFailure;
-use rusty_conduit_ssh::net::{DialFuture, UpstreamDialer};
-use tokio::io::copy_bidirectional;
-use tokio::net::{TcpListener, TcpStream};
+use rusty_conduit_engine::upstream::{DialFuture, UpstreamDialer, UpstreamStream};
 
 use crate::chain::SshChain;
 
@@ -94,41 +92,19 @@ impl UpstreamDialer for RusshDialer {
                 })?
         })
     }
+
+    fn redacted_upstream(&self) -> String {
+        "ssh-tunnel".to_string()
+    }
 }
 
-async fn dial(chain: &SshChain, host: &str, port: u16) -> io::Result<TcpStream> {
+async fn dial(chain: &SshChain, host: &str, port: u16) -> io::Result<UpstreamStream> {
     let channel = chain
         .open_direct_tcpip(host, port)
         .await
         .map_err(|e| map_open_error(&e, host, port))?;
-    let (client, mut bridge) = loopback_pair().await?;
-    let mut remote = channel.into_stream();
-    tokio::spawn(async move {
-        // Either side closing ends the relay, and dropping both ends propagates the close.
-        let _ = copy_bidirectional(&mut bridge, &mut remote).await;
-    });
-    Ok(client)
-}
-
-/// Creates a connected loopback TCP pair as `(client, server)`.
-///
-/// The listener only lives for this call, and any connection other than our own is dropped.
-pub(crate) async fn loopback_pair() -> io::Result<(TcpStream, TcpStream)> {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-    let client = TcpStream::connect(listener.local_addr()?).await?;
-    let server = accept_verified(&listener, client.local_addr()?).await?;
-    client.set_nodelay(true)?;
-    server.set_nodelay(true)?;
-    Ok((client, server))
-}
-
-async fn accept_verified(listener: &TcpListener, expected: SocketAddr) -> io::Result<TcpStream> {
-    loop {
-        let (stream, peer) = listener.accept().await?;
-        if peer == expected {
-            return Ok(stream);
-        }
-    }
+    // Dropping the stream closes the channel, which propagates the close to the target.
+    Ok(UpstreamStream::boxed(channel.into_stream()))
 }
 
 /// Maps a channel-open failure to the `io::ErrorKind` the engine turns into HTTP and SOCKS
@@ -164,7 +140,6 @@ fn strip_brackets(host: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn kind_of(error: russh::Error) -> io::ErrorKind {
         map_open_error(&error, "example.test", 443).kind()
@@ -208,27 +183,8 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::NotConnected);
     }
 
-    #[tokio::test]
-    async fn loopback_pair_is_connected_both_ways() {
-        let (mut client, mut server) = loopback_pair().await.unwrap();
-        assert_eq!(client.local_addr().unwrap(), server.peer_addr().unwrap());
-        client.write_all(b"ping").await.unwrap();
-        let mut buffer = [0u8; 4];
-        server.read_exact(&mut buffer).await.unwrap();
-        assert_eq!(&buffer, b"ping");
-        server.write_all(b"pong").await.unwrap();
-        client.read_exact(&mut buffer).await.unwrap();
-        assert_eq!(&buffer, b"pong");
-    }
-
-    #[tokio::test]
-    async fn accept_skips_a_connection_from_another_socket() {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let _intruder = TcpStream::connect(addr).await.unwrap();
-        let client = TcpStream::connect(addr).await.unwrap();
-        let expected = client.local_addr().unwrap();
-        let accepted = accept_verified(&listener, expected).await.unwrap();
-        assert_eq!(accepted.peer_addr().unwrap(), expected);
+    #[test]
+    fn redacted_upstream_names_the_tunnel() {
+        assert_eq!(RusshDialer::new().redacted_upstream(), "ssh-tunnel");
     }
 }

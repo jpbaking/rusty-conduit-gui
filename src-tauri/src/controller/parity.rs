@@ -7,7 +7,7 @@ use std::str::FromStr;
 
 use conduit_core::ForwardDirection;
 use conduit_openssh::OpenSshBinaryInfo;
-use rusty_conduit_ssh::filter::{FilterRule, HostFilter};
+use rusty_conduit_engine::filter::{FilterRule, HostFilter};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
