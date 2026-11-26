@@ -166,56 +166,10 @@ struct MitmFile {
     ca_passphrase_file: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cert_ttl: Option<String>,
-    /// `cert_cache_max_entries` in `rusty-conduit` / `-ssh`, `cert_cache_max` in `-switch`.
+    /// Every CLI writes `cert_cache_max_entries`; `cert_cache_max` is `-switch`'s deprecated
+    /// name, still read on import.
     #[serde(default, skip_serializing_if = "Option::is_none", alias = "cert_cache_max")]
     cert_cache_max_entries: Option<usize>,
-}
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SwitchMitmFile {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    ca_cert: Option<PathBuf>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    ca_key: Option<PathBuf>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    ca_p12: Option<PathBuf>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    ca_passphrase: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    ca_passphrase_file: Option<PathBuf>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    cert_ttl: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    cert_cache_max: Option<usize>,
-}
-
-impl From<SwitchMitmFile> for MitmFile {
-    fn from(m: SwitchMitmFile) -> Self {
-        MitmFile {
-            ca_cert: m.ca_cert,
-            ca_key: m.ca_key,
-            ca_p12: m.ca_p12,
-            ca_passphrase: m.ca_passphrase,
-            ca_passphrase_file: m.ca_passphrase_file,
-            cert_ttl: m.cert_ttl,
-            cert_cache_max_entries: m.cert_cache_max,
-        }
-    }
-}
-
-impl From<MitmFile> for SwitchMitmFile {
-    fn from(m: MitmFile) -> Self {
-        SwitchMitmFile {
-            ca_cert: m.ca_cert,
-            ca_key: m.ca_key,
-            ca_p12: m.ca_p12,
-            ca_passphrase: m.ca_passphrase,
-            ca_passphrase_file: m.ca_passphrase_file,
-            cert_ttl: m.cert_ttl,
-            cert_cache_max: m.cert_cache_max_entries,
-        }
-    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -357,6 +311,15 @@ struct SshFile {
     logging: Option<LoggingFile>,
 }
 
+/// `tcp_keepalive` in a `-switch` file: a duration (current) or the deprecated
+/// `[tcp_keepalive]` table with `idle`, `interval`, and `retries`.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+enum SwitchKeepaliveField {
+    Idle(String),
+    Table(SwitchKeepalive),
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SwitchKeepalive {
@@ -439,11 +402,20 @@ struct SwitchFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     max_connections: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    tcp_keepalive: Option<SwitchKeepalive>,
+    tcp_keepalive: Option<SwitchKeepaliveField>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tcp_keepalive_interval: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tcp_keepalive_retries: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    allow: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    block: Option<Vec<String>>,
+    /// Deprecated `[filter]` table; read on import, never written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     filter: Option<SwitchFilter>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    mitm: Option<SwitchMitmFile>,
+    mitm: Option<MitmFile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     logging: Option<LoggingFile>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -1172,12 +1144,39 @@ pub fn import_rusty_conduit_switch_toml(
                 .into(),
         );
     }
-    let ka = f.tcp_keepalive.unwrap_or_default();
-    let network = network_of(CLI, &f.connect_timeout, &ka.idle, &ka.interval, ka.retries)?;
-    let filter = f.filter.unwrap_or_default();
-    let filter = filter_of(CLI, filter.allow, filter.block)?;
+    // Current top-level keys win over the deprecated tables, as in rusty-conduit-switch.
+    let mut deprecated = Vec::new();
+    let (idle, table_interval, table_retries) = match f.tcp_keepalive {
+        Some(SwitchKeepaliveField::Idle(idle)) => (Some(idle), None, None),
+        Some(SwitchKeepaliveField::Table(t)) => {
+            deprecated.push("`[tcp_keepalive]`");
+            (t.idle, t.interval, t.retries)
+        }
+        None => (None, None, None),
+    };
+    let interval = f.tcp_keepalive_interval.or(table_interval);
+    let retries = f.tcp_keepalive_retries.or(table_retries);
+    let network = network_of(CLI, &f.connect_timeout, &idle, &interval, retries)?;
+    let legacy_filter = f.filter.unwrap_or_default();
+    if legacy_filter.allow.is_some() || legacy_filter.block.is_some() {
+        deprecated.push("`[filter]`");
+    }
+    let filter =
+        filter_of(CLI, f.allow.or(legacy_filter.allow), f.block.or(legacy_filter.block))?;
     let socks_block_web = f.socks_block_web.unwrap_or(false);
-    let mitm = mitm_of(f.mitm.map(MitmFile::from), &mut warnings);
+    if switch_uses_cert_cache_max(toml_str) {
+        deprecated.push("`mitm.cert_cache_max`");
+    }
+    if !deprecated.is_empty() {
+        warnings.push(format!(
+            "{} {} deprecated in rusty-conduit-switch; exports write the current names \
+             (top-level tcp_keepalive, tcp_keepalive_interval, tcp_keepalive_retries, allow, \
+             block, and mitm.cert_cache_max_entries)",
+            deprecated.join(", "),
+            if deprecated.len() == 1 { "is" } else { "are" },
+        ));
+    }
+    let mitm = mitm_of(f.mitm, &mut warnings);
 
     let mut aliases = BTreeMap::new();
     let mut profiles = Vec::new();
@@ -1259,6 +1258,16 @@ pub fn import_rusty_conduit_switch_toml(
         ..Proxy::default()
     };
     Ok(SwitchTomlImport { proxy, extracted_secrets: secrets, warnings })
+}
+
+/// Whether a `-switch` file uses the deprecated `mitm.cert_cache_max` key, which serde reads
+/// through an alias.
+fn switch_uses_cert_cache_max(toml_str: &str) -> bool {
+    toml_str.parse::<toml::Table>().ok().is_some_and(|t| {
+        t.get("mitm")
+            .and_then(toml::Value::as_table)
+            .is_some_and(|m| m.contains_key("cert_cache_max"))
+    })
 }
 
 fn non_empty(s: &str) -> Option<String> {
@@ -1358,7 +1367,6 @@ pub fn export_rusty_conduit_switch_toml(
     }
 
     let (allow, block) = filter_to_file(&proxy.filter);
-    let filter = (allow.is_some() || block.is_some()).then_some(SwitchFilter { allow, block });
     let l = &proxy.listeners;
     let n = &proxy.network;
     let file = SwitchFile {
@@ -1367,16 +1375,15 @@ pub fn export_rusty_conduit_switch_toml(
         socks_port: Some(l.socks_port),
         connect_timeout: Some(format_duration(n.connect_timeout)),
         max_connections: Some(l.max_connections),
-        tcp_keepalive: Some(SwitchKeepalive {
-            idle: Some(format_duration(n.tcp_keepalive)),
-            interval: Some(format_duration(n.tcp_keepalive_interval)),
-            retries: Some(n.tcp_keepalive_retries),
-        }),
-        filter,
+        tcp_keepalive: Some(SwitchKeepaliveField::Idle(format_duration(n.tcp_keepalive))),
+        tcp_keepalive_interval: Some(format_duration(n.tcp_keepalive_interval)),
+        tcp_keepalive_retries: Some(n.tcp_keepalive_retries),
+        allow,
+        block,
         socks_block_web: (proxy.socks_block_web
             || proxy.mitm.as_ref().is_some_and(|m| m.socks_block_web))
             .then_some(true),
-        mitm: proxy.mitm.as_ref().map(|m| SwitchMitmFile::from(mitm_to_file(m, &mut notes))),
+        mitm: proxy.mitm.as_ref().map(|m| mitm_to_file(m, &mut notes)),
         logging: Some(logging_to_file(&proxy.logging)),
         profiles,
         routing: Some(proxy.routing.clone()),
@@ -1882,6 +1889,38 @@ inherit = true
     }
 
     #[test]
+    fn toml_io_switch_imports_current_names_and_flags_deprecated_ones() {
+        let current = "tcp_keepalive = \"30s\"\ntcp_keepalive_interval = \"5s\"\n\
+                       tcp_keepalive_retries = 3\nblock = [\"*.ads.example\"]\n\
+                       allow = [\"ok.ads.example\"]\n\n[mitm]\ncert_cache_max_entries = 99\n\n\
+                       [routing]\ndefault = \"direct\"\n";
+        let out = import_rusty_conduit_switch_toml(current, "now").unwrap();
+        let n = &out.proxy.network;
+        assert_eq!(
+            (n.tcp_keepalive, n.tcp_keepalive_interval, n.tcp_keepalive_retries),
+            (Duration::from_secs(30), Duration::from_secs(5), 3)
+        );
+        assert!(matches!(&out.proxy.filter, GlobalFilterConfig::BlockExcept { .. }), "{:?}", out.proxy.filter);
+        assert!(!out.warnings.iter().any(|w| w.contains("deprecated")), "{:?}", out.warnings);
+
+        let old = import_rusty_conduit_switch_toml(SWITCH_TOML, "auto").unwrap();
+        assert!(
+            old.warnings.iter().any(|w| w.starts_with("`[tcp_keepalive]`, `[filter]` are deprecated")),
+            "{:?}",
+            old.warnings
+        );
+        let cache = import_rusty_conduit_switch_toml("[mitm]\ncert_cache_max = 5\n", "x").unwrap();
+        assert!(cache.warnings.iter().any(|w| w.starts_with("`mitm.cert_cache_max` is deprecated")));
+
+        // As in rusty-conduit-switch, a top-level key wins over the deprecated table.
+        let both = "tcp_keepalive_retries = 7\nallow = [\"a.example\"]\n\n[tcp_keepalive]\nretries = 2\n\n\
+                    [filter]\nallow = [\"b.example\"]\n";
+        let p = import_rusty_conduit_switch_toml(both, "x").unwrap().proxy;
+        assert_eq!(p.network.tcp_keepalive_retries, 7);
+        assert_eq!(p.filter, GlobalFilterConfig::Allow(vec!["a.example".into()]));
+    }
+
+    #[test]
     fn toml_io_switch_import_rejects_conflicts() {
         let two = "[profiles.a]\ntype = \"http\"\nhost = \"h\"\nport = 1\npassword = \"x\"\npassword_env = \"Y\"";
         assert!(matches!(import_rusty_conduit_switch_toml(two, "x"), Err(TomlImportError::Invalid { .. })));
@@ -1918,7 +1957,12 @@ inherit = true
         assert!(toml.contains("# [profiles.ssh-hop]") || toml.contains("# [profiles.\"ssh-hop\"]"), "{toml}");
         assert!(toml.contains("# type = \"socks5\""));
         assert!(toml.contains("Tunnel \"corp\""));
-        assert!(toml.contains("cert_cache_max = "));
+        assert!(toml.contains("cert_cache_max_entries = "), "{toml}");
+        for old in ["[tcp_keepalive]", "[filter]", "cert_cache_max = "] {
+            assert!(!toml.contains(old), "export still writes the deprecated {old}: {toml}");
+        }
+        assert!(toml.contains("tcp_keepalive = \"45s\"") && toml.contains("tcp_keepalive_retries = 4"), "{toml}");
+        assert!(toml.contains("allow = [\"*.example.com\"]"), "{toml}");
         let notes = out.notes.join("\n");
         assert!(notes.contains("CONDUIT_UPSTREAM_CORP_PASSWORD") && notes.contains("ssh-hop"));
         assert_eq!(upstream_password_env_var("my-proxy.1"), "CONDUIT_UPSTREAM_MY_PROXY_1_PASSWORD");
