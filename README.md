@@ -2,11 +2,11 @@
 
 One system tray app and **Manage Window** for the whole Rusty Conduit proxy family. Build local **Proxies** whose traffic goes direct, through **SSH Tunnels**, through other upstream proxies, or wherever **Auto Switch** rules send it. Save, run, autostart, and auto-reconnect them all at once, without touching `~/.ssh`.
 
-Built with Tauri v2, Svelte 5, and TypeScript over a UI-agnostic Rust workspace that embeds the shared [`rusty-conduit-engine`](https://github.com/jpbaking/rusty-conduit-engine) `v0.4.0`. It replaces the earlier **Rusty Conduit (SSH)** app (`rusty-conduit-ssh-gui` `v0.1.0`); see [Upgrading from v0.1.0](docs/RELEASING.md#8-upgrading-from-v010-rusty-conduit-ssh-gui).
+Built with Tauri v2, Svelte 5, and TypeScript over a UI-agnostic Rust workspace that embeds the shared [`rusty-conduit-engine`](https://github.com/jpbaking/rusty-conduit-engine) `v0.5.0`. It replaces the earlier **Rusty Conduit (SSH)** app (`rusty-conduit-ssh-gui` `v0.1.0`); see [Upgrading from v0.1.0](docs/RELEASING.md#8-upgrading-from-v010-rusty-conduit-ssh-gui).
 
 ## Features
 
-- **Proxies and Tunnels.** A Proxy is a local HTTP/HTTPS and SOCKS4/4a/5 listener. A Tunnel is a saved SSH connection that Proxies can route through. Each Proxy runs in one of these modes: **Direct**, **Forward** (through an upstream proxy or a Tunnel), **Auto Switch** (rules with failover chains and a live Route Tester), **PAC**, or **External TOML** (linked to a CLI config file).
+- **Proxies and Tunnels.** A Proxy is a local HTTP/HTTPS and SOCKS4/4a/5 listener. A Tunnel is a saved SSH connection that Proxies can route through. Each Proxy runs in one of these modes: **Direct**, **Forward** (through an upstream proxy or a Tunnel), **Auto Switch** (rules with failover chains and a live Route Tester), or **External TOML** (linked to a CLI config file).
 - **Hot reload.** Saving a routing change on a running Proxy applies it without dropping open connections.
 - **Import and export.** Import AirSwitch / ZeroOmega `.bak` files, and import or export `config.toml` for all three CLIs (`rusty-conduit`, `rusty-conduit-ssh`, `rusty-conduit-switch`). Secrets move into the vault and are never written out in plaintext. App backups use format v2, and v1 backups from v0.1.0 still import.
 - **Two SSH engines.** The default is pure-Rust [`russh`](https://crates.io/crates/russh), with no external `ssh` binary. An opt-in OpenSSH engine runs in an isolated worker process for cases `russh` cannot cover (raw `extra_args`, custom `ProxyCommand`, GSSAPI, hardware keys).
@@ -43,7 +43,7 @@ Built with Tauri v2, Svelte 5, and TypeScript over a UI-agnostic Rust workspace 
     librsvg2-dev patchelf libdbus-1-dev libgtk-3-dev
   ```
 
-`Cargo.toml` pulls `rusty-conduit-engine` from its Git tag `v0.4.0`, so no sibling checkout is needed. Cargo fetches it on the first build. If Cargo's built-in Git client fails (for example behind a proxy), set `CARGO_NET_GIT_FETCH_WITH_CLI=true`.
+`Cargo.toml` pulls `rusty-conduit-engine` from its Git tag `v0.5.0`, so no sibling checkout is needed. Cargo fetches it on the first build. If Cargo's built-in Git client fails (for example behind a proxy), set `CARGO_NET_GIT_FETCH_WITH_CLI=true`.
 
 ## Development
 

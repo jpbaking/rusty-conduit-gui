@@ -35,7 +35,7 @@ Tags use the format `vX.Y.Z`, for example `v0.2.0`. The tag must point at the co
 The workspace `Cargo.toml` pulls the shared engine, `rusty-conduit-engine`, from its pinned Git tag:
 
 ```toml
-rusty-conduit-engine = { git = "https://github.com/jpbaking/rusty-conduit-engine", tag = "v0.4.0" }
+rusty-conduit-engine = { git = "https://github.com/jpbaking/rusty-conduit-engine", tag = "v0.5.0" }
 ```
 
 No sibling checkout is needed, locally or in CI. Cargo fetches the tag on the first build, and `Cargo.lock` records the exact commit.
@@ -150,7 +150,7 @@ Automated checks confirm that the installers exist, contain both binaries, and (
 - [ ] A multi-hop connection works, and **Test Connection** names the failing hop when one is broken.
 - [ ] Forward and reverse proxies pass traffic.
 - [ ] The Manage Window shows both **Proxies** and **Tunnels**. A Proxy can be created, started, and stopped from each.
-- [ ] Each Proxy mode routes traffic: **Direct**, **Forward** (through an upstream profile or a Tunnel), **Auto Switch** (rules and the Route Tester agree), **PAC**, and **External TOML** (edits to the linked file are picked up).
+- [ ] Each Proxy mode routes traffic: **Direct**, **Forward** (through an upstream profile or a Tunnel), **Auto Switch** (rules and the Route Tester agree), and **External TOML** (edits to the linked file are picked up).
 - [ ] Saving a routing change on a running Proxy applies it without dropping open connections.
 - [ ] An AirSwitch / ZeroOmega `.bak` file imports through the wizard.
 - [ ] A `config.toml` from each CLI (`rusty-conduit`, `rusty-conduit-ssh`, `rusty-conduit-switch`) imports, and export writes one back with no plaintext secrets.
