@@ -1,20 +1,29 @@
 <script lang="ts">
   import { api, errorMessage } from "../api";
-  import { NEW_SESSION_ID, store } from "../stores.svelte";
   import type { ForwardConfig, PortConflict, SessionProfile } from "../types";
   import { PortMux, shareablePort } from "../portMux.svelte";
   import { isIpAddress, isLoopback, isPort } from "../validate";
+  import { chainEditor } from "./JumpChainBuilder.svelte";
   import MuxCheckbox from "./MuxCheckbox.svelte";
   import PortField from "./PortField.svelte";
   import ProxySwitch from "./ProxySwitch.svelte";
 
   const CHECK_DELAY_MS = 300;
 
+  interface Props {
+    isTunnel?: boolean;
+  }
+
+  let { isTunnel }: Props = $props();
+
   const uid = $props.id();
-  const forward = $derived((store.draft as SessionProfile).forward);
-  const reverseOn = $derived((store.draft as SessionProfile).reverse.enabled);
-  const portForwardOn = $derived((store.draft as SessionProfile).port_forwards.some((f) => f.enabled));
-  const errors = $derived(store.draftErrors);
+  const ed = chainEditor();
+  const tunnelMode = $derived(isTunnel ?? !!ed.isTunnel);
+  const draft = $derived(ed.draft as SessionProfile);
+  const forward = $derived(draft.forward);
+  const reverseOn = $derived(draft.reverse.enabled);
+  const portForwardOn = $derived(draft.port_forwards.some((f) => f.enabled));
+  const errors = $derived(ed.draftErrors);
   const forwardOn = $derived(forward.enabled && (forward.http_port !== 0 || forward.socks_port !== 0));
   const exposed = $derived(forwardOn && isIpAddress(forward.bind) && !isLoopback(forward.bind));
   const mux = new PortMux(() => ({ http: forward.http_port, socks: forward.socks_port }));
@@ -23,7 +32,7 @@
   let conflicts = $state.raw<PortConflict[]>([]);
   let checkError = $state<string | null>(null);
   function setForward(patch: Partial<ForwardConfig>) {
-    store.updateDraft((profile) => ({ ...profile, forward: { ...profile.forward, ...patch } }));
+    ed.updateDraft((profile) => ({ ...profile, forward: { ...profile.forward, ...patch } }));
   }
 
   /** Turning on with no ports set fills in the usual ones, so the proxy has a listener. */
@@ -38,7 +47,7 @@
   }
 
   $effect(() => {
-    const id = store.selectedId;
+    const sessionId = ed.selected?.profile.id ?? null;
     const { enabled, bind, http_port, socks_port } = forward;
     conflicts = [];
     checkError = null;
@@ -53,7 +62,6 @@
     let cancelled = false;
     const timer = setTimeout(async () => {
       try {
-        const sessionId = id === NEW_SESSION_ID ? null : id;
         const report = await api.checkPortConflicts(sessionId, bind, http_port, socks_port);
         if (!cancelled) conflicts = report.conflicts;
       } catch (error) {
@@ -73,10 +81,18 @@
     <ProxySwitch
       name="Forward proxy"
       on={forward.enabled}
-      lockedReason={reverseOn || portForwardOn ? undefined : "To turn this off, turn on the reverse proxy or a port forward first"}
+      lockedReason={tunnelMode || reverseOn || portForwardOn ? undefined : "To turn this off, turn on the reverse proxy or a port forward first"}
       onToggle={setEnabled}
     />
   </div>
+  {#if tunnelMode}
+    <p class="note">
+      Proxies that route through this tunnel dial it directly without needing a local forward listener;
+      only enable Forward if you need a dedicated local bind address and port (<code>ssh -D</code> style).
+      If Forward is enabled and a Proxy also uses this tunnel, the Proxy bypasses this tunnel's forward
+      address/port and tunnel MITM, while still enforcing this tunnel's configured filters.
+    </p>
+  {/if}
   <!-- Switched off, the values stay as they are for when the proxy is turned back on. -->
   <fieldset class="card-body" disabled={!forward.enabled}>
   <legend class="sr-only">Forward proxy settings</legend>

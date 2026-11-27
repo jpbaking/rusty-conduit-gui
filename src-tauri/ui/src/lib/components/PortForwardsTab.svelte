@@ -48,7 +48,9 @@
   const proxiesOn = $derived(draft.forward.enabled || draft.reverse.enabled);
   const enabledCount = $derived(forwards.filter((f) => f.enabled).length);
   const lockedReason = $derived(
-    !proxiesOn && enabledCount === 1 ? "This is the only listener: turn on another first" : undefined,
+    !ed.isTunnel && !proxiesOn && enabledCount === 1
+      ? "This is the only listener: turn on another first"
+      : undefined,
   );
 
   // `-L` / `-R` flags typed into the Advanced tab's extra arguments.

@@ -1,63 +1,44 @@
-# phase-0002 — Update release validation/smoke scripts, CI/release workflows, RELEASING.md, and README.md for v0.2.0
+# phase-0002 — Runtime tunnel forward listener, filtered dialer, and in-process -L proxy dialer (conduit-runtime)
 
 - Status: done
 - Owner: executor
 - Depends on: phase-0001
-- Goal: Enforce the new §3.3 `.deb`/`.rpm`/NSIS upgrade-path rules in `scripts/validate-release-config.py` and `scripts/smoke-test-bundle.py`, align `.github/workflows/{ci,release}.yml` with the current git-tag `rusty-conduit-engine` `v0.2.0` dependency, and update `docs/RELEASING.md` and `README.md` for `v0.2.0` and the unified Rusty Conduit GUI.
-- Done when: `validate-release-config.py` enforces `.deb`/`.rpm` and NSIS upgrade-path rules, `smoke-test-bundle.py --self-test` verifies `.deb` `Replaces`/`Conflicts` and `.rpm` `Obsoletes`/`Conflicts`, workflows/docs/README are accurate for `v0.2.0`, and `## Verify` exits 0.
-- Pattern to follow: `scripts/validate-release-config.py`, `scripts/smoke-test-bundle.py`, `docs/RELEASING.md`, `README.md`
+- Goal: Implement tunnel-level filter enforcement on Proxy traffic, in-process HTTP/SOCKS5 handshakes for `@forward:<tid>:<fid>` targets, optional tunnel forward listener + MITM in `TunnelManager`, and automatic external dialer registration in `ProxyManager`.
+- Done when: `cargo clippy -p conduit-runtime --all-targets -- -D warnings` and `cargo test -p conduit-runtime` pass, including tests for filtered tunnel dialing, in-process `-L` HTTP and SOCKS5 handshake dialing, optional tunnel forward listener, and `ProxyManager::test_route` with `@tunnel:` / `@forward:` targets.
+- Pattern to follow: `crates/conduit-runtime/src/tunnel_manager.rs:160-217` (`SwitchableDialer`), `crates/conduit-runtime/src/runner.rs:750-770` and `923-945` (forward `Server::from_options` and `MitmState` setup), `crates/conduit-runtime/src/proxy_manager.rs:565-610` (`compile_routing`).
 
 ## Context
-- **`scripts/validate-release-config.py`**:
-  - Enforce that `src-tauri/tauri.conf.json` configures `bundle.linux.deb.replaces` and `bundle.linux.deb.conflicts` containing `rusty-conduit-ssh-gui`, and `bundle.linux.rpm.obsoletes` and `bundle.linux.rpm.conflicts` containing `rusty-conduit-ssh-gui` (matching whatever exact keys were landed in `phase-0001`).
-  - Enforce that `src-tauri/windows/nsis-hooks.nsh` checks for legacy `Rusty Conduit (SSH)` uninstall entry in `NSIS_HOOK_PREINSTALL` (in addition to stopping `rusty-conduit-gui.exe`, `rusty-conduit-ssh-gui.exe`, `conduit-worker.exe`).
-- **`scripts/smoke-test-bundle.py`**:
-  - Extend `.deb` inspection (`dpkg-deb -f` / control metadata) to assert `Replaces` and `Conflicts` include `rusty-conduit-ssh-gui`.
-  - Extend `.rpm` inspection (`rpm -qp` / header check) to assert `Obsoletes` and `Conflicts` include `rusty-conduit-ssh-gui`.
-  - Update `--self-test` to cover both passing and failing cases for the new `.deb` and `.rpm` upgrade-path checks.
-- **`.github/workflows/ci.yml` & `.github/workflows/release.yml`**:
-  - Audit and clean up stale comments/steps referencing `../rusty-conduit-engine` relative path now that `Cargo.toml` uses git tag `v0.2.0` (keep runner matrices, caching, artifact names, and signing logic intact; ensure git-tag fetching works cleanly in CI).
-- **`docs/RELEASING.md`**:
-  - Replace stale `rusty-conduit-ssh` / `v1.3.0` / sibling-directory instructions with the current `rusty-conduit-engine` `v0.2.0` git-tag setup.
-  - Document the `v0.1.0` (`rusty-conduit-ssh-gui`) → `v0.2.0` (`rusty-conduit-gui`) upgrade path (Linux `.deb` Replaces/Conflicts, `.rpm` Obsoletes/Conflicts, Windows NSIS legacy uninstall offer, macOS drop-in replacement, automatic first-launch config/vault migration).
-  - Update the §7 smoke-test / release checklist for unified GUI features (Proxies + Tunnels, Direct / Forward / Auto Switch / PAC / External TOML, AirSwitch/ZeroOmega `.bak` & 3-CLI `config.toml` import/export, backup format v2 & v1 import migration, tray PROXIES + TUNNELS sections).
-- **`README.md`**:
-  - Update description, Features, Workspace layout, and Prerequisites to reflect the unified Rusty Conduit GUI and `rusty-conduit-engine` `v0.2.0` git dependency (remove the stale `../rusty-conduit-ssh` sibling-repo note).
+`rusty-conduit-engine` already exposes `rusty_conduit_engine::upstream::http::connect_tunnel` and `rusty_conduit_engine::upstream::socks5::{handshake, encode_connect_request}` over any `AsyncRead + AsyncWrite + Unpin` stream. When a Proxy routes through `@tunnel:<tid>`, it must dial the tunnel's in-process SSH dialer (bypassing any customized tunnel forward `ip:port` and bypassing tunnel MITM), while STILL enforcing the tunnel's configured `forward.allow` / `forward.block` `HostFilter`. When a Proxy routes through `@forward:<tid>:<fid>`, it checks the tunnel's filter on the requested destination host, dials `(forward.dest_host, forward.dest_port)` through the tunnel's raw SSH dialer (skipping the local `-L` port), and runs the HTTP CONNECT or SOCKS5 handshake on that stream. Meanwhile, if `tunnel.forward.enabled` is true, `TunnelStack` runs a local `Server::from_options` with the tunnel's `forward_filter` and optional `MitmState` (loaded from the vault if `tunnel.mitm` is set).
 
 ## Scope
-- In: `scripts/validate-release-config.py`, `scripts/smoke-test-bundle.py`, `.github/workflows/ci.yml`, `.github/workflows/release.yml`, `docs/RELEASING.md`, `README.md`
-- Out: `src-tauri/`, `crates/`, `Cargo.toml`, `Cargo.lock`
+- In: `crates/conduit-runtime/src/tunnel_manager.rs`, `crates/conduit-runtime/src/proxy_manager.rs`, `crates/conduit-runtime/src/lib.rs`, `crates/conduit-runtime/tests/u2_tunnels_proxies.rs` (plus an optional new helper module `crates/conduit-runtime/src/forward_dialer.rs` if cleaner)
+- Out: `crates/conduit-core/`, `crates/conduit-tray/`, `src-tauri/`
 
 ## Sub-tasks
-1. [done] Update `scripts/validate-release-config.py` to enforce the `.deb`/`.rpm` replacement metadata and NSIS legacy uninstall check — done when: `python3 scripts/validate-release-config.py` passes and would fail if those entries were removed.
-2. [done] Update `scripts/smoke-test-bundle.py` (including `--self-test`) to verify `.deb` `Replaces`/`Conflicts` and `.rpm` `Obsoletes`/`Conflicts` for `rusty-conduit-ssh-gui` — done when: `python3 scripts/smoke-test-bundle.py --self-test` passes with passing and failing assertions for both.
-3. [done] Audit and update `.github/workflows/ci.yml` and `.github/workflows/release.yml` to remove stale sibling-path assumptions while keeping CI/release jobs intact — done when: workflows are valid YAML with no stale `../rusty-conduit-engine` or `rusty-conduit-ssh` sibling-checkout assumptions.
-4. [done] Update `docs/RELEASING.md` and `README.md` for `v0.2.0`, `rusty-conduit-engine` `v0.2.0`, the §3.3 upgrade path, and the unified GUI feature set — done when: no stale `v1.3.0` / sibling-path notes remain and §7 checklist covers unified GUI features.
-5. [done] Run `## Verify` and record observed results in `## Evidence` — done when: `## Verify` exits 0.
+1. [done] In `crates/conduit-runtime/src/tunnel_manager.rs`, add `FilteredTunnelDialer` wrapping `SwitchableDialer` with a live `Arc<RwLock<Option<HostFilter>>>` (refreshed on `upsert_tunnel` and tunnel start). On `connect(host, port, timeout)`, check the filter first; if denied, return `RouteBlocked::new(...).into_io()` (using `rusty_conduit_engine::upstream::RouteBlocked`), otherwise delegate to the inner dialer. Expose `TunnelManager::dialer(&self, id: TunnelId)` returning the filtered dialer and `TunnelManager::forward_dialer(&self, tid: TunnelId, fid: Uuid) -> Option<Arc<dyn UpstreamDialer>>` returning a `TunnelForwardDialer` that: (a) checks the tunnel filter on `host`, (b) looks up the current `PortForward` by `fid` (verifying `direction == Local` and `proxy_protocol != None`), (c) dials `(dest_host, dest_port)` via the raw `SwitchableDialer`, (d) performs `http::connect_tunnel` (attaching any trailing bytes via `UpstreamStream::with_prefix`) or `socks5::handshake` with `encode_connect_request(host, port)`. — done when: unit tests verify filter denial and both HTTP CONNECT and SOCKS5 in-process handshakes against local mock servers.
+2. [done] In `crates/conduit-runtime/src/tunnel_manager.rs`, extend `TunnelSnapshot` with `pub listeners: Vec<ListenerInfo>` (the tunnel's bound forward listeners when `tunnel.forward.enabled`, empty otherwise) and update `TunnelStack` to start/stop an optional forward `Server::from_options(&cfg.forward_server, ...)` backed by the tunnel's raw dialer + `cfg.forward_filter` + optional `MitmState` (reading CA PEM from `ctx.vault` when `cfg.mitm_enabled`, returning `LinkError::Locked` if vault is locked and MITM CA is needed). Update `needs_secrets` check in `TunnelStack::start` to also account for `tunnel.forward.enabled && tunnel.mitm.is_some()`. Also expose `TunnelManager::tunnels(&self) -> Vec<Tunnel>` (or `known_tunnels_full`) for `ProxyManager`. — done when: unit/integration test starts a Tunnel with `forward.enabled = true` and confirms `snapshot.listeners` is populated and traffic flows through it; and starts a Tunnel with `forward.enabled = false` and confirms `snapshot.listeners` is empty.
+3. [done] In `crates/conduit-runtime/src/proxy_manager.rs`, update `compile_routing`, `launch`, `reload`, `test_route`, `test_upstream`, `set_override`, and `profile_exists` to: (a) validate using `validate_proxy_with_tunnels` with live tunnels from `TunnelManager`, (b) register external dialers for all `@tunnel:<tid>` (via `tunnels.dialer(tid)`) and `@forward:<tid>:<fid>` (via `tunnels.forward_dialer(tid, fid)`) targets referenced in `proxy.routing`, (c) include Tunnel forward listeners in `other_listeners` for self-loop / port-conflict checks, (d) format friendly `redacted_upstream` in `test_route` (e.g. `tunnel:<name>` and `tunnel:<name> › <fwd_name> (http|socks5)`), and (e) allow `set_override` to accept `@tunnel:<tid>` and `@forward:<tid>:<fid>` targets by registering that target's external dialer in the override `RoutingState` whenever it is not already in `saved.registry`. — done when: `ProxyManager` tests pass for routing through `@tunnel:<id>`, `@forward:<tid>:<fid>`, tunnel filter enforcement on Proxy traffic, and `test_route` / `set_override`.
+4. [done] Run `cargo clippy -p conduit-runtime --all-targets -- -D warnings` and `cargo test -p conduit-runtime`. — done when: both commands exit 0 with zero warnings.
 
 ## Verify
 ```sh
-python3 scripts/validate-release-config.py && python3 scripts/smoke-test-bundle.py --self-test && python3 scripts/check-pure-rust-crypto.py
+cargo clippy -p conduit-runtime --all-targets -- -D warnings && cargo test -p conduit-runtime
 ```
 
 ## Escalate when
-- `scripts/validate-release-config.py` or `scripts/smoke-test-bundle.py` reveals a packaging mismatch in `src-tauri/tauri.conf.json` or `src-tauri/windows/nsis-hooks.nsh` that requires editing `phase-0001` files → stop, set Status: needs-human — reason: describe the mismatch.
+- `rusty_conduit_engine::upstream::http::connect_tunnel` or `socks5::handshake` is private or lacks a needed method/type export in the pinned `v0.4.1` engine crate → stop, set Status: needs-human — reason: name the exact missing engine symbol.
+- `TunnelStack` forward server setup conflicts with `OpenSshTunnelLink` or `RusshTunnelLink` lifecycle ordering → stop, set Status: needs-human — reason: describe the lifecycle conflict.
 
 ## Log
 - (append-only, one line per event)
-- sub-task 1: validate-release-config.py now requires `rusty-conduit-ssh-gui` in deb replaces/conflicts and rpm obsoletes/conflicts, and checks the expanded NSIS_HOOK_PREINSTALL (macros, arguments, !defines inlined) for taskkill of all three exes plus the legacy `Rusty Conduit (SSH)` UninstallString/MessageBox/ExecWait offer.
-- sub-task 2: smoke-test-bundle.py checks `.deb` Replaces/Conflicts via `dpkg-deb -f` and `.rpm` Obsoletes/Conflicts via `rpm -qp --obsoletes/--conflicts`; --self-test covers parser pass/fail and lookalike cases plus real .deb fixtures missing each field. No real .rpm built (no rpm/rpmbuild locally).
-- sub-task 3: removed the sibling `rusty-conduit-engine` checkout step and unused UPSTREAM_REPO/UPSTREAM_REF env from ci.yml and release.yml; added `CARGO_NET_GIT_FETCH_WITH_CLI: "true"`; matrices, caching, artifact names, signing unchanged. validate-release-config.py's old "must check out both sibling repositories" rule (which would now fail) replaced by a "must not check out a sibling repository" rule for ci rust-and-e2e and release package.
-- sub-task 4: RELEASING.md §2 rewritten for the engine git tag v0.2.0; new §8 documents the v0.1.0 → v0.2.0 upgrade path (§1–§7 numbering kept so the checklist stays §7); §7 checklist extended for unified GUI features and upgrade checks. README description/Features/Workspace layout/Prerequisites updated; sibling-repo note removed.
-- sub-task 5: ran ## Verify → exit 0.
+- sub-task 1: added `FilteredTunnelDialer` in `tunnel_manager.rs`, `TunnelForwardDialer` in `forward_dialer.rs`, exposed `TunnelManager::dialer` (filtered) and `TunnelManager::forward_dialer`, and added unit tests for filter denial and HTTP CONNECT / SOCKS5 in-process handshakes
+- sub-task 2: extended `TunnelSnapshot` with `listeners`, added optional forward `Server` + `MitmState` + vault-lock check to `TunnelStack`, exposed `TunnelManager::tunnels` and `TunnelManager::forward_listeners`, and added unit tests
+- sub-task 3: updated `ProxyManager` (`compile_routing`, `launch`, `reload`, `test_route`/`test_route_with_tunnels`/`test_route_live`, `test_upstream`, `set_override`, `profile_exists`, `other_listeners`, `port_conflict`) for `validate_proxy_with_tunnels`, `@tunnel:`/`@forward:` external dialers, tunnel forward listener conflict/self-loop checks, friendly upstream labels, and added unit + E2E tests
+- sub-task 4: ran full `conduit-runtime` clippy and test verification suite
 
 ## Evidence
 - (append-only: command → observed result)
-- `python3 scripts/validate-release-config.py` → `RELEASE_CONFIG_OK` (rules at scripts/validate-release-config.py:43, :90, :130, :147, :286)
-- in-memory negative test (import module, delete each of deb.replaces/deb.conflicts/rpm.obsoletes/rpm.conflicts; drop `!insertmacro CONDUIT_OFFER_LEGACY_UNINSTALL`; rename `rusty-conduit-ssh-gui.exe`) → each produced the matching error (e.g. `bundle.linux.rpm.obsoletes must include rusty-conduit-ssh-gui`, `NSIS_HOOK_PREINSTALL must use ...Uninstall\Rusty Conduit (SSH)`); unmodified files → no errors
-- in-memory negative test (insert a `repository: x/rusty-conduit-engine` checkout into ci rust-and-e2e) → `ci.yml: job rust-and-e2e must not check out a sibling repository`
-- `python3 scripts/smoke-test-bundle.py --self-test` → `SMOKE_TEST_SELF_TEST_OK` (scripts/smoke-test-bundle.py:98, :110, :255, :293)
-- real .deb fixture built without Conflicts / without Replaces / with neither → `xConflicts.deb Replaces does not include rusty-conduit-ssh-gui`, `xReplaces.deb Conflicts does not include rusty-conduit-ssh-gui`, `x.deb Replaces does not include rusty-conduit-ssh-gui`
-- `python3 -c "import yaml; ..."` on ci.yml and release.yml → `YAML_OK`; `grep -rn "UPSTREAM\|rusty-conduit-ssh\|\.\./" .github/workflows/` → only the new comment line naming rusty-conduit-engine's git tag
-- `grep -n "v1.3.0\|parent/\|\.\./rusty\|relative path" README.md docs/RELEASING.md` → no matches
-- ## Verify `python3 scripts/validate-release-config.py && python3 scripts/smoke-test-bundle.py --self-test && python3 scripts/check-pure-rust-crypto.py` → `RELEASE_CONFIG_OK`, `SMOKE_TEST_SELF_TEST_OK`, `PURE_RUST_CRYPTO_OK`, exit 0
+- `cargo test -p conduit-runtime --lib tunnel_manager::tests` → exit 0 (14 passed; 0 failed)
+- `cargo test -p conduit-runtime --lib tunnel_manager::tests::loopback_tunnel_forward` → exit 0 (2 passed; 0 failed)
+- `cargo test -p conduit-runtime --lib proxy_manager::tests && cargo test -p conduit-runtime --test u2_tunnels_proxies proxy_routes_through_synthetic_tunnel_and_forward_targets_with_filter` → exit 0 (15 unit + 1 E2E passed; 0 failed)
+- `cargo clippy -p conduit-runtime --all-targets -- -D warnings && cargo test -p conduit-runtime` → exit 0 (0 warnings; 97 unit + 9 e2e_runtime + 9 openssh_e2e + 8 u2_tunnels_proxies = 123 passed, 0 failed)

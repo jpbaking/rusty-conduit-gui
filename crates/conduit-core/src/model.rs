@@ -392,6 +392,16 @@ pub enum ForwardDirection {
     Remote,
 }
 
+/// Optional proxy protocol spoken by the remote service behind a local (`-L`) [`PortForward`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForwardProxyProtocol {
+    #[default]
+    None,
+    Http,
+    Socks5,
+}
+
 /// One fixed TCP port forward, like `ssh -L` or `ssh -R`.
 ///
 /// Both engines run it the same way. A local forward listens here and opens each connection
@@ -417,6 +427,9 @@ pub struct PortForward {
     /// Host connected to: resolved by the target for `Local`, by this machine for `Remote`.
     pub dest_host: String,
     pub dest_port: u16,
+    /// Optional proxy protocol spoken by the forwarded service (`Local` forwards only).
+    #[serde(default)]
+    pub proxy_protocol: ForwardProxyProtocol,
 }
 
 impl Default for PortForward {
@@ -430,6 +443,7 @@ impl Default for PortForward {
             port: 0,
             dest_host: String::new(),
             dest_port: 0,
+            proxy_protocol: ForwardProxyProtocol::None,
         }
     }
 }
@@ -1057,6 +1071,44 @@ mod tests {
         assert_eq!(hop.hop_id, "target");
         let saved = serde_json::to_string(&hop).unwrap();
         assert!(!saved.contains("agent_forward"), "{saved}");
+    }
+
+    #[test]
+    fn port_forward_round_trips_with_and_without_proxy_protocol() {
+        let legacy_json = r#"{
+            "direction": "local",
+            "port": 8080,
+            "dest_host": "proxy.internal",
+            "dest_port": 3128
+        }"#;
+        let legacy: PortForward = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(legacy.proxy_protocol, ForwardProxyProtocol::None);
+        let back: PortForward =
+            serde_json::from_str(&serde_json::to_string(&legacy).unwrap()).unwrap();
+        assert_eq!(back, legacy);
+
+        for proto in [
+            ForwardProxyProtocol::None,
+            ForwardProxyProtocol::Http,
+            ForwardProxyProtocol::Socks5,
+        ] {
+            let fwd = PortForward {
+                id: Uuid::new_v4(),
+                direction: ForwardDirection::Local,
+                name: "corp proxy".into(),
+                port: 18080,
+                dest_host: "10.0.0.2".into(),
+                dest_port: 1080,
+                proxy_protocol: proto,
+                ..PortForward::default()
+            };
+            let json = serde_json::to_string(&fwd).unwrap();
+            let round: PortForward = serde_json::from_str(&json).unwrap();
+            assert_eq!(round, fwd);
+        }
+        assert_eq!(serde_json::to_string(&ForwardProxyProtocol::None).unwrap(), r#""none""#);
+        assert_eq!(serde_json::to_string(&ForwardProxyProtocol::Http).unwrap(), r#""http""#);
+        assert_eq!(serde_json::to_string(&ForwardProxyProtocol::Socks5).unwrap(), r#""socks5""#);
     }
 
     #[test]

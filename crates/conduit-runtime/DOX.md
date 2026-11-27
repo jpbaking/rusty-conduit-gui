@@ -21,8 +21,8 @@ Owns everything under `crates/conduit-runtime/`. Inherits all root DOX rules and
 
 ## Feature Map
 - **Session manager (v1 sessions)** — runs many legacy sessions; drives one session end to end. Start: `src/manager.rs`. Files: `src/runner.rs`, `src/state.rs`, `src/backoff.rs`, `src/port_forward.rs`, `src/reverse.rs`.
-- **Tunnel manager** — supervises v2 Tunnels (hops, reverse proxy, port forwards) and exposes them as dialers. Start: `src/tunnel_manager.rs`. Files: `src/port_forward.rs`, `src/reverse.rs`, `src/backoff.rs`.
-- **Proxy manager and hot reload** — runs every saved Proxy, compiles hot-swappable routing, resolves vaulted upstream passwords and MITM CA. Start: `src/proxy_manager.rs`.
+- **Tunnel manager** — supervises v2 Tunnels (hops, optional forward proxy/MITM, tunnel-level filtered dialers, reverse proxy, port forwards, and in-process `-L` proxy forward dialers) and exposes them as dialers. Start: `src/tunnel_manager.rs`. Files: `src/forward_dialer.rs`, `src/port_forward.rs`, `src/reverse.rs`, `src/backoff.rs`.
+- **Proxy manager and hot reload** — runs every saved Proxy, compiles hot-swappable routing (including tunnel and `-L` proxy-forward upstreams), resolves vaulted upstream passwords and MITM CA. Start: `src/proxy_manager.rs`. Files: `src/forward_dialer.rs`.
 - **External TOML link mode** — polls a linked `rusty-conduit-switch` `config.toml` and reloads on change. Start: `src/toml_watcher.rs`.
 - **Logs and events** — bounded, redacted per-session logs and the UI event bus. Start: `src/logs.rs`. Files: `src/events.rs`.
 - **Wake reconnect** — OS resume-from-sleep listener. Start: `src/wake.rs`.

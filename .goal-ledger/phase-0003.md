@@ -1,57 +1,49 @@
-# phase-0003 — Rebuild src-tauri/ui/dist/ if needed and run full low-disk verification suite plus version check
+# phase-0003 — Tauri controller, IPC, tray bridge, and frontend types/validation sync
 
 - Status: done
 - Owner: executor
 - Depends on: phase-0002
-- Goal: Run the complete low-disk U5 verification suite across Rust, Python scripts, and Svelte UI, rebuild `src-tauri/ui/dist/` if the frontend build produces any changes, verify `rusty-conduit-gui --version` reports `0.2.0`, and confirm disk usage remains healthy.
-- Done when: All `## Verify` commands exit 0, `rusty-conduit-gui --version` prints `0.2.0`, any `src-tauri/ui/dist/` updates are committed cleanly, and root `/` has >= 10 GB free.
-- Pattern to follow: `.goal-ledger/GOAL.md` Full verification command
+- Goal: Wire the new core/runtime tunnel and routing capabilities through `src-tauri` controllers, tray bridge, and `src-tauri/ui` TypeScript wire types, client validation, and mock data.
+- Done when: `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, and `(cd src-tauri/ui && npm run check && npm test)` all exit 0.
+- Pattern to follow: `src-tauri/src/controller/proxies.rs:176-210` (`upsert_proxy`), `src-tauri/src/tray_bridge.rs:85-115` (proxy tray item building), `src-tauri/ui/src/lib/types.ts` and `src-tauri/ui/src/lib/validate.ts`.
 
 ## Context
-- Disk constraint: ALWAYS pass `CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_NET_GIT_FETCH_WITH_CLI=true` on every `cargo` command. Check `df -h /` and `du -sh target` at the end.
-- `src-tauri/ui/dist/` is tracked in Git (required by `tauri::generate_context!()`). After `npm run build`, if `git status --short src-tauri/ui/dist` shows changes, stage and commit them cleanly (removing any stale hashed assets); if unchanged, commit only the ledger update.
-- Verify `cargo run -p rusty-conduit-gui -- --version` prints `0.2.0`.
+`src-tauri` adapts `conduit-core` and `conduit-runtime` over Tauri IPC, and `src-tauri/ui/src/lib/types.ts` + `validate.ts` must exactly mirror the serialized Rust structs and validation rules. Existing saved configs may contain legacy `UpstreamKind::Tunnel` profiles in `proxy.profiles`, so `AppController` should run `migrate_tunnel_profiles` on load (and keep config valid). Also `src-tauri/ui/src/lib/mock.ts` must compile against updated `types.ts` so `npm run check` stays green.
 
 ## Scope
-- In: `src-tauri/ui/dist/` (only if `npm run build` changes it)
-- Out: `crates/`, `src-tauri/src/`, `src-tauri/ui/src/`, `scripts/`, `.github/`, `docs/`, `README.md`
+- In: `src-tauri/src/controller/proxies.rs`, `src-tauri/src/controller/tunnels.rs`, `src-tauri/src/controller/parity.rs`, `src-tauri/src/controller.rs`, `src-tauri/src/controller/import_export.rs`, `src-tauri/src/tray_bridge.rs`, `src-tauri/src/commands.rs`, `src-tauri/ui/src/lib/types.ts`, `src-tauri/ui/src/lib/validate.ts`, `src-tauri/ui/src/lib/validate.test.ts` (if present), `src-tauri/ui/src/lib/mock.ts`, `src-tauri/ui/src/lib/stores.svelte.ts`, `src-tauri/ui/src/lib/portForwards.ts`, `src-tauri/ui/src/lib/components/TunnelEditor.svelte` (only minimal compile-fix if `TunnelSnapshot.listeners` or `Tunnel.forward` breaks `npm run check`)
+- Out: `crates/conduit-core/`, `crates/conduit-runtime/`, `src-tauri/ui/src/lib/components/ProxyRoutingTab.svelte`, `src-tauri/ui/src/lib/components/ProxyProfilesTab.svelte`, `src-tauri/ui/dist/`
 
 ## Sub-tasks
-1. [done] Run the frontend checks and production build (`cd src-tauri/ui && npm run check && npm test && npm run build`) and inspect `git status --short src-tauri/ui/dist` — done when: `svelte-check` reports 0 errors/warnings, all frontend tests pass, and `vite build` succeeds.
-2. [done] Run the full Rust and Python verification suite, check `rusty-conduit-gui --version` prints `0.2.0`, verify disk usage (`df -h / && du -sh target`), and record observed results in `## Evidence` — done when: all `## Verify` commands exit 0 and `target/` + disk space are healthy.
+1. [done] In `src-tauri/src/controller/proxies.rs`, `src-tauri/src/controller/tunnels.rs`, `src-tauri/src/controller/parity.rs`, and `src-tauri/src/controller.rs`: (a) switch proxy validation to `validate_proxy_with_tunnels` passing the saved `&[Tunnel]` slice, (b) run `migrate_tunnel_profiles` on loaded proxies in `AppController` startup (persisting if any proxy was migrated), (c) in `parity.rs`, include tunnel forward listeners (`tunnels.forward_listeners()` / saved tunnel `forward` ports) in `check_port_conflicts` and `check_proxy_port_conflicts`, (d) keep `AppController::test_route` static and add `AppController::test_route_live(&self, ...)` calling `self.proxies.test_route_live(...)`, and call `controller.test_route_live(...)` from `src-tauri/src/commands.rs:442` so `@tunnel:` and `@forward:` targets show friendly upstream names without modifying `secret_leak_scan.rs`. — done when: `cargo test -p rusty-conduit-gui` passes.
+2. [done] In `src-tauri/src/tray_bridge.rs`, keep `profiles` passing custom `proxy.profiles` names (do NOT expose raw `@tunnel:<uuid>` UUIDs in tray menu labels, since `conduit-tray` displays the override string verbatim). Verify `cargo test -p rusty-conduit-gui` and `cargo test -p conduit-tray` pass. — done when: `cargo test -p rusty-conduit-gui` and `cargo test -p conduit-tray` pass.
+3. [done] In `src-tauri/ui/src/lib/types.ts`, add `ForwardProxyProtocol = "none" | "http" | "socks5"`, add `proxy_protocol: ForwardProxyProtocol` to `PortForward`, add `forward: ForwardConfig`, `mitm: MitmConfig | null`, `socks_block_web: boolean` to `Tunnel`, and add `listeners: ListenerInfo[]` to `TunnelSnapshot`. Update `src-tauri/ui/src/lib/mock.ts` and any minimal compile references (e.g. `TunnelEditor.svelte`, `portForwards.ts`) so `npm run check` passes. — done when: `(cd src-tauri/ui && npm run check)` exits 0.
+4. [done] In `src-tauri/ui/src/lib/validate.ts`, add target helper constants/functions (`TUNNEL_TARGET_PREFIX = "@tunnel:"`, `FORWARD_TARGET_PREFIX = "@forward:"`, `tunnelTarget(id)`, `forwardTarget(tid, fid)`, `isSyntheticTarget(name)`), mirror `validate_tunnel` (always validate `forward.allow`/`block`, validate `forward` ports & `mitm` when `forward.enabled`, reject remote forward with `proxy_protocol !== "none"`), and mirror `validate_proxy_with_tunnels` (reject profile names starting with `@`, validate `@tunnel:` and `@forward:` targets against known tunnels/forwards). Update or add unit tests in `src-tauri/ui/src/lib/`. — done when: `(cd src-tauri/ui && npm run check && npm test)` exits 0.
+5. [done] Run workspace Rust checks and UI checks: `cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && (cd src-tauri/ui && npm run check && npm test)`. — done when: command exits 0.
 
 ## Verify
 ```sh
-CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_NET_GIT_FETCH_WITH_CLI=true cargo clippy --workspace --all-targets -- -D warnings && CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test --workspace && CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_NET_GIT_FETCH_WITH_CLI=true cargo test -p rusty-conduit-gui --test secret_leak_scan && CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_NET_GIT_FETCH_WITH_CLI=true RUSTFLAGS="--cfg conduit_check_tauri_tray" cargo check -p rusty-conduit-gui --tests --features tauri/tray-icon && CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0 CARGO_NET_GIT_FETCH_WITH_CLI=true cargo run -p rusty-conduit-gui -- --version && python3 scripts/check-pure-rust-crypto.py && python3 scripts/validate-release-config.py && python3 scripts/smoke-test-bundle.py --self-test && (cd src-tauri/ui && npm run check && npm test && npm run build) && df -h / && du -sh target
+cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && (cd src-tauri/ui && npm run check && npm test)
 ```
 
 ## Escalate when
-- Any test, clippy check, Python script, frontend check, or `--version` check fails and requires editing files outside `src-tauri/ui/dist/` → stop, set Status: needs-human — reason: paste the failing command and output.
-- Free space on `/` drops below 10 GB → stop, set Status: needs-human — reason: report `df -h /` and `du -sh target`.
+- `crates/conduit-tray` cannot display a friendly label separate from the override target string `@tunnel:<uuid>` without changing `conduit-tray`'s public API → stop, set Status: needs-human — reason: ask whether to widen scope to `crates/conduit-tray/` or keep tray override limited to named profiles for now.
+- Any existing Rust integration test in `src-tauri/tests/` fails due to the `migrate_tunnel_profiles` behavior on load → stop, set Status: needs-human — reason: describe the failing test.
 
 ## Log
 - (append-only, one line per event)
-- sub-task 1: ran `npm run check && npm test && npm run build` in src-tauri/ui; all passed; `src-tauri/ui/dist/` unchanged (no dist commit needed)
-- sub-task 2: ran the `## Verify` block verbatim (output to scratchpad verify.log); every command exited 0; `--version` prints `rusty-conduit-gui 0.2.0`; dist still unchanged after second build
-- phase verify: `## Verify` chain → VERIFY_EXIT=0; phase done
+- blocked on sub-task 1: `check_port_conflicts` / `check_proxy_port_conflicts` live in `src-tauri/src/controller/parity.rs` (outside `Scope: In`), and changing `AppController::test_route` to `&self` affects `src-tauri/tests/secret_leak_scan.rs:679,682` (outside `Scope: In`)
+- planner resolved escalation: added `src-tauri/src/controller/parity.rs` to `Scope: In`, and specified keeping `AppController::test_route` static while adding `AppController::test_route_live(&self, ...)` called from `src-tauri/src/commands.rs:442`. Returned sub-task 1 and phase-0003 to `todo` for executor continuation.
+- completed sub-task 1: wired `validate_proxy_with_tunnels`, startup `migrate_tunnel_profiles`, tunnel forward port conflict checks in `parity.rs`, and `AppController::test_route_live` in `commands.rs`
+- completed sub-task 2: verified `tray_bridge.rs` keeps custom `proxy.profiles` names only and passes `rusty-conduit-gui` and `conduit-tray` tests
+- completed sub-task 3: synced `types.ts`, `mock.ts`, `portForwards.ts`, `stores.svelte.ts`, `TunnelEditor.svelte`, and `validate.test.ts` with new `ForwardProxyProtocol`, `Tunnel`, and `TunnelSnapshot` fields
+- completed sub-task 4: added target helpers and synced `tunnelErrors`/`proxyErrors` in `validate.ts`, updated `stores.svelte.ts` to pass full `Tunnel` objects, and added unit tests in `validate.test.ts`
+- completed sub-task 5 and phase verification: full workspace clippy, Rust tests, svelte-check, and UI unit tests all passed
 
 ## Evidence
 - (append-only: command → observed result)
-- `df -h /` (start) → 140G avail (43% used)
-- `npm run check` → svelte-check 198 files, 0 errors, 0 warnings, exit 0
-- `npm test` → tests 93, pass 93, fail 0, exit 0
-- `npm run build` → vite built in 3.54s (index-DHmNQCi3.js, index-CmjdL6Z5.css), exit 0
-- `git status --short src-tauri/ui/dist` → empty (no changes)
-- `## Verify` full chain (verbatim) → VERIFY_EXIT=0
-- `cargo clippy --workspace --all-targets -- -D warnings` → Finished, no warnings/errors
-- `cargo test --workspace` → all `test result: ok`, 0 failed (largest suites 174, 133, 91 passed; 1 ignored in a 44-test suite)
-- `cargo test -p rusty-conduit-gui --test secret_leak_scan` → ok, 0 failed
-- `RUSTFLAGS="--cfg conduit_check_tauri_tray" cargo check -p rusty-conduit-gui --tests --features tauri/tray-icon` → Finished, exit 0
-- `cargo run -p rusty-conduit-gui -- --version` → `rusty-conduit-gui 0.2.0`
-- `python3 scripts/check-pure-rust-crypto.py` → PURE_RUST_CRYPTO_OK
-- `python3 scripts/validate-release-config.py` → RELEASE_CONFIG_OK
-- `python3 scripts/smoke-test-bundle.py --self-test` → SMOKE_TEST_SELF_TEST_OK
-- `(cd src-tauri/ui && npm run check && npm test && npm run build)` → 0 errors/0 warnings; 93/93 pass; built in 3.73s
-- `df -h /` → 139G avail (43% used), >= 10 GB OK
-- `du -sh target` → 6.8G
-- `git status --short` after Verify → only `.goal-ledger/phase-0003.md` modified; dist unchanged
+- `rg -n "check_port_conflicts|validate_proxy|test_route|migrate_tunnel_profiles|forward_listeners" src-tauri/src` → `check_port_conflicts` at `src-tauri/src/controller/parity.rs:166`, `check_proxy_port_conflicts` at `src-tauri/src/controller/parity.rs:248`
+- `rg -n "test_route|check_port_conflicts|UpstreamKind::Tunnel" src-tauri/tests/` → `AppController::test_route` called statically at `src-tauri/tests/secret_leak_scan.rs:679` and `682`
+- `cargo test -p rusty-conduit-gui && cargo test -p conduit-tray` → exit 0 (`rusty-conduit-gui`: 176 unit + 6 secret_leak_scan passed; `conduit-tray`: 23 passed)
+- `cd src-tauri/ui && npm run check` → exit 0 (`svelte-check found 0 errors and 0 warnings`)
+- `cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && (cd src-tauri/ui && npm run check && npm test)` → exit 0 (0 clippy warnings; all workspace Rust tests passed; svelte-check 0 errors/warnings; 95/95 UI tests passed)

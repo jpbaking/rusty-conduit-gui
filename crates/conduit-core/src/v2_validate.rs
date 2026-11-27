@@ -19,10 +19,11 @@ use rusty_conduit_engine::mitm::MIN_MITM_CERT_TTL;
 use rusty_conduit_engine::router::Router;
 use rusty_conduit_engine::routing::{RoutingError, PROFILE_BLOCK, PROFILE_DIRECT};
 use thiserror::Error;
+use uuid::Uuid;
 
-use crate::model::LoggingConfig;
-use crate::v2_mapping::build_routing_input;
-use crate::v2_model::{GlobalFilterConfig, Proxy, Tunnel, TunnelId, UpstreamKind};
+use crate::model::{ForwardDirection, ForwardProxyProtocol, LoggingConfig};
+use crate::v2_mapping::{build_routing_input, proxy_referenced_targets};
+use crate::v2_model::{GlobalFilterConfig, Proxy, TargetRef, Tunnel, TunnelId, UpstreamKind};
 use crate::validate::{denylisted_flag, keepalive_problem, port_forward_problem_in};
 use crate::{MappingError, SshIpVersion, ValidateError};
 
@@ -51,10 +52,14 @@ pub enum ProxyValidateError {
     InvalidLogFormat(String),
     #[error("two upstream profiles are named `{0}`: profile names must be unique")]
     DuplicateProfile(String),
-    #[error("`{0}` is a built-in profile name and cannot be used for an upstream profile")]
+    #[error("`{0}` is a reserved profile name and cannot be used for an upstream profile")]
     ReservedProfileName(String),
     #[error("profile `{profile}` routes through tunnel {tunnel_id}, which does not exist")]
     UnknownTunnel { profile: String, tunnel_id: TunnelId },
+    #[error(
+        "routing target references tunnel {tunnel_id} forward {forward_id}, which does not exist or is not a local proxy forward"
+    )]
+    UnknownTunnelForward { tunnel_id: TunnelId, forward_id: Uuid },
     #[error(transparent)]
     Mapping(#[from] MappingError),
     #[error(transparent)]
@@ -94,10 +99,37 @@ pub fn validate_tunnel(tunnel: &Tunnel) -> Result<(), ValidateError> {
         Some(_) => {}
     }
 
+    if tunnel.forward.enabled {
+        if tunnel.forward.effective_ports() == (0, 0) {
+            return Err(ValidateError::NoListeners);
+        }
+        if let Some(mitm) = &tunnel.mitm {
+            if mitm.ca.is_none() {
+                return Err(ValidateError::MissingMitmCa);
+            }
+            if mitm.cert_ttl < MIN_MITM_CERT_TTL {
+                return Err(ValidateError::CertTtlTooShort(mitm.cert_ttl));
+            }
+        }
+    }
+
+    let local_proxy = tunnel
+        .forward
+        .enabled
+        .then_some((tunnel.forward.bind, tunnel.forward.effective_ports()));
     let reverse = (tunnel.reverse.reverse_bind, tunnel.reverse.effective_ports());
     for (index, forward) in tunnel.port_forwards.iter().enumerate() {
+        if forward.direction == ForwardDirection::Remote
+            && forward.proxy_protocol != ForwardProxyProtocol::None
+        {
+            return Err(ValidateError::InvalidPortForward {
+                index,
+                spec: forward.spec(),
+                message: "proxy protocol is only supported on local (-L) port forwards".into(),
+            });
+        }
         if let Some(message) =
-            port_forward_problem_in(&tunnel.port_forwards, index, forward, None, reverse)
+            port_forward_problem_in(&tunnel.port_forwards, index, forward, local_proxy, reverse)
         {
             return Err(ValidateError::InvalidPortForward {
                 index,
@@ -122,8 +154,10 @@ pub fn validate_tunnel(tunnel: &Tunnel) -> Result<(), ValidateError> {
     }
     keepalive_problem(k.tcp_keepalive, k.tcp_keepalive_interval, k.tcp_keepalive_retries)?;
 
-    let r = &tunnel.reverse;
     let invalid = |scope, rule, message| ValidateError::InvalidFilterRule { scope, rule, message };
+    filter_rules("forward_allow", &tunnel.forward.allow, invalid)?;
+    filter_rules("forward_block", &tunnel.forward.block, invalid)?;
+    let r = &tunnel.reverse;
     filter_rules("reverse_allow", &r.reverse_allow, invalid)?;
     filter_rules("reverse_block", &r.reverse_block, invalid)?;
 
@@ -139,12 +173,33 @@ pub fn validate_tunnel(tunnel: &Tunnel) -> Result<(), ValidateError> {
 
 /// Validate a [`Proxy`], returning the first `FATAL` problem found.
 ///
-/// `known_tunnels` are the Tunnels an [`UpstreamKind::Tunnel`] profile may name.
-/// `extra_listeners` (other Proxies' listeners and Tunnel reverse listeners) join the Proxy's
-/// own listeners for self-loop detection.
+/// `known_tunnels` are the Tunnels an [`UpstreamKind::Tunnel`] profile or `@tunnel:` /
+/// `@forward:` target may name. `extra_listeners` (other Proxies' listeners and Tunnel reverse
+/// listeners) join the Proxy's own listeners for self-loop detection.
 pub fn validate_proxy(
     proxy: &Proxy,
     known_tunnels: &[TunnelId],
+    extra_listeners: &[SocketAddr],
+) -> Result<(), ProxyValidateError> {
+    validate_proxy_inner(proxy, known_tunnels, None, extra_listeners)
+}
+
+/// Validate a [`Proxy`] against full [`Tunnel`] definitions, additionally verifying that every
+/// `@forward:<tid>:<fid>` target names an existing local (`-L`) port forward with a proxy
+/// protocol (`http` or `socks5`).
+pub fn validate_proxy_with_tunnels(
+    proxy: &Proxy,
+    known_tunnels: &[Tunnel],
+    extra_listeners: &[SocketAddr],
+) -> Result<(), ProxyValidateError> {
+    let ids: Vec<TunnelId> = known_tunnels.iter().map(|t| t.id).collect();
+    validate_proxy_inner(proxy, &ids, Some(known_tunnels), extra_listeners)
+}
+
+fn validate_proxy_inner(
+    proxy: &Proxy,
+    known_tunnel_ids: &[TunnelId],
+    known_tunnels: Option<&[Tunnel]>,
     extra_listeners: &[SocketAddr],
 ) -> Result<(), ProxyValidateError> {
     if proxy.listeners.http_port == 0 && proxy.listeners.socks_port == 0 {
@@ -192,19 +247,56 @@ pub fn validate_proxy(
 
     let mut names = BTreeSet::new();
     for p in &proxy.profiles {
-        if p.name == PROFILE_DIRECT || p.name == PROFILE_BLOCK {
+        if p.name == PROFILE_DIRECT || p.name == PROFILE_BLOCK || p.name.starts_with('@') {
             return Err(ProxyValidateError::ReservedProfileName(p.name.clone()));
         }
         if !names.insert(p.name.as_str()) {
             return Err(ProxyValidateError::DuplicateProfile(p.name.clone()));
         }
         if let UpstreamKind::Tunnel { tunnel_id } = p.kind {
-            if !known_tunnels.contains(&tunnel_id) {
+            if !known_tunnel_ids.contains(&tunnel_id) {
                 return Err(ProxyValidateError::UnknownTunnel {
                     profile: p.name.clone(),
                     tunnel_id,
                 });
             }
+        }
+    }
+
+    for target in proxy_referenced_targets(proxy) {
+        match &target {
+            TargetRef::Tunnel(tunnel_id) => {
+                if !known_tunnel_ids.contains(tunnel_id) {
+                    return Err(ProxyValidateError::UnknownTunnel {
+                        profile: target.to_wire(),
+                        tunnel_id: *tunnel_id,
+                    });
+                }
+            }
+            TargetRef::TunnelForward { tunnel_id, forward_id } => {
+                if !known_tunnel_ids.contains(tunnel_id) {
+                    return Err(ProxyValidateError::UnknownTunnel {
+                        profile: target.to_wire(),
+                        tunnel_id: *tunnel_id,
+                    });
+                }
+                if let Some(tunnels) = known_tunnels {
+                    let valid = tunnels.iter().find(|t| t.id == *tunnel_id).is_some_and(|t| {
+                        t.port_forwards.iter().any(|f| {
+                            f.id == *forward_id
+                                && f.direction == ForwardDirection::Local
+                                && f.proxy_protocol != ForwardProxyProtocol::None
+                        })
+                    });
+                    if !valid {
+                        return Err(ProxyValidateError::UnknownTunnelForward {
+                            tunnel_id: *tunnel_id,
+                            forward_id: *forward_id,
+                        });
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -525,5 +617,181 @@ mod tests {
             validate_proxy(&p, &[id], &[]),
             Err(ProxyValidateError::Routing(RoutingError::InvalidProfile { .. }))
         ));
+    }
+
+    #[test]
+    fn tunnel_forward_filters_are_always_validated() {
+        let mut t = tunnel();
+        assert!(!t.forward.enabled);
+        t.forward.allow = vec!["allowed.example".into()];
+        t.forward.block = vec!["*.example".into()];
+        validate_tunnel(&t).unwrap();
+
+        t.forward.allow = vec!["bad*rule".into()];
+        assert!(matches!(
+            validate_tunnel(&t),
+            Err(ValidateError::InvalidFilterRule { scope: "forward_allow", .. })
+        ));
+
+        let mut t = tunnel();
+        t.forward.block = vec!["".into()];
+        assert!(matches!(
+            validate_tunnel(&t),
+            Err(ValidateError::InvalidFilterRule { scope: "forward_block", .. })
+        ));
+    }
+
+    #[test]
+    fn tunnel_forward_enabled_checks_ports_collisions_and_mitm() {
+        // Inactive MITM when forward is off does not fail validation.
+        let mut t = tunnel();
+        t.mitm = Some(MitmConfig { ca: None, ..MitmConfig::default() });
+        validate_tunnel(&t).unwrap();
+
+        // Forward on with both ports 0 is rejected.
+        t.forward.enabled = true;
+        t.forward.http_port = 0;
+        t.forward.socks_port = 0;
+        assert!(matches!(validate_tunnel(&t), Err(ValidateError::NoListeners)));
+
+        // Forward on checks MITM CA and cert_ttl.
+        t.forward.http_port = 3128;
+        assert!(matches!(validate_tunnel(&t), Err(ValidateError::MissingMitmCa)));
+        t.mitm = Some(MitmConfig {
+            ca: Some(MitmCaId::new()),
+            cert_ttl: Duration::from_secs(1),
+            ..MitmConfig::default()
+        });
+        assert!(matches!(validate_tunnel(&t), Err(ValidateError::CertTtlTooShort(_))));
+        t.mitm = Some(MitmConfig {
+            ca: Some(MitmCaId::new()),
+            cert_ttl: Duration::from_secs(60),
+            ..MitmConfig::default()
+        });
+        validate_tunnel(&t).unwrap();
+
+        // Local port forward colliding with active forward proxy port is rejected.
+        t.port_forwards.push(PortForward {
+            enabled: true,
+            direction: ForwardDirection::Local,
+            bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 3128,
+            dest_host: "db.internal".into(),
+            dest_port: 5432,
+            ..PortForward::default()
+        });
+        assert!(matches!(
+            validate_tunnel(&t),
+            Err(ValidateError::InvalidPortForward { index: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn tunnel_rejects_proxy_protocol_on_remote_port_forward() {
+        let mut t = tunnel();
+        t.port_forwards.push(PortForward {
+            enabled: true,
+            direction: ForwardDirection::Local,
+            port: 18080,
+            dest_host: "proxy.internal".into(),
+            dest_port: 1080,
+            proxy_protocol: ForwardProxyProtocol::Socks5,
+            ..PortForward::default()
+        });
+        validate_tunnel(&t).unwrap();
+
+        t.port_forwards.push(PortForward {
+            enabled: true,
+            direction: ForwardDirection::Remote,
+            port: 19090,
+            dest_host: "127.0.0.1".into(),
+            dest_port: 8080,
+            proxy_protocol: ForwardProxyProtocol::Http,
+            ..PortForward::default()
+        });
+        assert!(matches!(
+            validate_tunnel(&t),
+            Err(ValidateError::InvalidPortForward { index: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn proxy_rejects_at_prefixed_user_profile_names() {
+        let id = TunnelId::new();
+        let mut p = proxy(id);
+        p.profiles.push(upstream("@custom", UpstreamKind::Http, 1081));
+        assert!(matches!(
+            validate_proxy(&p, &[id], &[]),
+            Err(ProxyValidateError::ReservedProfileName(n)) if n == "@custom"
+        ));
+    }
+
+    #[test]
+    fn proxy_with_tunnels_validates_synthetic_tunnel_and_forward_targets() {
+        use crate::v2_model::{forward_target_name, tunnel_target_name};
+
+        let fwd_ok = Uuid::new_v4();
+        let fwd_plain = Uuid::new_v4();
+        let fwd_remote = Uuid::new_v4();
+        let mut t = tunnel();
+        t.id = TunnelId::new();
+        t.port_forwards = vec![
+            PortForward {
+                id: fwd_ok,
+                direction: ForwardDirection::Local,
+                port: 18080,
+                dest_host: "proxy.internal".into(),
+                dest_port: 3128,
+                proxy_protocol: ForwardProxyProtocol::Http,
+                ..PortForward::default()
+            },
+            PortForward {
+                id: fwd_plain,
+                direction: ForwardDirection::Local,
+                port: 15432,
+                dest_host: "db.internal".into(),
+                dest_port: 5432,
+                proxy_protocol: ForwardProxyProtocol::None,
+                ..PortForward::default()
+            },
+            PortForward {
+                id: fwd_remote,
+                direction: ForwardDirection::Remote,
+                port: 19090,
+                dest_host: "127.0.0.1".into(),
+                dest_port: 8080,
+                proxy_protocol: ForwardProxyProtocol::None,
+                ..PortForward::default()
+            },
+        ];
+
+        // Valid @tunnel and @forward targets with zero manual UpstreamProfiles.
+        let mut p = Proxy { name: "p".into(), ..Proxy::default() };
+        p.routing.default = RouteOneOrMany::One(tunnel_target_name(t.id));
+        let mut rule = RoutingRule::to_target(RouteOneOrMany::One(forward_target_name(t.id, fwd_ok)));
+        rule.host_wildcard = Some(RouteOneOrMany::One("*.corp.example".into()));
+        p.routing.rules.push(rule);
+        validate_proxy_with_tunnels(&p, std::slice::from_ref(&t), &[]).unwrap();
+
+        // Unknown @tunnel target.
+        let unknown_tid = TunnelId::new();
+        let mut bad_t = p.clone();
+        bad_t.routing.default = RouteOneOrMany::One(tunnel_target_name(unknown_tid));
+        assert!(matches!(
+            validate_proxy_with_tunnels(&bad_t, std::slice::from_ref(&t), &[]),
+            Err(ProxyValidateError::UnknownTunnel { tunnel_id, .. }) if tunnel_id == unknown_tid
+        ));
+
+        // @forward targeting a non-proxy local forward, a remote forward, or a missing forward.
+        for bad_fid in [fwd_plain, fwd_remote, Uuid::new_v4()] {
+            let mut bad_f = p.clone();
+            bad_f.routing.rules[0].target =
+                RouteOneOrMany::One(forward_target_name(t.id, bad_fid));
+            assert!(matches!(
+                validate_proxy_with_tunnels(&bad_f, std::slice::from_ref(&t), &[]),
+                Err(ProxyValidateError::UnknownTunnelForward { tunnel_id, forward_id })
+                    if tunnel_id == t.id && forward_id == bad_fid
+            ));
+        }
     }
 }

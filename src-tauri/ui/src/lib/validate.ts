@@ -17,6 +17,7 @@ import type {
   Tunnel,
   TunnelConfig,
   TunnelId,
+  Uuid,
 } from "./types";
 
 /** Field path, such as `forward.bind` or `hop:<id>:host`, mapped to its message. */
@@ -353,6 +354,9 @@ function portForwardErrors(
     if (!isPort(f.dest_port)) errors[key("dest_port")] = "Use a port from 1 to 65535.";
     const hostError = forwardHostError(f.dest_host);
     if (hostError) errors[key("dest_host")] = hostError;
+    if (f.direction === "remote" && f.proxy_protocol !== "none") {
+      errors[key("proxy_protocol")] = "Proxy protocol is only supported on local (-L) port forwards.";
+    }
     if (!f.enabled || errors[key("port")] || errors[key("bind")]) return;
 
     const [proxyBind, ports, side] =
@@ -446,7 +450,19 @@ export function tunnelErrors(tunnel: Tunnel): FieldErrors {
   if (tunnel.hops.length === 0) errors.hops = "Add at least one hop. The last hop is the target.";
   for (const hop of tunnel.hops) Object.assign(errors, hostErrors(hop.host, `hop:${hop.hop_id}:`));
 
-  const { reverse } = tunnel;
+  const { forward, reverse } = tunnel;
+  if (forward.enabled) {
+    if (!isIpAddress(forward.bind)) errors["forward.bind"] = "Use an IP address, such as 127.0.0.1.";
+    if (!isPort(forward.http_port, true)) errors["forward.http"] = "Use a port from 0 to 65535. 0 turns it off.";
+    if (!isPort(forward.socks_port, true)) errors["forward.socks"] = "Use a port from 0 to 65535. 0 turns it off.";
+    if (!Number.isSafeInteger(forward.max_connections) || forward.max_connections < 0) {
+      errors["forward.max_connections"] = "Use a whole number. 0 means unlimited.";
+    }
+    if (forward.http_port === 0 && forward.socks_port === 0) {
+      errors["forward.ports"] = "Set an HTTP or SOCKS port, or switch the forward proxy off.";
+    }
+    if (tunnel.mitm) mitmErrors(errors, tunnel.mitm);
+  }
   if (!isIpAddress(reverse.reverse_bind)) {
     errors["reverse.bind"] = "Use an IP address, such as 127.0.0.1.";
   }
@@ -461,7 +477,8 @@ export function tunnelErrors(tunnel: Tunnel): FieldErrors {
   if (reverse.enabled && reverse.reverse_http_port === 0 && reverse.reverse_socks_port === 0) {
     errors["reverse.ports"] = "Set an HTTP or SOCKS port, or switch the reverse proxy off.";
   }
-  portForwardErrors(errors, { forward: null, reverse, port_forwards: tunnel.port_forwards });
+  portForwardErrors(errors, { forward, reverse, port_forwards: tunnel.port_forwards });
+  filterErrors(errors, "forward", forward.allow, forward.block);
   filterErrors(errors, "reverse", reverse.reverse_allow, reverse.reverse_block);
   keepaliveErrors(errors, tunnel.keepalive, "keepalive");
   loggingErrors(errors, tunnel.logging);
@@ -471,6 +488,15 @@ export function tunnelErrors(tunnel: Tunnel): FieldErrors {
 
 /** Built-in profile names a Proxy may route to without defining them. */
 export const BUILTIN_PROFILES = ["direct", "block"] as const;
+
+export const TUNNEL_TARGET_PREFIX = "@tunnel:";
+export const FORWARD_TARGET_PREFIX = "@forward:";
+
+export const tunnelTarget = (id: TunnelId): string => `${TUNNEL_TARGET_PREFIX}${id}`;
+export const forwardTarget = (tid: TunnelId, fid: Uuid): string =>
+  `${FORWARD_TARGET_PREFIX}${tid}:${fid}`;
+export const isSyntheticTarget = (name: string): boolean =>
+  name.startsWith(TUNNEL_TARGET_PREFIX) || name.startsWith(FORWARD_TARGET_PREFIX);
 
 const MAX_U16 = 65_535;
 
@@ -508,9 +534,22 @@ const asList = <T>(value: T | T[] | undefined): T[] =>
 /**
  * Field errors for a Proxy, keyed by field path (`listeners.http_port`,
  * `profiles:<index>:host`, `routing.rules:<index>:target`, `routing.http.default`, ...).
- * Mirrors `validate_proxy` and the engine checks it runs on profiles, targets, and self-loops.
+ * Mirrors `validate_proxy_with_tunnels` and the engine checks it runs on profiles, targets, and self-loops.
  */
-export function proxyErrors(proxy: Proxy, knownTunnels: readonly TunnelId[]): FieldErrors {
+export function proxyErrors(
+  proxy: Proxy,
+  knownTunnels: readonly (TunnelId | Pick<Tunnel, "id" | "port_forwards">)[],
+): FieldErrors {
+  const knownTunnelIds = new Set<TunnelId>();
+  const tunnelsById = new Map<TunnelId, Pick<Tunnel, "id" | "port_forwards">>();
+  for (const item of knownTunnels) {
+    if (typeof item === "string") {
+      knownTunnelIds.add(item);
+    } else {
+      knownTunnelIds.add(item.id);
+      tunnelsById.set(item.id, item);
+    }
+  }
   const errors: FieldErrors = {};
   if (!proxy.name.trim()) errors.name = "Enter a proxy name.";
 
@@ -578,6 +617,8 @@ export function proxyErrors(proxy: Proxy, knownTunnels: readonly TunnelId[]): Fi
     if (!name) errors[key("name")] = "Enter a profile name.";
     else if ((BUILTIN_PROFILES as readonly string[]).includes(name)) {
       errors[key("name")] = `"${name}" is a built-in profile name.`;
+    } else if (name.startsWith("@")) {
+      errors[key("name")] = 'Profile names cannot start with "@".';
     } else if (seen.has(name)) {
       errors[key("name")] = `Another profile is already named "${name}".`;
     }
@@ -585,7 +626,7 @@ export function proxyErrors(proxy: Proxy, knownTunnels: readonly TunnelId[]): Fi
 
     const { kind } = profile;
     if (kind.type === "tunnel") {
-      if (!knownTunnels.includes(kind.tunnel_id)) errors[key("tunnel")] = "Choose a tunnel that exists.";
+      if (!knownTunnelIds.has(kind.tunnel_id)) errors[key("tunnel")] = "Choose a tunnel that exists.";
       return;
     }
     if (kind.type === "composite") {
@@ -603,12 +644,40 @@ export function proxyErrors(proxy: Proxy, knownTunnels: readonly TunnelId[]): Fi
     }
   });
 
+  const singleTargetError = (name: string): string | null => {
+    if (name.startsWith(TUNNEL_TARGET_PREFIX)) {
+      const tid = name.slice(TUNNEL_TARGET_PREFIX.length);
+      return tid && knownTunnelIds.has(tid) ? null : `Unknown tunnel "${tid}".`;
+    }
+    if (name.startsWith(FORWARD_TARGET_PREFIX)) {
+      const rest = name.slice(FORWARD_TARGET_PREFIX.length);
+      const parts = rest.split(":");
+      if (parts.length !== 2 || !parts[0] || !parts[1]) {
+        return `Invalid tunnel forward target "${name}".`;
+      }
+      const [tid, fid] = parts as [string, string];
+      if (!knownTunnelIds.has(tid)) return `Unknown tunnel "${tid}".`;
+      const tunnel = tunnelsById.get(tid);
+      if (tunnel) {
+        const ok = tunnel.port_forwards.some(
+          (f) => f.id === fid && f.direction === "local" && f.proxy_protocol !== "none",
+        );
+        if (!ok) return `Unknown or non-proxy local forward "${fid}".`;
+      }
+      return null;
+    }
+    return defined.has(name) ? null : `Unknown profile "${name}".`;
+  };
+
   // Composite sub-profiles must exist; checked after every name is known.
   proxy.profiles.forEach((profile, index) => {
     if (profile.kind.type !== "composite") return;
     for (const field of ["http", "https", "fallback"] as const) {
       const sub = profile.kind[field].trim();
-      if (sub && !defined.has(sub)) errors[`profiles:${index}:composite.${field}`] = `Unknown profile "${sub}".`;
+      if (sub) {
+        const problem = singleTargetError(sub);
+        if (problem) errors[`profiles:${index}:composite.${field}`] = problem;
+      }
     }
   });
 
@@ -616,8 +685,11 @@ export function proxyErrors(proxy: Proxy, knownTunnels: readonly TunnelId[]): Fi
   const targetError = (target: RouteTarget): string | null => {
     const names = targetNames(target);
     if (names.length === 0) return "Choose at least one profile.";
-    const missing = names.find((n) => !defined.has(n));
-    return missing === undefined ? null : `Unknown profile "${missing}".`;
+    for (const name of names) {
+      const problem = singleTargetError(name);
+      if (problem) return problem;
+    }
+    return null;
   };
   const ruleErrors = (prefix: string, rules: RoutingRule[]) => {
     rules.forEach((rule, index) => {

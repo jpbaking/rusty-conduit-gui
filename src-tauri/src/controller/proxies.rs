@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use conduit_core::{
-    validate_proxy, AppConfig, Proxy, ProxyId, RouteInbound, TunnelId, TunnelStartMode,
+    validate_proxy_with_tunnels, AppConfig, Proxy, ProxyId, RouteInbound, TunnelId, TunnelStartMode,
     UpstreamKind, UpstreamPasswordSource, UpstreamProfile,
 };
 use conduit_runtime::{
@@ -119,10 +119,6 @@ fn not_found(kind: &'static str, id: impl ToString) -> AppError {
     AppError::NotFound { kind, id: id.to_string() }
 }
 
-fn known_tunnels(config: &AppConfig) -> Vec<TunnelId> {
-    config.tunnels.iter().map(|t| t.id).collect()
-}
-
 /// Rejects an upstream profile whose vault password or Tunnel does not exist.
 fn check_profile_refs(
     config: &AppConfig,
@@ -183,7 +179,7 @@ impl AppController {
         let saved = proxy.clone();
         super::run_blocking(move || {
             controller.mutate_config(|config| {
-                validate_proxy(&proxy, &known_tunnels(config), &[])?;
+                validate_proxy_with_tunnels(&proxy, &config.tunnels, &[])?;
                 for profile in &proxy.profiles {
                     check_profile_refs(config, &records, profile)?;
                 }
@@ -290,6 +286,17 @@ impl AppController {
         inbound: RouteInbound,
     ) -> Result<RouteTestResult, AppError> {
         Ok(ProxyManager::test_route(proxy, raw_target, inbound)?)
+    }
+
+    /// Route Tester using live saved Tunnels so `@tunnel:` and `@forward:` targets resolve to
+    /// friendly upstream labels.
+    pub fn test_route_live(
+        &self,
+        proxy: &Proxy,
+        raw_target: &str,
+        inbound: RouteInbound,
+    ) -> Result<RouteTestResult, AppError> {
+        Ok(self.proxies().test_route_live(proxy, raw_target, inbound)?)
     }
 
     /// Test Upstream: dials `host:port` through the draft `proxy`'s profile, with timing.
@@ -775,5 +782,77 @@ mod tests {
         assert_eq!(c.tunnels().snapshot(linked).unwrap().state, SessionState::Stopped);
         c.stop_all_v2().await;
         assert!(!running(auto) && !running(manual));
+    }
+
+    #[tokio::test]
+    async fn proxies_startup_migrates_legacy_tunnel_profiles_and_persists() {
+        let dir = TempDir::new();
+        let c = controller(&dir);
+        let t = c
+            .upsert_tunnel(Tunnel {
+                name: "bastion".into(),
+                hops: vec![hop("", 22, Vec::new())],
+                ..Tunnel::default()
+            })
+            .unwrap();
+        let mut legacy = proxy("legacy");
+        legacy.profiles.push(UpstreamProfile {
+            kind: UpstreamKind::Tunnel { tunnel_id: t.id },
+            host: None,
+            port: None,
+            ..http_profile("via-ssh", 0, None)
+        });
+        legacy.routing.default = RouteOneOrMany::One("via-ssh".into());
+        let saved_id = c.upsert_proxy(legacy).await.unwrap().profile.id;
+        drop(c);
+
+        // Reopening runs `migrate_tunnel_profiles` and writes the migrated config back to disk.
+        let reopened = controller(&dir);
+        let migrated = reopened.proxy_profile(saved_id).unwrap();
+        assert!(!migrated.profiles.iter().any(|p| matches!(p.kind, UpstreamKind::Tunnel { .. })));
+        let expected_target = format!("@tunnel:{}", t.id);
+        assert_eq!(migrated.routing.default, RouteOneOrMany::One(expected_target.clone()));
+        let raw = std::fs::read_to_string(dir.path().join("config.json")).unwrap();
+        assert!(raw.contains(&expected_target));
+    }
+
+    #[tokio::test]
+    async fn proxies_test_route_live_formats_tunnel_and_forward_targets() {
+        let dir = TempDir::new();
+        let c = controller(&dir);
+        let fwd_id = uuid::Uuid::new_v4();
+        let t = c
+            .upsert_tunnel(Tunnel {
+                name: "bastion".into(),
+                hops: vec![hop("", 22, Vec::new())],
+                port_forwards: vec![conduit_core::PortForward {
+                    id: fwd_id,
+                    enabled: true,
+                    direction: conduit_core::ForwardDirection::Local,
+                    name: "corp-http".into(),
+                    bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    port: free_port(),
+                    dest_host: "proxy.internal".into(),
+                    dest_port: 8080,
+                    proxy_protocol: conduit_core::ForwardProxyProtocol::Http,
+                }],
+                ..Tunnel::default()
+            })
+            .unwrap();
+
+        let mut draft = proxy("draft");
+        draft.routing.rules.push(RoutingRule {
+            name: Some("via-fwd".into()),
+            host: Some(RouteOneOrMany::One("app.internal".into())),
+            ..RoutingRule::to_target(RouteOneOrMany::One(format!("@forward:{}:{fwd_id}", t.id)))
+        });
+        draft.routing.default = RouteOneOrMany::One(format!("@tunnel:{}", t.id));
+
+        let hit = c.test_route_live(&draft, "app.internal:443", RouteInbound::Http).unwrap();
+        assert_eq!(hit.matched_rule.as_deref(), Some("via-fwd"));
+        assert!(hit.targets[0].redacted_upstream.contains("bastion"), "{:?}", hit.targets[0]);
+
+        let miss = c.test_route_live(&draft, "other.example:443", RouteInbound::Http).unwrap();
+        assert!(miss.targets[0].redacted_upstream.contains("bastion"), "{:?}", miss.targets[0]);
     }
 }

@@ -105,4 +105,36 @@ describe("forward presets", () => {
     const errors = presetErrors({ ...preset, name: " ", bind: "box", port: 0, dest_host: "a b" });
     assert.deepEqual(Object.keys(errors).sort(), ["bind", "dest_host", "name", "port"]);
   });
+
+  test("defaults proxy_protocol to none and supports http/socks5 overrides", () => {
+    const localDefault = newForward("local");
+    assert.equal(localDefault.proxy_protocol, "none");
+
+    const remoteDefault = newForward("remote");
+    assert.equal(remoteDefault.proxy_protocol, "none");
+
+    const parsedLocal = parsed(parseForwardSpec("local", "8080:proxy.internal:3128"));
+    assert.equal(parsedLocal.proxy_protocol, "none");
+
+    const httpForward = newForward("local", {
+      name: "Corp HTTP",
+      port: 8080,
+      dest_host: "proxy.internal",
+      dest_port: 3128,
+      proxy_protocol: "http",
+    });
+    assert.equal(httpForward.proxy_protocol, "http");
+
+    const socksForward = newForward("local", {
+      port: 1080,
+      dest_host: "socks.internal",
+      dest_port: 1080,
+      proxy_protocol: "socks5",
+    });
+    assert.equal(socksForward.proxy_protocol, "socks5");
+
+    const preset = presetFromForward(httpForward);
+    const fromPreset = forwardFromPreset(preset);
+    assert.equal(fromPreset.proxy_protocol, "none");
+  });
 });

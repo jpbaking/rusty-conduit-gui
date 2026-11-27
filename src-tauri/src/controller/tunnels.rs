@@ -201,6 +201,11 @@ impl AppController {
             for hop in &tunnel.hops {
                 check_auth_refs(config, &records, &hop.host.auth)?;
             }
+            if let Some(ca) = tunnel.mitm.as_ref().and_then(|m| m.ca.as_ref()) {
+                if !config.mitm_cas.iter().any(|c| c.id == *ca) {
+                    return Err(not_found("MITM CA", ca));
+                }
+            }
             match config.tunnels.iter_mut().find(|t| t.id == tunnel.id) {
                 Some(existing) => *existing = tunnel,
                 None => config.tunnels.push(tunnel),

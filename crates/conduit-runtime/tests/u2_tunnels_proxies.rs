@@ -1076,3 +1076,121 @@ fn route_tester_and_test_upstream_against_live_listeners() {
         f.finish().await;
     });
 }
+
+#[test]
+fn proxy_routes_through_synthetic_tunnel_and_forward_targets_with_filter() {
+    use conduit_core::{
+        forward_target_name, tunnel_target_name, ForwardDirection, ForwardProxyProtocol,
+        PortForward,
+    };
+
+    run(async {
+        let f = Fixture::new();
+        let node = spawn_node(None).await;
+        f.pin(&node);
+
+        let (upstream_http_port, upstream_served) = spawn_upstream_http().await;
+        let echo_direct_tunnel = spawn_echo().await;
+        let echo_via_fwd = spawn_echo().await;
+
+        let http_fid = Uuid::new_v4();
+        let tunnel = Tunnel {
+            id: TunnelId::new(),
+            name: "edge".into(),
+            start_mode: TunnelStartMode::Linked,
+            hops: vec![f.hop(&node)],
+            forward: ForwardConfig {
+                enabled: false,
+                block: vec!["blocked.example".into()],
+                ..ForwardConfig::default()
+            },
+            port_forwards: vec![PortForward {
+                id: http_fid,
+                name: "corp-http".into(),
+                direction: ForwardDirection::Local,
+                port: free_port().await,
+                dest_host: "127.0.0.1".into(),
+                dest_port: upstream_http_port,
+                proxy_protocol: ForwardProxyProtocol::Http,
+                ..Default::default()
+            }],
+            keepalive: fast_keepalive(),
+            ..Tunnel::default()
+        };
+        let tid = tunnel.id;
+        f.tunnels.upsert_tunnel(tunnel);
+
+        let t_wire = tunnel_target_name(tid);
+        let f_wire = forward_target_name(tid, http_fid);
+
+        let mut p = proxy("edge-proxy", free_port().await, free_port().await);
+        p.routing.rules = vec![
+            port_rule("to-edge-tunnel", echo_direct_tunnel, &t_wire),
+            port_rule("to-edge-http-fwd", echo_via_fwd, &f_wire),
+            {
+                let mut r = RoutingRule::to_target(RouteOneOrMany::One(t_wire.clone()));
+                r.name = Some("to-blocked".into());
+                r.host = Some(RouteOneOrMany::One("blocked.example".into()));
+                r
+            },
+        ];
+        let pid = f.add_proxy(&p).await;
+        f.proxies.start(pid).await.unwrap();
+        // Linked tunnel auto-started because proxy references `@tunnel:` / `@forward:`.
+        f.until_tunnel(tid, SessionState::Connected).await;
+
+        let http_addr = f.listener(pid, "http");
+        let data = payload(8 * 1024);
+
+        // (1) `@tunnel:<tid>` routes directly through the SSH tunnel.
+        let mut s = http_connect(http_addr, "127.0.0.1", echo_direct_tunnel).await;
+        roundtrip(&mut s, &data).await;
+        drop(s);
+
+        // (2) Tunnel filter is enforced on Proxy traffic routed through `@tunnel:<tid>` (HTTP 403).
+        let mut blocked = TcpStream::connect(http_addr).await.unwrap();
+        blocked
+            .write_all(b"CONNECT blocked.example:443 HTTP/1.1\r\nHost: blocked.example:443\r\n\r\n")
+            .await
+            .unwrap();
+        let head = read_head(&mut blocked).await.expect("403 head");
+        assert!(head.starts_with("HTTP/1.1 403"), "expected 403 from tunnel filter, got: {head}");
+
+        // (3) `@forward:<tid>:<fid>` dials the remote HTTP proxy in-process over SSH.
+        let mut s = http_connect(http_addr, "127.0.0.1", echo_via_fwd).await;
+        roundtrip(&mut s, &data).await;
+        drop(s);
+        eventually("in-process -L HTTP proxy served", || {
+            (upstream_served.load(Ordering::SeqCst) >= 1)
+                .then_some(())
+                .ok_or_else(|| "not yet".to_string())
+        })
+        .await;
+
+        // (4) test_route_live formats friendly upstream labels.
+        let route_t = f
+            .proxies
+            .test_route_live(&p, &format!("127.0.0.1:{echo_direct_tunnel}"), RouteInbound::Http)
+            .unwrap();
+        assert_eq!(route_t.targets[0].redacted_upstream, "tunnel:edge");
+        let route_f = f
+            .proxies
+            .test_route_live(&p, &format!("127.0.0.1:{echo_via_fwd}"), RouteInbound::Http)
+            .unwrap();
+        assert_eq!(route_f.targets[0].redacted_upstream, "tunnel:edge › corp-http (http)");
+
+        // (5) set_override with `@forward:<tid>:<fid>` routes arbitrary destinations through it.
+        f.proxies.set_override(pid, Some(f_wire.clone())).await.unwrap();
+        let mut s = http_connect(http_addr, "127.0.0.1", echo_direct_tunnel).await;
+        roundtrip(&mut s, &data).await;
+        drop(s);
+        eventually("override via -L HTTP proxy served", || {
+            (upstream_served.load(Ordering::SeqCst) >= 2)
+                .then_some(())
+                .ok_or_else(|| "not yet".to_string())
+        })
+        .await;
+
+        f.finish().await;
+    });
+}

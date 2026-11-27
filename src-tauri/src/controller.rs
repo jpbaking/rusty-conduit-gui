@@ -25,9 +25,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use conduit_core::{
-    load_known_hosts, load_or_migrate_app_config, save_app_config, save_known_hosts, AppConfig,
-    KeyId, KnownHostsStore, Proxy, ProxyValidateError, SecretRef, SessionProfile, StorageError,
-    Tunnel, ValidateError,
+    load_known_hosts, load_or_migrate_app_config, migrate_tunnel_profiles, save_app_config,
+    save_known_hosts, AppConfig, KeyId, KnownHostsStore, Proxy, ProxyValidateError, SecretRef,
+    SessionProfile, StorageError, Tunnel, ValidateError,
 };
 use conduit_runtime::{
     HostKeyPrompt, ManagerConfig, ProxyError, ProxyEvent, ProxyManager, RuntimeError, RuntimeEvent,
@@ -295,6 +295,16 @@ impl AppController {
                 ..AppConfig::default()
             }
         };
+        // Rewrite legacy `UpstreamKind::Tunnel` proxy profiles into `@tunnel:<uuid>` targets.
+        let mut migrated_tunnels = false;
+        for proxy in &mut config.proxies {
+            if migrate_tunnel_profiles(proxy) {
+                migrated_tunnels = true;
+            }
+        }
+        if migrated_tunnels {
+            save_app_config(&paths.config, &config)?;
+        }
         // In memory only: the file is written on the next change, as every other change is.
         // The built-in ids are fixed, so seeding again before then adds nothing new.
         config.seed_forward_presets();
@@ -657,10 +667,20 @@ impl AppController {
     }
 
     /// Unlocks with the key stored in the OS keyring. A missing entry is an error and never
-    /// recreates the vault.
+    /// recreates the vault. Falls back to the pre-migration `io.github.rusty-conduit-ssh-gui`
+    /// vault path if the data directory was migrated and copies the entry forward.
     pub async fn unlock_vault_with_keyring(&self) -> Result<VaultStatus, AppError> {
-        self.unlock_with(|vault, keyring| vault.unlock_with_keyring(keyring))
-            .await
+        let legacy_id = self
+            .inner
+            .paths
+            .vault
+            .parent()
+            .and_then(crate::migration::legacy_data_dir_for)
+            .map(|dir| dir.join("vault.bin").to_string_lossy().into_owned());
+        self.unlock_with(move |vault, keyring| {
+            vault.unlock_with_keyring_fallback(keyring, legacy_id.as_deref())
+        })
+        .await
     }
 
     /// Unlocks a fresh copy of the vault and swaps it in, so slow key derivation never holds

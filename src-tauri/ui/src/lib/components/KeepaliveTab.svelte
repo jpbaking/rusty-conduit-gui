@@ -6,7 +6,13 @@
   const uid = $props.id();
   const ed = chainEditor();
   const startMode = $derived(ed.startMode);
-  const manual = $derived(typeof startMode === "object" ? startMode.manual : null);
+  const startModeValue = $derived(
+    startMode === "linked"
+      ? "linked"
+      : typeof startMode === "object" && startMode.manual.autostart
+        ? "autostart"
+        : "manual",
+  );
   const draft = $derived(ed.draft as SessionProfile);
   const tunnel = $derived(draft.tunnel);
   const errors = $derived(ed.draftErrors);
@@ -132,37 +138,28 @@
   {/if}
   {#if startMode !== undefined && ed.setStartMode}
     {@const setStartMode = ed.setStartMode}
-    <fieldset class="start-mode">
-      <legend>Start mode</legend>
-      <label class="check">
-        <input
-          type="radio"
-          name={`${uid}-start-mode`}
-          checked={startMode === "linked"}
-          onchange={() => setStartMode("linked")}
-        />
-        Linked: runs while a Proxy that uses it is running
+    <div class="field-row">
+      <label class="field">
+        Start mode
+        <select
+          value={startModeValue}
+          onchange={(e) => {
+            const v = e.currentTarget.value;
+            setStartMode(
+              v === "linked"
+                ? "linked"
+                : v === "autostart"
+                  ? { manual: { autostart: true } }
+                  : { manual: { autostart: false } },
+            );
+          }}
+        >
+          <option value="linked">Run only while a Proxy uses it</option>
+          <option value="manual">Start manually</option>
+          <option value="autostart">Start with the app</option>
+        </select>
       </label>
-      <label class="check">
-        <input
-          type="radio"
-          name={`${uid}-start-mode`}
-          checked={manual !== null}
-          onchange={() => setStartMode({ manual: { autostart: false } })}
-        />
-        Manual: started and stopped by hand
-      </label>
-      {#if manual}
-        <label class="check nested">
-          <input
-            type="checkbox"
-            checked={manual.autostart}
-            onchange={(e) => setStartMode({ manual: { autostart: e.currentTarget.checked } })}
-          />
-          Start with the app
-        </label>
-      {/if}
-    </fieldset>
+    </div>
     {#if !draft.enabled}
       <p class="note">This tunnel is disabled, so it does not start with the app or with Start All. Enable it from the tunnel list's right-click menu.</p>
     {/if}
@@ -184,18 +181,3 @@
   {/if}
 </section>
 </div>
-
-<style>
-  .start-mode {
-    border: none;
-    margin: 0.5rem 0 0;
-    padding: 0;
-  }
-  .start-mode legend {
-    font-weight: 600;
-    margin-bottom: 0.25rem;
-  }
-  .nested {
-    margin-left: 1.5rem;
-  }
-</style>

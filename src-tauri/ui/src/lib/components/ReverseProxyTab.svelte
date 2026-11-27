@@ -55,7 +55,7 @@
     <ProxySwitch
       name="Reverse proxy"
       on={reverse.enabled}
-      lockedReason={forwardEnabled || portForwardOn ? undefined : "To turn this off, turn on the forward proxy or a port forward first"}
+      lockedReason={ed.isTunnel || forwardEnabled || portForwardOn ? undefined : "To turn this off, turn on the forward proxy or a port forward first"}
       onToggle={setEnabled}
     />
   </div>

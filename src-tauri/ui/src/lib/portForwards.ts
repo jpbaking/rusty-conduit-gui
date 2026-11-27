@@ -34,6 +34,7 @@ export function newForward(direction: ForwardDirection, patch: Partial<PortForwa
     port: Number.NaN,
     dest_host: direction === "local" ? "" : "localhost",
     dest_port: Number.NaN,
+    proxy_protocol: "none",
     ...patch,
   };
 }

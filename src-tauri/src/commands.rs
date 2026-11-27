@@ -439,8 +439,13 @@ pub async fn get_proxy_access_records(
 
 /// Route Tester: evaluates `raw_target` against the draft `proxy`. Needs no vault.
 #[tauri::command]
-pub async fn test_route(proxy: Proxy, raw_target: String, inbound: RouteInbound) -> CmdResult<RouteTestResult> {
-    run_blocking(move || AppController::test_route(&proxy, &raw_target, inbound)).await
+pub async fn test_route(
+    c: Ctl<'_>,
+    proxy: Proxy,
+    raw_target: String,
+    inbound: RouteInbound,
+) -> CmdResult<RouteTestResult> {
+    blocking(&c, move |c| c.test_route_live(&proxy, &raw_target, inbound)).await
 }
 
 #[tauri::command]

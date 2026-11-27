@@ -1,6 +1,7 @@
 <script lang="ts" module>
   import type { StatusDisplay } from "../format";
   import type { ProxyState, ProxyView } from "../types";
+  import { FORWARD_TARGET_PREFIX, TUNNEL_TARGET_PREFIX } from "../validate";
 
   /** How a Proxy's state shows in the sidebar and header. */
   export function proxyStatusOf(state: ProxyState): StatusDisplay {
@@ -42,6 +43,7 @@
     const target = Array.isArray(routing.default) ? routing.default[0] : routing.default;
     if (target === undefined || target === "direct") return "Direct";
     if (target === "block") return "Block";
+    if (target.startsWith(TUNNEL_TARGET_PREFIX) || target.startsWith(FORWARD_TARGET_PREFIX)) return "Tunnel";
     const upstream = profile.profiles.find((p) => p.name === target);
     return upstream?.kind.type === "tunnel" ? "Tunnel" : "Upstream";
   }
@@ -50,6 +52,7 @@
 <script lang="ts">
   import { tick } from "svelte";
   import { formatBytes } from "../format";
+  import { formatTargetLabel } from "../routingRows";
   import { NEW_SESSION_ID, store, type ProxyQuickAction } from "../stores.svelte";
   import type { GlobalFilterConfig, Proxy, ProxyTrafficSnapshot } from "../types";
   import FilterEditor from "./FilterEditor.svelte";
@@ -62,7 +65,7 @@
 
   const TABS = [
     { label: "Routing", title: "Routing rules & Route Tester" },
-    { label: "Profiles", title: "Upstream profiles" },
+    { label: "Upstream servers", title: "Custom upstream HTTP/HTTPS/SOCKS servers" },
     { label: "Listeners", title: "Listeners & network" },
     { label: "Filter", title: "Global filter" },
     { label: "MITM", title: "HTTPS MITM" },
@@ -110,6 +113,7 @@
   );
   const restartRequired = $derived(!!snapshot && (snapshot.restart_required || !!running?.restart_required));
   const overrideProfile = $derived(running?.override_profile ?? null);
+  const tunnels = $derived(store.tunnels.map((t) => t.profile));
   const profileCounters = $derived(Object.entries(snapshot?.profile_counters ?? {}));
   const totals = $derived(
     profileCounters.reduce<ProxyTrafficSnapshot>(
@@ -216,7 +220,7 @@
     {/if}
     {#if overrideProfile !== null && saved}
       <span class="pill busy" title="Set from the tray; rules are bypassed">
-        Override: {overrideProfile}
+        Override: {formatTargetLabel(overrideProfile, tunnels, proxy.profiles)}
         <button
           type="button"
           class="link-button"
@@ -291,7 +295,7 @@
         <ul class="plain-list counter-list" aria-label="Traffic by profile">
           {#each profileCounters as [name, counter] (name)}
             <li>
-              <strong>{name}</strong>
+              <strong>{formatTargetLabel(name, tunnels, proxy.profiles)}</strong>
               <span class="muted">{counter.active} active · {counter.hits} hits · ↓{formatBytes(counter.bytes_in)} ↑{formatBytes(counter.bytes_out)}</span>
             </li>
           {/each}

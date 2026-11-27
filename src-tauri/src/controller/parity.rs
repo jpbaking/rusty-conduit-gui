@@ -184,6 +184,7 @@ impl AppController {
                 proxies.chain(forwards).collect()
             })
             .unwrap_or_default();
+        let live_tunnel_forwards = self.tunnels().forward_listeners();
         let ports: BTreeSet<u16> = [http_port, socks_port].into_iter().filter(|p| *p != 0).collect();
 
         let mut conflicts = Vec::new();
@@ -223,6 +224,36 @@ impl AppController {
                     });
                 }
             }
+            let mut reported_tunnel_forward = false;
+            for tunnel in &config.tunnels {
+                if binds_overlap(bind, tunnel.forward.bind) {
+                    let (tunnel_http, tunnel_socks) = tunnel.forward.effective_ports();
+                    let roles = [("HTTP", tunnel_http), ("SOCKS", tunnel_socks)];
+                    for (role, _) in roles.iter().filter(|(_, p)| *p == port) {
+                        reported_tunnel_forward = true;
+                        conflicts.push(PortConflict {
+                            port,
+                            kind: CONFLICT_TUNNEL,
+                            detail: format!(
+                                "tunnel \"{}\" uses {}:{port} for {role}",
+                                tunnel.name, tunnel.forward.bind
+                            ),
+                        });
+                    }
+                }
+            }
+            if !reported_tunnel_forward {
+                for addr in live_tunnel_forwards
+                    .iter()
+                    .filter(|addr| addr.port() == port && binds_overlap(bind, addr.ip()))
+                {
+                    conflicts.push(PortConflict {
+                        port,
+                        kind: CONFLICT_TUNNEL,
+                        detail: format!("a running tunnel forward listener uses {addr}"),
+                    });
+                }
+            }
             let owned = own_listeners
                 .iter()
                 .any(|addr| addr.port() == port && binds_overlap(bind, addr.ip()));
@@ -257,6 +288,7 @@ impl AppController {
             .and_then(|id| self.proxies().snapshot(id).ok())
             .map(|snapshot| snapshot.listeners.into_iter().map(|l| l.addr).collect())
             .unwrap_or_default();
+        let live_tunnel_forwards = self.tunnels().forward_listeners();
         let ports: BTreeSet<u16> = [http_port, socks_port].into_iter().filter(|p| *p != 0).collect();
 
         let mut conflicts = Vec::new();
@@ -277,7 +309,23 @@ impl AppController {
                     });
                 }
             }
+            let mut reported_tunnel_forward = false;
             for tunnel in &config.tunnels {
+                if binds_overlap(bind, tunnel.forward.bind) {
+                    let (tunnel_http, tunnel_socks) = tunnel.forward.effective_ports();
+                    let roles = [("HTTP", tunnel_http), ("SOCKS", tunnel_socks)];
+                    for (role, _) in roles.iter().filter(|(_, p)| *p == port) {
+                        reported_tunnel_forward = true;
+                        conflicts.push(PortConflict {
+                            port,
+                            kind: CONFLICT_TUNNEL,
+                            detail: format!(
+                                "tunnel \"{}\" uses {}:{port} for {role}",
+                                tunnel.name, tunnel.forward.bind
+                            ),
+                        });
+                    }
+                }
                 let forwards = tunnel
                     .active_forwards_in(ForwardDirection::Local)
                     .filter(|f| f.port == port && binds_overlap(bind, f.bind));
@@ -291,6 +339,18 @@ impl AppController {
                             forward.listen(),
                             forward.destination()
                         ),
+                    });
+                }
+            }
+            if !reported_tunnel_forward {
+                for addr in live_tunnel_forwards
+                    .iter()
+                    .filter(|addr| addr.port() == port && binds_overlap(bind, addr.ip()))
+                {
+                    conflicts.push(PortConflict {
+                        port,
+                        kind: CONFLICT_TUNNEL,
+                        detail: format!("a running tunnel forward listener uses {addr}"),
                     });
                 }
             }
@@ -557,5 +617,31 @@ mod tests {
         let busy = c.check_proxy_port_conflicts(None, loopback, port, port);
         assert_eq!(busy.conflicts.len(), 1);
         assert_eq!(busy.conflicts[0].kind, "os_socket");
+    }
+
+    #[tokio::test]
+    async fn parity_port_checks_see_saved_tunnel_forward_listeners() {
+        let dir = TempDir::new();
+        let c = controller(&dir);
+        let http_port = free_port();
+        let socks_port = free_port();
+        let mut tunnel = conduit_core::Tunnel { name: "bastion".into(), ..conduit_core::Tunnel::default() };
+        tunnel.forward.enabled = true;
+        tunnel.forward.bind = LOOPBACK;
+        tunnel.forward.http_port = http_port;
+        tunnel.forward.socks_port = socks_port;
+        c.mutate_config(|config| {
+            config.tunnels.push(tunnel);
+            Ok(())
+        })
+        .unwrap();
+
+        let session_report = c.check_port_conflicts(None, LOOPBACK, http_port, socks_port);
+        assert!(session_report.conflicts.iter().any(|x| x.port == http_port && x.kind == "tunnel"));
+        assert!(session_report.conflicts.iter().any(|x| x.port == socks_port && x.kind == "tunnel"));
+
+        let proxy_report = c.check_proxy_port_conflicts(None, LOOPBACK, http_port, socks_port);
+        assert!(proxy_report.conflicts.iter().any(|x| x.port == http_port && x.kind == "tunnel"));
+        assert!(proxy_report.conflicts.iter().any(|x| x.port == socks_port && x.kind == "tunnel"));
     }
 }

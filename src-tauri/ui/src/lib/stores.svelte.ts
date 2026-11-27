@@ -115,8 +115,11 @@ function blankTunnel(): Tunnel {
     start_mode: "linked",
     engine: session.engine,
     hops: [],
+    forward: { ...session.forward, enabled: false, http_port: 0, socks_port: 0 },
     reverse: session.reverse,
     port_forwards: [],
+    mitm: null,
+    socks_block_web: false,
     keepalive: session.tunnel,
     logging: { ...DEFAULT_LOGGING },
     openssh: session.openssh,
@@ -359,7 +362,7 @@ class AppStore {
   );
   knownTunnelIds = $derived(this.tunnels.map((t) => t.profile.id));
   proxyDraftErrors = $derived<FieldErrors>(
-    this.proxyDraft ? proxyErrors(this.proxyDraft, this.knownTunnelIds) : {},
+    this.proxyDraft ? proxyErrors(this.proxyDraft, this.tunnels.map((t) => t.profile)) : {},
   );
   proxyDraftValid = $derived(Object.keys(this.proxyDraftErrors).length === 0);
   tunnelDraftErrors = $derived<FieldErrors>(this.tunnelDraft ? tunnelErrors(this.tunnelDraft) : {});

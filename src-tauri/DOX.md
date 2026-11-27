@@ -28,7 +28,7 @@ Owns everything under `src-tauri/` except `ui/`, which has its own DOX.md. Inher
 - **App bootstrap and platform rules** — builder setup, plugins, CLI flags (`--tray`, `--show`, `--safe-rendering`), WebKitGTK mitigations, autostart, single instance. Start: `src/lib.rs`. Files: `src/main.rs`, `src/platform.rs`, `build.rs`, `tauri.conf.json`, `capabilities/default.json`.
 - **IPC surface** — command wrappers over the controller. Start: `src/commands.rs`. Files: `src/controller.rs`.
 - **Proxy operations** — CRUD, lifecycle, hot reload, tray override, Route Tester, Test Upstream, Profile Library, Start/Stop All, autostart. Start: `src/controller/proxies.rs`.
-- **Tunnel operations** — CRUD, lifecycle, safe deletion, host keys, Test Chain. Start: `src/controller/tunnels.rs`.
+- **Tunnel operations** — CRUD, lifecycle (including optional forward proxy, filters, and MITM), safe deletion, host keys, Test Chain. Start: `src/controller/tunnels.rs`. Files: `src/controller/parity.rs`.
 - **Legacy sessions and editor helpers** — v1 sessions, host profiles, host-key approvals, port-forward presets, port-conflict detection, filter tester, OpenSSH check. Start: `src/controller/sessions.rs`. Files: `src/controller/presets.rs`, `src/controller/parity.rs`.
 - **Key vault and secrets** — key vault, write-only secrets, password strength rule, MITM CA upload/list/rename/delete. Start: `src/controller/keys.rs`. Files: `src/controller/password.rs`, `src/controller/mitm_ca.rs`.
 - **Backup export/import** — plain and encrypted app backups (format v2; v1 still imports). Start: `src/controller/export.rs`.

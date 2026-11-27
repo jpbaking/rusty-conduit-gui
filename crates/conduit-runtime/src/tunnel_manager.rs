@@ -11,7 +11,7 @@
 //! hold: bad credentials, a changed host key, a locked vault, and an invalid Tunnel are never
 //! retried automatically.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,9 +19,9 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
 use conduit_core::{
-    tunnel_to_engine_config, validate_tunnel, ForwardDirection, HostKeyLookup,
-    HostKeyRecord, KnownHostsStore, PortForward, ProxyId, SessionProfile, SshEngine, Timestamp,
-    Tunnel, TunnelId, TunnelStartMode,
+    tunnel_forward_filter, tunnel_to_engine_config, validate_tunnel, EngineConfig,
+    ForwardDirection, ForwardProxyProtocol, HostKeyLookup, HostKeyRecord, KnownHostsStore,
+    PortForward, ProxyId, SessionProfile, SshEngine, Timestamp, Tunnel, TunnelId, TunnelStartMode,
 };
 use conduit_openssh::{
     check_openssh_binary, LogFn, OpenSshDialer, OpenSshSupervisor, SupervisorOptions, TunnelState,
@@ -31,18 +31,30 @@ use conduit_ssh::{
     HostKeyVerifier, RemoteForward, ReverseError, ReverseInbound, ReverseRelay, RusshDialer,
     StatsDialer,
 };
-use conduit_vault::Vault;
-use rusty_conduit_engine::logging::{AccessLogger, Logger};
-use rusty_conduit_engine::upstream::{DialError, DialFuture, UpstreamDialer};
+use conduit_vault::{Vault, VaultError};
+use rusty_conduit_engine::filter::HostFilter;
+use rusty_conduit_engine::logging::{AccessLogger, Logger, ProxyDirection};
+use rusty_conduit_engine::mitm::MitmState;
+use rusty_conduit_engine::routing::{
+    OneOrMany, ProfileConfig, ProfileType, RoutingConfig, RoutingInput, RoutingSetupError,
+    RoutingState, SharedRouting, DEFAULT_CONNECT_TIMEOUT,
+};
+use rusty_conduit_engine::server::{EngineHandlers, ProtocolHandlers, Server, ShutdownReport};
+use rusty_conduit_engine::upstream::{
+    DialError, DialFuture, DialerOptions, RouteBlocked, UpstreamDialer,
+};
 use serde::Serialize;
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::backoff::Backoff;
 use crate::events::{EventBus, RuntimeEvent};
+use crate::forward_dialer::TunnelForwardDialer;
 use crate::logs::LogRingBuffer;
 use crate::manager::ManagerConfig;
 use crate::port_forward::{self, LocalForwards, SharedForwards};
@@ -147,6 +159,8 @@ pub struct TunnelSnapshot {
     pub engine: SshEngine,
     pub state: SessionState,
     pub stats: SessionStatsSnapshot,
+    /// Bound forward proxy listeners when `tunnel.forward.enabled`, empty otherwise.
+    pub listeners: Vec<ListenerInfo>,
     /// Reverse proxy (`-R`) listeners bound on the target host, while connected.
     pub remote_listeners: Vec<ListenerInfo>,
     /// Loopback listeners of the reverse proxy on this computer.
@@ -216,6 +230,50 @@ impl UpstreamDialer for SwitchableDialer {
     }
 }
 
+/// Wraps a Tunnel's counted [`SwitchableDialer`] with a live [`HostFilter`] (compiled from
+/// `tunnel.forward.allow` / `tunnel.forward.block`), enforcing the tunnel's filter on Proxy
+/// traffic even when `tunnel.forward.enabled == false`.
+pub(crate) struct FilteredTunnelDialer {
+    inner: Arc<dyn UpstreamDialer>,
+    filter: Arc<RwLock<Option<HostFilter>>>,
+}
+
+impl FilteredTunnelDialer {
+    pub(crate) fn new(
+        inner: Arc<dyn UpstreamDialer>,
+        filter: Arc<RwLock<Option<HostFilter>>>,
+    ) -> Self {
+        Self { inner, filter }
+    }
+}
+
+impl UpstreamDialer for FilteredTunnelDialer {
+    fn connect(&self, host: &str, port: u16, timeout: Duration) -> DialFuture<'_> {
+        let host = host.to_string();
+        Box::pin(async move {
+            let denied = {
+                let guard = self.filter.read().unwrap_or_else(PoisonError::into_inner);
+                guard.as_ref().and_then(|f| f.check_host(&host).err())
+            };
+            if let Some(denied) = denied {
+                return Err(RouteBlocked {
+                    profile: format!("{} ({denied})", self.inner.redacted_upstream()),
+                }
+                .into_io());
+            }
+            self.inner.connect(&host, port, timeout).await
+        })
+    }
+
+    fn redacted_upstream(&self) -> String {
+        self.inner.redacted_upstream()
+    }
+}
+
+fn compile_tunnel_filter(tunnel: &Tunnel) -> Option<HostFilter> {
+    tunnel_forward_filter(tunnel).ok().flatten()
+}
+
 /// Everything one Tunnel run needs from the manager.
 #[derive(Clone)]
 pub(crate) struct TunnelContext {
@@ -225,8 +283,9 @@ pub(crate) struct TunnelContext {
     pub(crate) logs: LogRingBuffer,
     /// Where the link installs its engine dialer.
     pub(crate) gate: Arc<SwitchableDialer>,
-    /// The persistent, counted dialer handed to Proxies; port forwards dial it too.
+    /// The persistent, counted raw dialer; port forwards and the optional forward listener dial it.
     pub(crate) dialer: Arc<dyn UpstreamDialer>,
+    pub(crate) listeners: SharedListeners,
     pub(crate) remote_listeners: SharedListeners,
     pub(crate) reverse_listeners: SharedAddrs,
     pub(crate) forwards: SharedForwards,
@@ -276,6 +335,7 @@ async fn run_tunnel(
 ) {
     let logs = ctx.logs.clone();
     let gate = Arc::clone(&ctx.gate);
+    let listeners = Arc::clone(&ctx.listeners);
     let remote_listeners = Arc::clone(&ctx.remote_listeners);
     let reverse_listeners = Arc::clone(&ctx.reverse_listeners);
     let forwards = Arc::clone(&ctx.forwards);
@@ -309,6 +369,7 @@ async fn run_tunnel(
         Err(error) => halt_state(error),
     };
     gate.set(None);
+    lock(&listeners).clear();
     lock(&remote_listeners).clear();
     lock(&reverse_listeners).clear();
     lock(&forwards).clear();
@@ -316,12 +377,51 @@ async fn run_tunnel(
     cell.set(final_state);
 }
 
-/// The proxy-free side of a Tunnel shared by both SSH engines: logging, the reverse proxy,
-/// and the port forwards.
+const TUNNEL_PROFILE: &str = "tunnel";
+
+fn tunnel_forward_routing(
+    cfg: &EngineConfig,
+    dialer: Arc<dyn UpstreamDialer>,
+) -> Result<RoutingState, RoutingSetupError> {
+    let profiles = BTreeMap::from([(
+        TUNNEL_PROFILE.to_string(),
+        ProfileConfig::of_kind(ProfileType::External),
+    )]);
+    let input = RoutingInput {
+        profiles,
+        routing: RoutingConfig {
+            default: OneOrMany::One(TUNNEL_PROFILE.to_string()),
+            ..RoutingConfig::default()
+        },
+        filter: cfg.forward_filter.clone(),
+        mitm_enabled: cfg.mitm_enabled,
+        listeners: Vec::new(),
+        keepalive: cfg.keepalive,
+        connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+    };
+    RoutingState::from_input(
+        &input,
+        DialerOptions::default().with_external(TUNNEL_PROFILE, dialer),
+    )
+}
+
+struct RunningServer {
+    token: CancellationToken,
+    run: JoinHandle<ShutdownReport>,
+    reaper: Option<JoinHandle<()>>,
+}
+
+/// The proxy and forwarding side of a Tunnel shared by both SSH engines: logging, optional
+/// forward proxy + MITM, reverse proxy, and port forwards.
 struct TunnelStack {
+    cfg: EngineConfig,
     logger: Logger,
     access: AccessLogger,
     reverse: Option<ReverseProxy>,
+    routing: SharedRouting,
+    mitm: Option<MitmState>,
+    server: Option<RunningServer>,
+    listeners: SharedListeners,
     dialer: Arc<dyn UpstreamDialer>,
     local_forwards: Option<LocalForwards>,
     forward_states: SharedForwards,
@@ -330,14 +430,29 @@ struct TunnelStack {
 }
 
 impl TunnelStack {
-    /// Checks the vault, then starts access logging and the reverse proxy.
+    /// Checks the vault, loads optional MITM CA, then starts access logging and the reverse proxy.
     async fn start(ctx: &TunnelContext) -> Result<Self, LinkError> {
-        {
+        let needs_mitm = ctx.tunnel.forward.enabled && ctx.tunnel.mitm.is_some();
+        let ca_pem: Option<Zeroizing<Vec<u8>>> = {
             let vault = ctx.vault.read().unwrap_or_else(PoisonError::into_inner);
-            if needs_secrets(&hop_profile(&ctx.tunnel)) && !vault.is_unlocked() {
+            if (needs_secrets(&hop_profile(&ctx.tunnel)) || needs_mitm) && !vault.is_unlocked() {
                 return Err(LinkError::Locked);
             }
-        }
+            if ctx.tunnel.forward.enabled {
+                match ctx.tunnel.mitm.as_ref().and_then(|m| m.ca.as_ref()) {
+                    Some(ca) => Some(vault.get_secret(&ca.to_string()).map_err(|e| match e {
+                        VaultError::Locked => LinkError::Locked,
+                        other => {
+                            LinkError::Fatal(format!("cannot read MITM CA from vault: {other}"))
+                        }
+                    })?),
+                    None => None,
+                }
+            } else {
+                None
+            }
+        };
+
         let cfg =
             tunnel_to_engine_config(&ctx.tunnel).map_err(|e| LinkError::Fatal(e.to_string()))?;
         let logger = Logger::with_writer(cfg.log_level, Box::new(ctx.logs.writer()));
@@ -349,7 +464,38 @@ impl TunnelStack {
         .await
         .map_err(|e| LinkError::Fatal(format!("failed to open access log: {e}")))?;
 
-        // Tunnels have no MITM: the reverse proxy egresses directly.
+        let routing = match tunnel_forward_routing(&cfg, Arc::clone(&ctx.dialer)) {
+            Ok(state) => state.shared(),
+            Err(e) => {
+                drop(ca_pem);
+                let _ = access.shutdown().await;
+                logger.flush();
+                return Err(LinkError::Fatal(format!("forward routing setup failed: {e}")));
+            }
+        };
+
+        let mitm = if cfg.forward_enabled && cfg.mitm_enabled {
+            match ca_pem.as_deref() {
+                Some(pem) => match MitmState::from_pem_bytes(pem, pem, &cfg.mitm_options) {
+                    Ok(state) => {
+                        state.cache.set_logger(logger.clone());
+                        Some(state)
+                    }
+                    Err(e) => {
+                        drop(ca_pem);
+                        let _ = access.shutdown().await;
+                        logger.flush();
+                        return Err(LinkError::Fatal(format!("MITM setup failed: {e}")));
+                    }
+                },
+                None => None,
+            }
+        } else {
+            None
+        };
+        drop(ca_pem);
+
+        // Reverse proxy egresses directly without MITM.
         let reverse = match ReverseProxy::start(&cfg, None, &access, &logger).await {
             Ok(reverse) => reverse,
             Err(message) => {
@@ -364,9 +510,14 @@ impl TunnelStack {
             .unwrap_or_default();
 
         Ok(Self {
+            cfg,
             logger,
             access,
             reverse,
+            routing,
+            mitm,
+            server: None,
+            listeners: Arc::clone(&ctx.listeners),
             dialer: Arc::clone(&ctx.dialer),
             local_forwards: None,
             forward_states: Arc::clone(&ctx.forwards),
@@ -412,31 +563,79 @@ impl TunnelStack {
         port_forward::publish(&self.forward_states, ForwardDirection::Remote, statuses);
     }
 
-    /// Binds the local port forwards once. They then stay bound across reconnects.
-    async fn ensure_forwards(&mut self) {
-        if self.local_forwards.is_some() {
-            return;
+    /// Binds the local port forwards and optional forward proxy listeners once. They then stay
+    /// bound across reconnects.
+    async fn ensure_forwards(&mut self) -> Result<(), LinkError> {
+        if self.local_forwards.is_none() {
+            let local = self
+                .port_forwards
+                .iter()
+                .filter(|f| f.enabled && f.direction == ForwardDirection::Local);
+            self.local_forwards = Some(
+                LocalForwards::bind(
+                    local,
+                    Arc::clone(&self.dialer),
+                    &self.logger,
+                    &self.forward_states,
+                )
+                .await,
+            );
         }
-        let local = self
-            .port_forwards
-            .iter()
-            .filter(|f| f.enabled && f.direction == ForwardDirection::Local);
-        self.local_forwards = Some(
-            LocalForwards::bind(
-                local,
-                Arc::clone(&self.dialer),
-                &self.logger,
-                &self.forward_states,
-            )
-            .await,
-        );
+        if self.server.is_some() || !self.cfg.forward_enabled {
+            return Ok(());
+        }
+        let access = self.access.clone().with_direction(ProxyDirection::Forward);
+        let mut handlers =
+            EngineHandlers::from_routing(Arc::clone(&self.routing), access, self.logger.clone());
+        if let Some(m) = &self.mitm {
+            handlers = handlers.with_mitm(Arc::new(m.interceptor.clone()), false);
+        }
+        if self.cfg.socks_block_web_in_mitm {
+            handlers = handlers.with_socks_block_web();
+        }
+        let handlers: Arc<dyn ProtocolHandlers> = Arc::new(handlers);
+        let server = Server::from_options(&self.cfg.forward_server, handlers, self.logger.clone())
+            .await
+            .map_err(|e| LinkError::Fatal(e.to_string()))?;
+        let bound: Vec<ListenerInfo> = server
+            .listeners()
+            .into_iter()
+            .map(|(role, addr)| {
+                self.logger.info(format!("{role} proxy listening on {addr}"));
+                ListenerInfo {
+                    role: role.to_string(),
+                    addr,
+                }
+            })
+            .collect();
+        *lock(&self.listeners) = bound;
+        let token = server.shutdown_token();
+        let reaper = self
+            .mitm
+            .as_ref()
+            .map(|m| m.cache.spawn_reaper(token.clone(), self.logger.clone()));
+        let run = tokio::spawn(server.run());
+        self.server = Some(RunningServer { token, run, reaper });
+        Ok(())
     }
 
-    /// First shutdown step: close the local port forwards.
+    /// First shutdown step: close the local port forwards and drain the optional forward proxy.
     async fn drain_forwards(&mut self) {
         if let Some(forwards) = self.local_forwards.take() {
             forwards.shutdown().await;
         }
+        if let Some(server) = self.server.take() {
+            server.token.cancel();
+            if let Ok(report) = server.run.await {
+                if report.drained {
+                    self.logger.debug("all connections drained");
+                }
+            }
+            if let Some(reaper) = server.reaper {
+                let _ = reaper.await;
+            }
+        }
+        lock(&self.listeners).clear();
     }
 
     /// Last shutdown steps, after SSH is down: drain the reverse proxy and flush the logs.
@@ -577,7 +776,7 @@ impl Link for RusshTunnelLink {
             }
             self.dialer.swap(chain);
             self.disconnects = Some(receiver);
-            self.stack.ensure_forwards().await;
+            self.stack.ensure_forwards().await?;
             Ok(())
         })
     }
@@ -811,7 +1010,7 @@ impl Link for OpenSshTunnelLink {
                 .map(|f| (f.bind.to_string(), u32::from(f.port)))
                 .collect();
             self.stack.publish_remote(Some(&requested));
-            self.stack.ensure_forwards().await;
+            self.stack.ensure_forwards().await?;
             Ok(())
         })
     }
@@ -857,13 +1056,19 @@ struct Running {
 }
 
 struct TunnelSlot {
-    tunnel: Mutex<Tunnel>,
+    tunnel: Arc<Mutex<Tunnel>>,
     logs: LogRingBuffer,
     stats: Arc<AtomicStats>,
     cell: Arc<StateCell>,
     gate: Arc<SwitchableDialer>,
-    /// The persistent handle given to Proxies: counted, gated on `Connected`.
+    /// Live tunnel-level forward filter, refreshed on `upsert_tunnel` and `start`.
+    filter: Arc<RwLock<Option<HostFilter>>>,
+    /// Counted raw SSH dialer (no tunnel filter): used by `-L` port forwards, the tunnel's
+    /// own forward listener (which has its own router filter), and `TunnelForwardDialer`.
+    raw_dialer: Arc<dyn UpstreamDialer>,
+    /// The persistent filtered handle given to Proxies: counted, filtered, gated on `Connected`.
     dialer: Arc<dyn UpstreamDialer>,
+    listeners: SharedListeners,
     remote_listeners: SharedListeners,
     reverse_listeners: SharedAddrs,
     forwards: SharedForwards,
@@ -890,6 +1095,7 @@ impl TunnelSlot {
             engine: tunnel.engine,
             state: self.cell.get(),
             stats: SessionStatsSnapshot::from_stats(self.stats.snapshot(), self.cell.uptime_secs()),
+            listeners: lock(&self.listeners).clone(),
             remote_listeners: lock(&self.remote_listeners).clone(),
             reverse_listeners: lock(&self.reverse_listeners).clone(),
             port_forwards: lock(&self.forwards).clone(),
@@ -946,27 +1152,40 @@ impl TunnelManager {
     }
 
     /// Adds a Tunnel, or updates it. A running Tunnel uses the update on its next start; its
-    /// dialer handle stays the same.
+    /// dialer handle stays the same and its forward filter refreshes immediately.
     pub fn upsert_tunnel(&self, tunnel: Tunnel) {
         let mut tunnels = lock(&self.inner.tunnels);
         match tunnels.get(&tunnel.id) {
-            Some(slot) => *lock(&slot.tunnel) = tunnel,
+            Some(slot) => {
+                let compiled = compile_tunnel_filter(&tunnel);
+                *lock(&slot.tunnel) = tunnel;
+                *slot.filter.write().unwrap_or_else(PoisonError::into_inner) = compiled;
+            }
             None => {
                 let id = tunnel.id;
+                let compiled = compile_tunnel_filter(&tunnel);
                 let cell = Arc::new(StateCell::new(id.as_uuid(), self.inner.events.clone()));
                 let gate = Arc::new(SwitchableDialer::new(tunnel.name.clone(), Arc::clone(&cell)));
                 let stats = Arc::new(AtomicStats::default());
-                let dialer: Arc<dyn UpstreamDialer> = Arc::new(StatsDialer::new(
+                let filter = Arc::new(RwLock::new(compiled));
+                let raw_dialer: Arc<dyn UpstreamDialer> = Arc::new(StatsDialer::new(
                     Arc::clone(&gate) as Arc<dyn UpstreamDialer>,
                     Arc::clone(&stats),
                 ));
+                let dialer: Arc<dyn UpstreamDialer> = Arc::new(FilteredTunnelDialer::new(
+                    Arc::clone(&raw_dialer),
+                    Arc::clone(&filter),
+                ));
                 let slot = TunnelSlot {
-                    tunnel: Mutex::new(tunnel),
+                    tunnel: Arc::new(Mutex::new(tunnel)),
                     logs: LogRingBuffer::new(self.inner.config.log_capacity),
                     stats,
                     cell,
                     gate,
+                    filter,
+                    raw_dialer,
                     dialer,
+                    listeners: Arc::default(),
                     remote_listeners: Arc::default(),
                     reverse_listeners: Arc::default(),
                     forwards: Arc::default(),
@@ -997,12 +1216,37 @@ impl TunnelManager {
         lock(&self.inner.tunnels).values().cloned().collect()
     }
 
-    /// The Tunnel's persistent dialer. It fails with [`DialError::NotConnected`] (kind
-    /// [`io::ErrorKind::NotConnected`]) unless the Tunnel is `Connected`.
+    /// The Tunnel's persistent filtered dialer. It enforces the tunnel's forward `HostFilter`
+    /// and fails with [`DialError::NotConnected`] (kind [`io::ErrorKind::NotConnected`]) unless
+    /// the Tunnel is `Connected`.
     pub fn dialer(&self, id: TunnelId) -> Option<Arc<dyn UpstreamDialer>> {
         lock(&self.inner.tunnels)
             .get(&id)
             .map(|slot| Arc::clone(&slot.dialer))
+    }
+
+    /// An in-process proxy dialer for a tagged local (`-L`) [`PortForward`] on Tunnel `tid`.
+    /// Returns `None` if the tunnel or forward does not exist, or if the forward is not a local
+    /// forward with `proxy_protocol` set to `Http` or `Socks5`.
+    pub fn forward_dialer(&self, tid: TunnelId, fid: Uuid) -> Option<Arc<dyn UpstreamDialer>> {
+        let slot = lock(&self.inner.tunnels).get(&tid).cloned()?;
+        let valid = {
+            let tunnel = lock(&slot.tunnel);
+            tunnel.port_forwards.iter().any(|f| {
+                f.id == fid
+                    && f.direction == ForwardDirection::Local
+                    && f.proxy_protocol != ForwardProxyProtocol::None
+            })
+        };
+        if !valid {
+            return None;
+        }
+        Some(Arc::new(TunnelForwardDialer::new(
+            Arc::clone(&slot.tunnel),
+            fid,
+            Arc::clone(&slot.filter),
+            Arc::clone(&slot.raw_dialer),
+        )))
     }
 
     /// Starts a Tunnel. Does nothing if it is already running.
@@ -1029,6 +1273,9 @@ impl TunnelManager {
             return Err(TunnelError::InvalidTunnel(reason));
         }
 
+        *slot.filter.write().unwrap_or_else(PoisonError::into_inner) =
+            compile_tunnel_filter(&tunnel);
+
         let (sender, receiver) = mpsc::unbounded_channel();
         *lock(&slot.control) = Some(sender);
         slot.cell.set(SessionState::Starting);
@@ -1039,7 +1286,8 @@ impl TunnelManager {
             known_hosts: Arc::clone(&self.inner.known_hosts),
             logs: slot.logs.clone(),
             gate: Arc::clone(&slot.gate),
-            dialer: Arc::clone(&slot.dialer),
+            dialer: Arc::clone(&slot.raw_dialer),
+            listeners: Arc::clone(&slot.listeners),
             remote_listeners: Arc::clone(&slot.remote_listeners),
             reverse_listeners: Arc::clone(&slot.reverse_listeners),
             forwards: Arc::clone(&slot.forwards),
@@ -1221,6 +1469,33 @@ impl TunnelManager {
             .collect();
         addrs.sort();
         addrs
+    }
+
+    /// Every bound local forward-proxy listener, across all Tunnels.
+    pub fn forward_listeners(&self) -> Vec<SocketAddr> {
+        let mut addrs: Vec<SocketAddr> = self
+            .slots()
+            .iter()
+            .flat_map(|slot| {
+                lock(&slot.listeners)
+                    .iter()
+                    .map(|l| l.addr)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        addrs.sort();
+        addrs
+    }
+
+    /// Full saved [`Tunnel`] definitions currently registered with the manager, sorted by name.
+    pub fn tunnels(&self) -> Vec<Tunnel> {
+        let mut list: Vec<Tunnel> = self
+            .slots()
+            .iter()
+            .map(|slot| lock(&slot.tunnel).clone())
+            .collect();
+        list.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.as_uuid().cmp(&b.id.as_uuid())));
+        list
     }
 
     /// A view of every Tunnel, sorted by name.
@@ -1746,5 +2021,329 @@ mod tests {
         assert!(snapshot.port_forwards.is_empty());
         assert!(f.manager.reverse_listeners().is_empty());
         assert!(TcpStream::connect(loopback(local_port)).await.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn filtered_tunnel_dialer_blocks_denied_hosts_and_refreshes_on_upsert() {
+        use rusty_conduit_engine::upstream::is_route_blocked;
+
+        let f = Loopback::new();
+        let node = spawn_node(None).await;
+        f.pin(&node);
+        let echo = spawn_echo().await;
+
+        let mut t = f.tunnel(&node, PASSWORD);
+        t.forward.enabled = false;
+        t.forward.block = vec!["127.0.0.1".into()];
+        let id = t.id;
+        f.manager.upsert_tunnel(t.clone());
+        let dialer = f.manager.dialer(id).unwrap();
+
+        f.manager.start(id).await.unwrap();
+        f.until(id, "Connected", |s| *s == SessionState::Connected).await;
+
+        // Filter is enforced even while tunnel.forward.enabled == false.
+        let err = dialer.connect("127.0.0.1", echo, DIAL_TIMEOUT).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(is_route_blocked(&err), "expected RouteBlocked, got {err}");
+
+        // Refreshing the filter via upsert_tunnel takes effect immediately on the live dialer.
+        t.forward.block.clear();
+        f.manager.upsert_tunnel(t);
+        let stream = dialer.connect("127.0.0.1", echo, DIAL_TIMEOUT).await.unwrap();
+        assert_eq!(roundtrip(stream, b"allowed-now").await, b"allowed-now");
+
+        f.manager.stop(id).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tunnel_forward_dialer_http_connect_and_filter() {
+        use rusty_conduit_engine::upstream::is_route_blocked;
+
+        // Local mock HTTP CONNECT proxy that echoes after 200 OK and sends an initial prefix byte.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut b = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        if sock.read_exact(&mut b).await.is_err() {
+                            return;
+                        }
+                        head.push(b[0]);
+                    }
+                    let req = String::from_utf8_lossy(&head);
+                    if !req.starts_with("CONNECT app.internal:8080 HTTP/1.1\r\n") {
+                        let _ = sock.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+                        return;
+                    }
+                    // Write 200 OK plus immediate trailing bytes to exercise `with_prefix`.
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\nHELLO:")
+                        .await;
+                    let (mut r, mut w) = sock.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                });
+            }
+        });
+
+        let f = Loopback::new();
+        let node = spawn_node(None).await;
+        f.pin(&node);
+
+        let http_fid = Uuid::new_v4();
+        let plain_fid = Uuid::new_v4();
+        let mut t = f.tunnel(&node, PASSWORD);
+        t.forward.block = vec!["blocked.internal".into()];
+        t.port_forwards = vec![
+            PortForward {
+                id: http_fid,
+                name: "corp-http".into(),
+                direction: ForwardDirection::Local,
+                port: free_port().await,
+                dest_host: "127.0.0.1".into(),
+                dest_port: mock_port,
+                proxy_protocol: ForwardProxyProtocol::Http,
+                ..Default::default()
+            },
+            PortForward {
+                id: plain_fid,
+                name: "plain-tcp".into(),
+                direction: ForwardDirection::Local,
+                port: free_port().await,
+                dest_host: "127.0.0.1".into(),
+                dest_port: mock_port,
+                proxy_protocol: ForwardProxyProtocol::None,
+                ..Default::default()
+            },
+        ];
+        let id = t.id;
+        f.manager.upsert_tunnel(t);
+
+        // Untagged forward is rejected; tagged HTTP forward succeeds.
+        assert!(f.manager.forward_dialer(id, plain_fid).is_none());
+        assert!(f.manager.forward_dialer(id, Uuid::new_v4()).is_none());
+        let fwd_dialer = f.manager.forward_dialer(id, http_fid).unwrap();
+        assert_eq!(fwd_dialer.redacted_upstream(), "tunnel:loopback › corp-http (http)");
+
+        f.manager.start(id).await.unwrap();
+        f.until(id, "Connected", |s| *s == SessionState::Connected).await;
+
+        // Tunnel filter blocks denied host before dialing.
+        let denied = fwd_dialer
+            .connect("blocked.internal", 8080, DIAL_TIMEOUT)
+            .await
+            .unwrap_err();
+        assert!(is_route_blocked(&denied), "expected RouteBlocked, got {denied}");
+
+        // Allowed host completes in-process HTTP CONNECT and replays trailing prefix bytes.
+        let mut stream = fwd_dialer
+            .connect("app.internal", 8080, DIAL_TIMEOUT)
+            .await
+            .unwrap();
+        let mut prefix = [0u8; 6];
+        stream.read_exact(&mut prefix).await.unwrap();
+        assert_eq!(&prefix, b"HELLO:");
+        assert_eq!(roundtrip(stream, b"http-fwd-ok").await, b"http-fwd-ok");
+
+        f.manager.stop(id).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tunnel_forward_dialer_socks5_and_filter() {
+        use rusty_conduit_engine::upstream::is_route_blocked;
+
+        // Local mock SOCKS5 proxy accepting no-auth + domain CONNECT and echoing payload.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut greet = [0u8; 3];
+                    if sock.read_exact(&mut greet).await.is_err() || greet != [0x05, 0x01, 0x00] {
+                        return;
+                    }
+                    if sock.write_all(&[0x05, 0x00]).await.is_err() {
+                        return;
+                    }
+                    let mut req_head = [0u8; 4];
+                    if sock.read_exact(&mut req_head).await.is_err()
+                        || req_head[0] != 0x05
+                        || req_head[1] != 0x01
+                        || req_head[3] != 0x03
+                    {
+                        return;
+                    }
+                    let mut len = [0u8; 1];
+                    if sock.read_exact(&mut len).await.is_err() {
+                        return;
+                    }
+                    let mut rest = vec![0u8; usize::from(len[0]) + 2];
+                    if sock.read_exact(&mut rest).await.is_err() {
+                        return;
+                    }
+                    let domain = &rest[..usize::from(len[0])];
+                    let port = u16::from_be_bytes([rest[rest.len() - 2], rest[rest.len() - 1]]);
+                    if domain != b"db.internal" || port != 5432 {
+                        let _ = sock.write_all(&[0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
+                        return;
+                    }
+                    // Success reply with IPv4 BND.ADDR 0.0.0.0:0.
+                    let _ = sock.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
+                    let (mut r, mut w) = sock.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                });
+            }
+        });
+
+        let f = Loopback::new();
+        let node = spawn_node(None).await;
+        f.pin(&node);
+
+        let socks_fid = Uuid::new_v4();
+        let mut t = f.tunnel(&node, PASSWORD);
+        t.forward.allow = vec!["db.internal".into()];
+        t.port_forwards = vec![PortForward {
+            id: socks_fid,
+            name: "corp-socks".into(),
+            direction: ForwardDirection::Local,
+            port: free_port().await,
+            dest_host: "127.0.0.1".into(),
+            dest_port: mock_port,
+            proxy_protocol: ForwardProxyProtocol::Socks5,
+            ..Default::default()
+        }];
+        let id = t.id;
+        f.manager.upsert_tunnel(t);
+
+        let fwd_dialer = f.manager.forward_dialer(id, socks_fid).unwrap();
+        assert_eq!(fwd_dialer.redacted_upstream(), "tunnel:loopback › corp-socks (socks5)");
+
+        f.manager.start(id).await.unwrap();
+        f.until(id, "Connected", |s| *s == SessionState::Connected).await;
+
+        // Allowlist blocks non-matching host.
+        let denied = fwd_dialer
+            .connect("other.internal", 5432, DIAL_TIMEOUT)
+            .await
+            .unwrap_err();
+        assert!(is_route_blocked(&denied), "expected RouteBlocked, got {denied}");
+
+        // Allowed host completes in-process SOCKS5 handshake.
+        let stream = fwd_dialer
+            .connect("db.internal", 5432, DIAL_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(roundtrip(stream, b"socks5-fwd-ok").await, b"socks5-fwd-ok");
+
+        f.manager.stop(id).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn loopback_tunnel_forward_listener_enabled_and_disabled() {
+        let f = Loopback::new();
+        let node = spawn_node(None).await;
+        f.pin(&node);
+        let echo = spawn_echo().await;
+        let http_port = free_port().await;
+
+        // (1) forward.enabled = true: listeners populated and traffic flows through.
+        let mut enabled_t = f.tunnel(&node, PASSWORD);
+        enabled_t.forward.enabled = true;
+        enabled_t.forward.bind = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        enabled_t.forward.http_port = http_port;
+        enabled_t.forward.socks_port = 0;
+        enabled_t.forward.block = vec!["blocked.example".into()];
+        let enabled_id = enabled_t.id;
+        f.manager.upsert_tunnel(enabled_t);
+
+        f.manager.start(enabled_id).await.unwrap();
+        f.until(enabled_id, "Connected", |s| *s == SessionState::Connected).await;
+
+        let snap = f.manager.snapshot(enabled_id).unwrap();
+        assert_eq!(snap.listeners.len(), 1, "{snap:?}");
+        assert_eq!(snap.listeners[0].addr, loopback(http_port));
+        assert_eq!(f.manager.forward_listeners(), vec![loopback(http_port)]);
+        assert_eq!(f.manager.tunnels().len(), 1);
+
+        // HTTP CONNECT through the tunnel's forward listener reaches the echo server.
+        let mut sock = TcpStream::connect(loopback(http_port)).await.unwrap();
+        let req = format!("CONNECT 127.0.0.1:{echo} HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\n\r\n");
+        sock.write_all(req.as_bytes()).await.unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            sock.read_exact(&mut byte).await.unwrap();
+            head.push(byte[0]);
+        }
+        assert!(
+            String::from_utf8_lossy(&head).starts_with("HTTP/1.1 200"),
+            "unexpected CONNECT response: {}",
+            String::from_utf8_lossy(&head)
+        );
+        assert_eq!(roundtrip(sock, b"via-tunnel-forward").await, b"via-tunnel-forward");
+
+        // Blocked host is rejected with 403 by the tunnel's forward filter.
+        let mut blocked = TcpStream::connect(loopback(http_port)).await.unwrap();
+        blocked
+            .write_all(b"CONNECT blocked.example:443 HTTP/1.1\r\nHost: blocked.example:443\r\n\r\n")
+            .await
+            .unwrap();
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            blocked.read_exact(&mut byte).await.unwrap();
+            head.push(byte[0]);
+        }
+        assert!(
+            String::from_utf8_lossy(&head).starts_with("HTTP/1.1 403"),
+            "expected 403 for blocked host, got: {}",
+            String::from_utf8_lossy(&head)
+        );
+
+        f.manager.stop(enabled_id).await.unwrap();
+        assert!(f.manager.snapshot(enabled_id).unwrap().listeners.is_empty());
+        assert!(f.manager.forward_listeners().is_empty());
+
+        // (2) forward.enabled = false: listeners stay empty.
+        let mut disabled_t = f.tunnel(&node, PASSWORD);
+        disabled_t.forward.enabled = false;
+        disabled_t.forward.http_port = http_port;
+        let disabled_id = disabled_t.id;
+        f.manager.upsert_tunnel(disabled_t);
+
+        f.manager.start(disabled_id).await.unwrap();
+        f.until(disabled_id, "Connected", |s| *s == SessionState::Connected).await;
+        assert!(f.manager.snapshot(disabled_id).unwrap().listeners.is_empty());
+        assert!(f.manager.forward_listeners().is_empty());
+
+        f.manager.stop(disabled_id).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn loopback_tunnel_forward_mitm_requires_unlocked_vault() {
+        use conduit_core::{MitmCaId, MitmConfig};
+
+        let f = Loopback::new();
+        let mut t = tunnel(
+            "mitm-tunnel",
+            TunnelStartMode::Manual { autostart: false },
+            vec![scripted_hop()],
+        );
+        t.forward.enabled = true;
+        t.forward.http_port = free_port().await;
+        t.forward.socks_port = 0;
+        t.mitm = Some(MitmConfig {
+            ca: Some(MitmCaId::new()),
+            ..MitmConfig::default()
+        });
+        let id = t.id;
+        f.manager.upsert_tunnel(t);
+        f.vault.write().unwrap().lock();
+
+        f.manager.start(id).await.unwrap();
+        f.until(id, "Locked", |s| *s == SessionState::Locked).await;
+        f.manager.stop(id).await.unwrap();
     }
 }

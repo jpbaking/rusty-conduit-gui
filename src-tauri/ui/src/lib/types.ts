@@ -190,6 +190,9 @@ export interface ReverseConfig {
 /** `local` is `ssh -L` (listens here), `remote` is `ssh -R` (listens on the target). */
 export type ForwardDirection = "local" | "remote";
 
+/** Protocol spoken by the remote service behind a local (`-L`) port forward. */
+export type ForwardProxyProtocol = "none" | "http" | "socks5";
+
 export interface PortForward {
   id: Uuid;
   /** Off keeps the forward saved without running it. */
@@ -202,6 +205,8 @@ export interface PortForward {
   /** Resolved by the target for `local`, by this computer for `remote`. */
   dest_host: string;
   dest_port: number;
+  /** When `http` or `socks5`, Proxies can route directly through this `-L` forward. */
+  proxy_protocol: ForwardProxyProtocol;
 }
 
 /** An app-wide template for a port forward. An empty `dest_host` is filled in per session. */
@@ -623,8 +628,11 @@ export interface Tunnel {
   start_mode: TunnelStartMode;
   engine: SshEngine;
   hops: HopEntry[];
+  forward: ForwardConfig;
   reverse: ReverseConfig;
   port_forwards: PortForward[];
+  mitm: MitmConfig | null;
+  socks_block_web: boolean;
   keepalive: TunnelConfig;
   logging: LoggingConfig;
   openssh: OpenSshOptions;
@@ -869,6 +877,8 @@ export interface TunnelSnapshot {
   engine: SshEngine;
   state: SessionState;
   stats: SessionStatsSnapshot;
+  /** Optional local forward proxy listeners bound by this Tunnel while connected. */
+  listeners: ListenerInfo[];
   /** Reverse proxy (-R) listeners bound on the target host, while connected. */
   remote_listeners: ListenerInfo[];
   /** Loopback listeners of the reverse proxy on this computer. */

@@ -36,9 +36,12 @@ pub use toml_io::{
     SwitchTomlImport, TomlExport, TomlExportError, TomlImportError,
 };
 pub use v2_mapping::{
-    global_filter, proxy_mitm_options, proxy_referenced_tunnels, proxy_server_options,
-    proxy_to_routing_input, proxy_vault_secret_refs, routing_config, tunnel_to_engine_config,
+    global_filter, proxy_mitm_options, proxy_referenced_forwards, proxy_referenced_targets,
+    proxy_referenced_tunnels, proxy_server_options, proxy_to_routing_input,
+    proxy_vault_secret_refs, routing_config, tunnel_forward_filter, tunnel_to_engine_config,
 };
 pub use v2_model::*;
-pub use v2_validate::{validate_proxy, validate_tunnel, ProxyValidateError};
+pub use v2_validate::{
+    validate_proxy, validate_proxy_with_tunnels, validate_tunnel, ProxyValidateError,
+};
 pub use validate::{validate, validate_forward_preset, SshIpVersion, ValidateError};

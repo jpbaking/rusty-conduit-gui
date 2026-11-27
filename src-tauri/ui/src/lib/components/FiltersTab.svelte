@@ -1,11 +1,19 @@
 <script lang="ts">
-  import { store } from "../stores.svelte";
   import type { SessionProfile } from "../types";
   import FilterEditor from "./FilterEditor.svelte";
+  import { chainEditor } from "./JumpChainBuilder.svelte";
 
-  const draft = $derived(store.draft as SessionProfile);
-  const errors = $derived(store.draftErrors);
+  const ed = chainEditor();
+  const draft = $derived(ed.draft as SessionProfile);
+  const errors = $derived(ed.draftErrors);
+  const isTunnel = $derived(!!ed.isTunnel);
 </script>
+
+{#if isTunnel}
+  <p class="note">
+    Forward filters apply both to this tunnel's optional Forward listener and to all Proxy traffic routed through this tunnel.
+  </p>
+{/if}
 
 <FilterEditor
   title="Forward filters"
@@ -14,7 +22,7 @@
   block={draft.forward.block}
   {errors}
   onChange={(allow, block) =>
-    store.updateDraft((p) => ({ ...p, forward: { ...p.forward, allow, block } }))}
+    ed.updateDraft((p) => ({ ...p, forward: { ...p.forward, allow, block } }))}
 />
 
 <FilterEditor
@@ -24,5 +32,5 @@
   block={draft.reverse.reverse_block}
   {errors}
   onChange={(reverse_allow, reverse_block) =>
-    store.updateDraft((p) => ({ ...p, reverse: { ...p.reverse, reverse_allow, reverse_block } }))}
+    ed.updateDraft((p) => ({ ...p, reverse: { ...p.reverse, reverse_allow, reverse_block } }))}
 />

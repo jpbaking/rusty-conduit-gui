@@ -116,7 +116,7 @@ function withReverse(p: SessionProfile, httpPort: number): SessionProfile {
 }
 
 function withForwards(p: SessionProfile): SessionProfile {
-  const base = { enabled: true, bind: "127.0.0.1" };
+  const base = { enabled: true, bind: "127.0.0.1", proxy_protocol: "none" as const };
   return {
     ...p,
     port_forwards: [
@@ -338,8 +338,11 @@ function sampleTunnel(id: string, name: string, host: string): Tunnel {
     start_mode: "linked",
     engine: base.engine,
     hops: base.hops,
+    forward: { ...base.forward, enabled: false, http_port: 0, socks_port: 0 },
     reverse: base.reverse,
     port_forwards: [],
+    mitm: null,
+    socks_block_web: false,
     keepalive: base.tunnel,
     logging: base.logging,
     openssh: base.openssh,
@@ -347,6 +350,14 @@ function sampleTunnel(id: string, name: string, host: string): Tunnel {
 }
 
 function tunnelSnapshot(t: Tunnel, state: TunnelSnapshot["state"], holders = 0): TunnelSnapshot {
+  const connected = state.state === "connected";
+  const listeners =
+    connected && t.forward.enabled
+      ? [
+          ...(t.forward.http_port ? [{ role: "HTTP/HTTPS", addr: `${t.forward.bind}:${t.forward.http_port}` }] : []),
+          ...(t.forward.socks_port ? [{ role: "SOCKS4/4a/5", addr: `${t.forward.bind}:${t.forward.socks_port}` }] : []),
+        ]
+      : [];
   return {
     id: t.id,
     name: t.name,
@@ -354,7 +365,8 @@ function tunnelSnapshot(t: Tunnel, state: TunnelSnapshot["state"], holders = 0):
     start_mode: t.start_mode,
     engine: t.engine,
     state,
-    stats: state.state === "connected" ? { ...IDLE_STATS, total_connections: 12, uptime_secs: 900 } : { ...IDLE_STATS },
+    stats: connected ? { ...IDLE_STATS, total_connections: 12, uptime_secs: 900 } : { ...IDLE_STATS },
+    listeners,
     remote_listeners: [],
     reverse_listeners: [],
     port_forwards: [],

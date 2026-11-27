@@ -20,9 +20,9 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use conduit_core::{
-    proxy_mitm_options, proxy_referenced_tunnels, proxy_server_options, proxy_to_routing_input,
-    proxy_vault_secret_refs, validate_proxy, Proxy, ProxyId, RouteInbound, SourceMode, TunnelId,
-    UpstreamKind, UpstreamPasswordSource,
+    proxy_mitm_options, proxy_referenced_targets, proxy_referenced_tunnels, proxy_server_options,
+    proxy_to_routing_input, proxy_vault_secret_refs, validate_proxy_with_tunnels, Proxy, ProxyId,
+    RouteInbound, SourceMode, TargetRef, Tunnel, TunnelId, UpstreamKind, UpstreamPasswordSource,
 };
 use conduit_vault::{Vault, VaultError};
 use rusty_conduit_engine::logging::{
@@ -32,8 +32,8 @@ use rusty_conduit_engine::logging::{
 use rusty_conduit_engine::mitm::MitmState;
 use rusty_conduit_engine::router::{ParsedTarget, RouteRequest, Router};
 use rusty_conduit_engine::routing::{
-    Inbound, OneOrMany, RoutingConfig, RoutingState, SharedRouting, TrafficSnapshot,
-    PROFILE_BLOCK, PROFILE_DIRECT,
+    Inbound, OneOrMany, ProfileConfig, ProfileType, RoutingConfig, RoutingState, SharedRouting,
+    TrafficSnapshot, PROFILE_BLOCK, PROFILE_DIRECT,
 };
 use rusty_conduit_engine::server::{EngineHandlers, ProtocolHandlers, Server, ShutdownReport};
 use rusty_conduit_engine::upstream::{dialer_for_profile, DialerOptions};
@@ -44,6 +44,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
+use crate::forward_dialer::format_forward_upstream;
 use crate::logs::{redact, LogRingBuffer};
 use crate::manager::ManagerConfig;
 use crate::state::ListenerInfo;
@@ -280,8 +281,20 @@ pub fn requires_restart(running: &Proxy, saved: &Proxy) -> bool {
         || running.logging != saved.logging
 }
 
-fn profile_exists(proxy: &Proxy, name: &str) -> bool {
-    name == PROFILE_DIRECT || name == PROFILE_BLOCK || proxy.profiles.iter().any(|p| p.name == name)
+fn profile_exists(proxy: &Proxy, tunnels: &TunnelManager, name: &str) -> bool {
+    match TargetRef::parse(name) {
+        TargetRef::Direct | TargetRef::Block => true,
+        TargetRef::Tunnel(tid) => tunnels.dialer(tid).is_some(),
+        TargetRef::TunnelForward {
+            tunnel_id,
+            forward_id,
+        } => tunnels.forward_dialer(tunnel_id, forward_id).is_some(),
+        TargetRef::Profile(_) => {
+            name == PROFILE_DIRECT
+                || name == PROFILE_BLOCK
+                || proxy.profiles.iter().any(|p| p.name == name)
+        }
+    }
 }
 
 fn placeholder_passwords(proxy: &Proxy) -> BTreeMap<String, Zeroizing<String>> {
@@ -303,24 +316,59 @@ fn invalid(error: impl ToString) -> ProxyError {
 }
 
 /// A rule-less copy of `saved` sending everything to `profile`, sharing its dialers, counters,
-/// and generation. Needs no secrets: the router only reads profile shapes.
+/// and generation. Registers an external dialer for `@tunnel:` / `@forward:` targets whenever
+/// not already in `saved.registry`. Needs no secrets: the router only reads profile shapes.
 fn override_state(
     proxy: &Proxy,
+    tunnels: &TunnelManager,
     saved: &RoutingState,
     profile: &str,
     listeners: &[SocketAddr],
 ) -> Result<RoutingState, ProxyError> {
     let mut input =
         proxy_to_routing_input(proxy, &placeholder_passwords(proxy), listeners).map_err(invalid)?;
+    let extra_dialer = match TargetRef::parse(profile) {
+        TargetRef::Tunnel(tid) => {
+            input
+                .profiles
+                .entry(profile.to_string())
+                .or_insert_with(|| ProfileConfig::of_kind(ProfileType::External));
+            let dialer = tunnels.dialer(tid).ok_or(ProxyError::UnknownTunnel(tid))?;
+            Some(dialer)
+        }
+        TargetRef::TunnelForward {
+            tunnel_id,
+            forward_id,
+        } => {
+            input
+                .profiles
+                .entry(profile.to_string())
+                .or_insert_with(|| ProfileConfig::of_kind(ProfileType::External));
+            if tunnels.dialer(tunnel_id).is_none() {
+                return Err(ProxyError::UnknownTunnel(tunnel_id));
+            }
+            let dialer = tunnels
+                .forward_dialer(tunnel_id, forward_id)
+                .ok_or_else(|| ProxyError::UnknownProfile(profile.to_string()))?;
+            Some(dialer)
+        }
+        _ => None,
+    };
     input.routing = RoutingConfig {
         default: OneOrMany::One(profile.to_string()),
         ..RoutingConfig::default()
     };
     let router = Router::from_input(&input).map_err(|e| ProxyError::Routing(e.to_string()))?;
-    Ok(RoutingState {
+    let mut state = RoutingState {
         router: Arc::new(router),
         ..saved.clone()
-    })
+    };
+    if let Some(dialer) = extra_dialer {
+        if saved.registry.get(profile).is_none() {
+            state = state.with_external(profile.to_string(), dialer);
+        }
+    }
+    Ok(state)
 }
 
 /// In-memory copies of a Proxy's vaulted secrets, wiped on drop.
@@ -483,14 +531,11 @@ impl ProxyManager {
         lock(&self.inner.proxies).values().cloned().collect()
     }
 
-    fn known_tunnels(&self) -> Vec<TunnelId> {
-        self.inner.tunnels.snapshots().iter().map(|s| s.id).collect()
-    }
-
-    /// Listeners a Proxy must never route to: other running Proxies' and Tunnels' reverse
-    /// listeners.
+    /// Listeners a Proxy must never route to: other running Proxies' and Tunnels' forward and
+    /// reverse listeners.
     fn other_listeners(&self, id: ProxyId) -> Vec<SocketAddr> {
         let mut addrs = self.inner.tunnels.reverse_listeners();
+        addrs.extend(self.inner.tunnels.forward_listeners());
         for slot in self.slots() {
             if lock(&slot.proxy).id == id {
                 continue;
@@ -502,8 +547,16 @@ impl ProxyManager {
         addrs
     }
 
-    /// The first of `wanted` another running Proxy already listens on.
+    /// The first of `wanted` another running Proxy or Tunnel forward listener already listens on.
     fn port_conflict(&self, id: ProxyId, wanted: &[SocketAddr]) -> Option<(SocketAddr, String)> {
+        let collides = |bound: SocketAddr| {
+            wanted.iter().find(|w| {
+                w.port() == bound.port()
+                    && (w.ip() == bound.ip()
+                        || w.ip().is_unspecified()
+                        || bound.ip().is_unspecified())
+            })
+        };
         for slot in self.slots() {
             let name = {
                 let proxy = lock(&slot.proxy);
@@ -515,13 +568,15 @@ impl ProxyManager {
             let live = lock(&slot.live);
             let Some(live) = live.as_ref() else { continue };
             for bound in live.bound() {
-                if let Some(w) = wanted.iter().find(|w| {
-                    w.port() == bound.port()
-                        && (w.ip() == bound.ip()
-                            || w.ip().is_unspecified()
-                            || bound.ip().is_unspecified())
-                }) {
+                if let Some(w) = collides(bound) {
                     return Some((*w, name));
+                }
+            }
+        }
+        for snap in self.inner.tunnels.snapshots() {
+            for listener in snap.listeners {
+                if let Some(w) = collides(listener.addr) {
+                    return Some((*w, snap.name));
                 }
             }
         }
@@ -562,7 +617,8 @@ impl ProxyManager {
         Ok(secrets)
     }
 
-    /// Dialer options carrying the dialer of every Tunnel the Proxy's profiles route through.
+    /// Dialer options carrying the dialer of every Tunnel and tagged `-L` forward the Proxy
+    /// routes through (via `UpstreamKind::Tunnel` profiles or `@tunnel:` / `@forward:` targets).
     fn external_dialers(&self, proxy: &Proxy) -> Result<DialerOptions, ProxyError> {
         let mut opts = DialerOptions::default();
         for p in &proxy.profiles {
@@ -573,6 +629,34 @@ impl ProxyManager {
                     .dialer(tunnel_id)
                     .ok_or(ProxyError::UnknownTunnel(tunnel_id))?;
                 opts = opts.with_external(p.name.clone(), dialer);
+            }
+        }
+        for target in proxy_referenced_targets(proxy) {
+            match target {
+                TargetRef::Tunnel(tunnel_id) => {
+                    let dialer = self
+                        .inner
+                        .tunnels
+                        .dialer(tunnel_id)
+                        .ok_or(ProxyError::UnknownTunnel(tunnel_id))?;
+                    opts = opts.with_external(target.to_wire(), dialer);
+                }
+                TargetRef::TunnelForward {
+                    tunnel_id,
+                    forward_id,
+                } => {
+                    if self.inner.tunnels.dialer(tunnel_id).is_none() {
+                        return Err(ProxyError::UnknownTunnel(tunnel_id));
+                    }
+                    let wire = target.to_wire();
+                    let dialer = self
+                        .inner
+                        .tunnels
+                        .forward_dialer(tunnel_id, forward_id)
+                        .ok_or_else(|| ProxyError::UnknownProfile(wire.clone()))?;
+                    opts = opts.with_external(wire, dialer);
+                }
+                _ => {}
             }
         }
         Ok(opts)
@@ -788,7 +872,8 @@ impl ProxyManager {
             return Err(ProxyError::PortConflict { addr, other });
         }
         let extra = self.other_listeners(proxy.id);
-        validate_proxy(proxy, &self.known_tunnels(), &extra).map_err(invalid)?;
+        validate_proxy_with_tunnels(proxy, &self.inner.tunnels.tunnels(), &extra)
+            .map_err(invalid)?;
         let level = LogLevel::from_str(&proxy.logging.level).map_err(ProxyError::Invalid)?;
         let format = LogFormat::from_str(&proxy.logging.format).map_err(ProxyError::Invalid)?;
 
@@ -984,10 +1069,11 @@ impl ProxyManager {
         let mut extra = self.other_listeners(id);
         extra.extend(bound);
         let generation = prev_generation + 1;
-        let compiled = validate_proxy(&proxy, &self.known_tunnels(), &extra)
-            .map_err(invalid)
-            .and_then(|()| self.read_secrets(&proxy, false))
-            .and_then(|secrets| self.compile_routing(&proxy, &secrets.passwords, &extra));
+        let compiled =
+            validate_proxy_with_tunnels(&proxy, &self.inner.tunnels.tunnels(), &extra)
+                .map_err(invalid)
+                .and_then(|()| self.read_secrets(&proxy, false))
+                .and_then(|secrets| self.compile_routing(&proxy, &secrets.passwords, &extra));
         let next = match compiled {
             Ok(state) => Arc::new(
                 state
@@ -1017,8 +1103,8 @@ impl ProxyManager {
         }
 
         let (active, override_profile, cleared) = match prev_override {
-            Some(profile) if profile_exists(&proxy, &profile) => {
-                match override_state(&proxy, &next, &profile, &extra) {
+            Some(profile) if profile_exists(&proxy, &self.inner.tunnels, &profile) => {
+                match override_state(&proxy, &self.inner.tunnels, &next, &profile, &extra) {
                     Ok(state) => (Arc::new(state), Some(profile), false),
                     Err(_) => (Arc::clone(&next), None, true),
                 }
@@ -1094,12 +1180,18 @@ impl ProxyManager {
         };
         let active = match &override_profile {
             Some(profile) => {
-                if !profile_exists(&compiled, profile) {
+                if !profile_exists(&compiled, &self.inner.tunnels, profile) {
                     return Err(ProxyError::UnknownProfile(profile.clone()));
                 }
                 let mut extra = self.other_listeners(id);
                 extra.extend(bound);
-                Arc::new(override_state(&compiled, &saved, profile, &extra)?)
+                Arc::new(override_state(
+                    &compiled,
+                    &self.inner.tunnels,
+                    &saved,
+                    profile,
+                    &extra,
+                )?)
             }
             None => saved,
         };
@@ -1122,6 +1214,28 @@ impl ProxyManager {
     /// `proxy`'s draft config. Needs no vault: vaulted passwords are placeholders.
     pub fn test_route(
         proxy: &Proxy,
+        raw_target: &str,
+        inbound: RouteInbound,
+    ) -> Result<RouteTestResult, ProxyError> {
+        Self::test_route_with_tunnels(proxy, &[], raw_target, inbound)
+    }
+
+    /// Route Tester with live [`Tunnel`] metadata from this manager so `@tunnel:` and
+    /// `@forward:` targets render with friendly names.
+    pub fn test_route_live(
+        &self,
+        proxy: &Proxy,
+        raw_target: &str,
+        inbound: RouteInbound,
+    ) -> Result<RouteTestResult, ProxyError> {
+        Self::test_route_with_tunnels(proxy, &self.inner.tunnels.tunnels(), raw_target, inbound)
+    }
+
+    /// Route Tester with explicit [`Tunnel`] definitions for formatting friendly upstream
+    /// labels on `@tunnel:` and `@forward:` targets.
+    pub fn test_route_with_tunnels(
+        proxy: &Proxy,
+        tunnels: &[Tunnel],
         raw_target: &str,
         inbound: RouteInbound,
     ) -> Result<RouteTestResult, ProxyError> {
@@ -1149,12 +1263,33 @@ impl ProxyManager {
             }
         };
         let redacted = |profile: &str| -> String {
-            match proxy.profiles.iter().find(|p| p.name == profile).map(|p| &p.kind) {
-                Some(UpstreamKind::Tunnel { tunnel_id }) => format!("tunnel {tunnel_id}"),
-                _ => router
-                    .profile(profile)
-                    .map(|p| p.redacted_upstream())
-                    .unwrap_or_else(|| profile.to_string()),
+            match TargetRef::parse(profile) {
+                TargetRef::Tunnel(tid) => match tunnels.iter().find(|t| t.id == tid) {
+                    Some(t) => format!("tunnel:{}", t.name),
+                    None => format!("tunnel:{tid}"),
+                },
+                TargetRef::TunnelForward {
+                    tunnel_id,
+                    forward_id,
+                } => match tunnels.iter().find(|t| t.id == tunnel_id) {
+                    Some(t) => match t.port_forwards.iter().find(|f| f.id == forward_id) {
+                        Some(fwd) => format_forward_upstream(&t.name, fwd),
+                        None => format!("tunnel:{} › {forward_id}", t.name),
+                    },
+                    None => format!("forward:{tunnel_id}:{forward_id}"),
+                },
+                _ => match proxy.profiles.iter().find(|p| p.name == profile).map(|p| &p.kind) {
+                    Some(UpstreamKind::Tunnel { tunnel_id }) => {
+                        match tunnels.iter().find(|t| t.id == *tunnel_id) {
+                            Some(t) => format!("tunnel:{}", t.name),
+                            None => format!("tunnel {tunnel_id}"),
+                        }
+                    }
+                    _ => router
+                        .profile(profile)
+                        .map(|p| p.redacted_upstream())
+                        .unwrap_or_else(|| profile.to_string()),
+                },
             }
         };
         Ok(RouteTestResult {
@@ -1175,8 +1310,9 @@ impl ProxyManager {
         })
     }
 
-    /// Test Upstream: dial `host:port` through `profile_name`'s dialer (a Tunnel's included),
-    /// timing it. Dial failures are `Ok` with `ok: false` and a redacted error.
+    /// Test Upstream: dial `host:port` through `profile_name`'s dialer (a Tunnel's or tagged
+    /// `-L` forward's included), timing it. Dial failures are `Ok` with `ok: false` and a
+    /// redacted error.
     pub async fn test_upstream(
         &self,
         proxy: &Proxy,
@@ -1185,41 +1321,66 @@ impl ProxyManager {
         port: u16,
         timeout: Duration,
     ) -> Result<UpstreamProbeResult, ProxyError> {
-        let profile = proxy.profiles.iter().find(|p| p.name == profile_name);
-        if profile.is_none() && !profile_exists(proxy, profile_name) {
-            return Err(ProxyError::UnknownProfile(profile_name.to_string()));
-        }
-        let mut passwords = placeholder_passwords(proxy);
-        if let Some(UpstreamPasswordSource::Vault(_)) = profile.and_then(|p| p.password.as_ref()) {
-            let only = Proxy {
-                profiles: profile.into_iter().cloned().collect(),
-                mitm: None,
-                ..Proxy::default()
-            };
-            passwords.extend(self.read_secrets(&only, false)?.passwords);
-        }
-        let input = proxy_to_routing_input(proxy, &passwords, &[]).map_err(invalid)?;
-        let mut opts = DialerOptions {
-            keepalive: input.keepalive,
-            filter: input.filter.clone().map(Arc::new),
-            ..DialerOptions::default()
-        };
-        if let Some(UpstreamKind::Tunnel { tunnel_id }) = profile.map(|p| &p.kind) {
-            let dialer = self
+        let dialer = match TargetRef::parse(profile_name) {
+            TargetRef::Tunnel(tid) => self
                 .inner
                 .tunnels
-                .dialer(*tunnel_id)
-                .ok_or(ProxyError::UnknownTunnel(*tunnel_id))?;
-            opts = opts.with_external(profile_name, dialer);
-        }
-        let profiles = input.profiles_with_builtins();
-        let config = profiles
-            .get(profile_name)
-            .ok_or_else(|| ProxyError::UnknownProfile(profile_name.to_string()))?;
-        let dialer = dialer_for_profile(profile_name, config, &opts)
-            .map_err(|e| ProxyError::Routing(redact(&e.to_string())))?
-            .ok_or_else(|| ProxyError::NoDialer(profile_name.to_string()))?;
-        drop(passwords);
+                .dialer(tid)
+                .ok_or(ProxyError::UnknownTunnel(tid))?,
+            TargetRef::TunnelForward {
+                tunnel_id,
+                forward_id,
+            } => {
+                if self.inner.tunnels.dialer(tunnel_id).is_none() {
+                    return Err(ProxyError::UnknownTunnel(tunnel_id));
+                }
+                self.inner
+                    .tunnels
+                    .forward_dialer(tunnel_id, forward_id)
+                    .ok_or_else(|| ProxyError::UnknownProfile(profile_name.to_string()))?
+            }
+            _ => {
+                let profile = proxy.profiles.iter().find(|p| p.name == profile_name);
+                if profile.is_none() && !profile_exists(proxy, &self.inner.tunnels, profile_name) {
+                    return Err(ProxyError::UnknownProfile(profile_name.to_string()));
+                }
+                let mut passwords = placeholder_passwords(proxy);
+                if let Some(UpstreamPasswordSource::Vault(_)) =
+                    profile.and_then(|p| p.password.as_ref())
+                {
+                    let only = Proxy {
+                        profiles: profile.into_iter().cloned().collect(),
+                        mitm: None,
+                        ..Proxy::default()
+                    };
+                    passwords.extend(self.read_secrets(&only, false)?.passwords);
+                }
+                let input =
+                    proxy_to_routing_input(proxy, &passwords, &[]).map_err(invalid)?;
+                let mut opts = DialerOptions {
+                    keepalive: input.keepalive,
+                    filter: input.filter.clone().map(Arc::new),
+                    ..DialerOptions::default()
+                };
+                if let Some(UpstreamKind::Tunnel { tunnel_id }) = profile.map(|p| &p.kind) {
+                    let dialer = self
+                        .inner
+                        .tunnels
+                        .dialer(*tunnel_id)
+                        .ok_or(ProxyError::UnknownTunnel(*tunnel_id))?;
+                    opts = opts.with_external(profile_name, dialer);
+                }
+                let profiles = input.profiles_with_builtins();
+                let config = profiles
+                    .get(profile_name)
+                    .ok_or_else(|| ProxyError::UnknownProfile(profile_name.to_string()))?;
+                let dialer = dialer_for_profile(profile_name, config, &opts)
+                    .map_err(|e| ProxyError::Routing(redact(&e.to_string())))?
+                    .ok_or_else(|| ProxyError::NoDialer(profile_name.to_string()))?;
+                drop(passwords);
+                dialer
+            }
+        };
 
         let redacted_upstream = dialer.redacted_upstream();
         let started = Instant::now();
@@ -1961,5 +2122,168 @@ mod tests {
         manager.stop(id).await.unwrap();
         assert!(lock(&manager.slot(id).unwrap().watcher).is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_route_formats_synthetic_tunnel_and_forward_targets() {
+        use conduit_core::{
+            forward_target_name, tunnel_target_name, ForwardDirection, ForwardProxyProtocol,
+            PortForward,
+        };
+
+        let tid = TunnelId::new();
+        let http_fid = Uuid::new_v4();
+        let socks_fid = Uuid::new_v4();
+        let tunnel = Tunnel {
+            id: tid,
+            name: "bastion".into(),
+            port_forwards: vec![
+                PortForward {
+                    id: http_fid,
+                    name: "corp-http".into(),
+                    direction: ForwardDirection::Local,
+                    port: 18080,
+                    dest_host: "10.0.0.2".into(),
+                    dest_port: 3128,
+                    proxy_protocol: ForwardProxyProtocol::Http,
+                    ..Default::default()
+                },
+                PortForward {
+                    id: socks_fid,
+                    name: "corp-socks".into(),
+                    direction: ForwardDirection::Local,
+                    port: 11080,
+                    dest_host: "10.0.0.3".into(),
+                    dest_port: 1080,
+                    proxy_protocol: ForwardProxyProtocol::Socks5,
+                    ..Default::default()
+                },
+            ],
+            ..Tunnel::default()
+        };
+
+        let mut proxy = corp_proxy(8080);
+        let t_wire = tunnel_target_name(tid);
+        let h_wire = forward_target_name(tid, http_fid);
+        let s_wire = forward_target_name(tid, socks_fid);
+        proxy.routing.rules = vec![
+            rule("via-tunnel", "*.ssh.internal", &t_wire),
+            rule("via-http-fwd", "*.web.internal", &h_wire),
+            rule("via-socks-fwd", "*.db.internal", &s_wire),
+        ];
+
+        let r_tunnel = ProxyManager::test_route_with_tunnels(
+            &proxy,
+            std::slice::from_ref(&tunnel),
+            "box.ssh.internal:22",
+            RouteInbound::Socks,
+        )
+        .unwrap();
+        assert_eq!(r_tunnel.targets[0].profile, t_wire);
+        assert_eq!(r_tunnel.targets[0].redacted_upstream, "tunnel:bastion");
+
+        let r_http = ProxyManager::test_route_with_tunnels(
+            &proxy,
+            std::slice::from_ref(&tunnel),
+            "app.web.internal:443",
+            RouteInbound::Http,
+        )
+        .unwrap();
+        assert_eq!(r_http.targets[0].profile, h_wire);
+        assert_eq!(
+            r_http.targets[0].redacted_upstream,
+            "tunnel:bastion › corp-http (http)"
+        );
+
+        let r_socks = ProxyManager::test_route_with_tunnels(
+            &proxy,
+            std::slice::from_ref(&tunnel),
+            "pg.db.internal:5432",
+            RouteInbound::Socks,
+        )
+        .unwrap();
+        assert_eq!(r_socks.targets[0].profile, s_wire);
+        assert_eq!(
+            r_socks.targets[0].redacted_upstream,
+            "tunnel:bastion › corp-socks (socks5)"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_override_and_test_upstream_accept_synthetic_tunnel_and_forward_targets() {
+        use conduit_core::{
+            forward_target_name, tunnel_target_name, ForwardDirection, ForwardProxyProtocol,
+            PortForward,
+        };
+
+        let (manager, tunnels) = manager_with(temp_vault());
+        let fid = Uuid::new_v4();
+        let t = Tunnel {
+            id: TunnelId::new(),
+            name: "bastion".into(),
+            hops: vec![HopEntry {
+                hop_id: "h".into(),
+                name: "h".into(),
+                host: HostProfile {
+                    host: "127.0.0.1".into(),
+                    user: "u".into(),
+                    ..Default::default()
+                },
+            }],
+            port_forwards: vec![PortForward {
+                id: fid,
+                name: "corp-http".into(),
+                direction: ForwardDirection::Local,
+                port: 18081,
+                dest_host: "127.0.0.1".into(),
+                dest_port: 3128,
+                proxy_protocol: ForwardProxyProtocol::Http,
+                ..Default::default()
+            }],
+            ..Tunnel::default()
+        };
+        let tid = t.id;
+        tunnels.upsert_tunnel(t);
+
+        let proxy = corp_proxy(free_port().await);
+        let pid = proxy.id;
+        manager.upsert_proxy(proxy.clone()).await.unwrap();
+        manager.start(pid).await.unwrap();
+
+        let t_wire = tunnel_target_name(tid);
+        let f_wire = forward_target_name(tid, fid);
+
+        // Neither target is in `proxy.routing`, yet set_override accepts and registers both.
+        manager.set_override(pid, Some(t_wire.clone())).await.unwrap();
+        let routing = manager.current_routing(pid).unwrap().unwrap();
+        assert!(routing.registry.get(&t_wire).is_some());
+
+        manager.set_override(pid, Some(f_wire.clone())).await.unwrap();
+        let routing = manager.current_routing(pid).unwrap().unwrap();
+        assert!(routing.registry.get(&f_wire).is_some());
+
+        // Unknown forward is rejected.
+        let bad_fwd = forward_target_name(tid, Uuid::new_v4());
+        assert_eq!(
+            manager.set_override(pid, Some(bad_fwd.clone())).await,
+            Err(ProxyError::UnknownProfile(bad_fwd))
+        );
+
+        // test_upstream also accepts synthetic targets (tunnel is down → ok: false).
+        let probe_t = manager
+            .test_upstream(&proxy, &t_wire, "127.0.0.1", 80, TIMEOUT)
+            .await
+            .unwrap();
+        assert!(!probe_t.ok);
+        assert_eq!(probe_t.redacted_upstream, "tunnel:bastion");
+
+        let probe_f = manager
+            .test_upstream(&proxy, &f_wire, "127.0.0.1", 80, TIMEOUT)
+            .await
+            .unwrap();
+        assert!(!probe_f.ok);
+        assert_eq!(probe_f.redacted_upstream, "tunnel:bastion › corp-http (http)");
+
+        manager.stop(pid).await.unwrap();
     }
 }

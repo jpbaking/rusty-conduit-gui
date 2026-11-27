@@ -60,6 +60,7 @@ fn migrate_session(session: &SessionProfile) -> (Tunnel, Option<Proxy>) {
         keepalive: session.tunnel.clone(),
         logging: session.logging.clone(),
         openssh: session.openssh.clone(),
+        ..Tunnel::default()
     };
     if !has_proxy {
         return (tunnel, None);

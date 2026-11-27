@@ -42,7 +42,7 @@
 
   type ListMatcher = (typeof LIST_MATCHERS)[number]["key"];
 
-  /** The condition chips shown on a rule row. */
+  /** The condition chips shown on an Advanced rule row. */
   export function conditionChips(rule: RoutingRule): string[] {
     const chips: string[] = [];
     if (rule.match_all) chips.push("match all");
@@ -69,7 +69,7 @@
     return [`${index + 1}`, `#${index + 1}`, `rule ${index + 1}`, `rule-${index + 1}`].includes(label);
   }
 
-  /** Text fields of the rule editor drawer. */
+  /** Text fields of the Advanced rule editor drawer. */
   export interface RuleForm {
     name: string;
     inbound: "" | "http" | "socks";
@@ -129,9 +129,28 @@
 
 <script lang="ts">
   import { tick } from "svelte";
+  import {
+    CONDITION_GROUPS,
+    WEEKDAYS,
+    applySimpleCondition,
+    buildProfileOptionGroups,
+    classifyRule,
+    conditionPlaceholder,
+    formatTargetLabel,
+    formatTimeRange,
+    formatWeekdays,
+    isKnownProfileOption,
+    isUrlConditionKind,
+    parseTimeRange,
+    parseWeekdays,
+    reorderList,
+    ruleDetailText,
+    type ConditionKind,
+    type SimpleConditionKind,
+    type WeekdayKey,
+  } from "../routingRows";
   import { store, type ProxyQuickAction } from "../stores.svelte";
   import type { Proxy, RouteInbound, RoutingTable } from "../types";
-  import { BUILTIN_PROFILES } from "../validate";
 
   interface Props {
     /** A Log drawer quick action to run once when it arrives. */
@@ -144,7 +163,8 @@
   const proxy = $derived(store.proxyDraft as Proxy);
   const routing = $derived(proxy.routing);
   const errors = $derived(store.proxyDraftErrors);
-  const targetNames = $derived([...BUILTIN_PROFILES, ...proxy.profiles.map((p) => p.name).filter((n) => n)]);
+  const tunnels = $derived(store.tunnels.map((t) => t.profile));
+  const profileGroups = $derived(buildProfileOptionGroups(tunnels, proxy.profiles));
 
   const TABLES: { value: RoutingTableKey; label: string; wire: string }[] = [
     { value: "unified", label: "Unified", wire: "[routing]" },
@@ -153,10 +173,54 @@
   ];
 
   let tableKey = $state<RoutingTableKey>("unified");
+  let splitTablesOpen = $state(false);
+  let lastProxyId = $state<string | null>(null);
+
+  // Auto-open the HTTP/SOCKS split disclosure when switching to a Proxy that has an override.
+  $effect(() => {
+    const id = store.selectedProxyId;
+    if (id !== lastProxyId) {
+      lastProxyId = id;
+      const hasSplit = routing.http !== undefined || routing.socks !== undefined;
+      splitTablesOpen = hasSplit;
+      tableKey = "unified";
+      kindOverrides = {};
+      editing = null;
+    }
+  });
+
   const override = $derived<RoutingTable | undefined>(tableKey === "unified" ? undefined : routing[tableKey]);
   const rules = $derived(tableKey === "unified" ? routing.rules : (override?.rules ?? []));
   const errorPrefix = $derived(tableKey === "unified" ? "routing.rules" : `routing.${tableKey}.rules`);
+  const defaultErrorKey = $derived(tableKey === "unified" ? "routing.default" : `routing.${tableKey}.default`);
   const tableWire = $derived(TABLES.find((t) => t.value === tableKey)?.wire ?? "[routing]");
+  const activeDefault = $derived<RouteTarget | undefined>(
+    tableKey === "unified" ? routing.default : override?.default,
+  );
+  const defaultSingleTarget = $derived(targetList(routing.default)[0] ?? "direct");
+
+  // Remembers the chosen condition kind for rows that have no value typed yet.
+  let kindOverrides = $state<Record<number, SimpleConditionKind>>({});
+
+  function rowKind(rule: RoutingRule, index: number): ConditionKind {
+    const classified = classifyRule(rule);
+    if (classified === "advanced") return "advanced";
+    const hasMatcher =
+      rule.match_all ||
+      rule.host !== undefined ||
+      rule.host_wildcard !== undefined ||
+      rule.host_regex !== undefined ||
+      rule.cidr !== undefined ||
+      rule.ip !== undefined ||
+      rule.port !== undefined ||
+      rule.host_levels !== undefined ||
+      rule.weekday !== undefined ||
+      rule.time !== undefined ||
+      rule.url_wildcard !== undefined ||
+      rule.url_regex !== undefined ||
+      rule.keyword !== undefined;
+    return hasMatcher ? classified : (kindOverrides[index] ?? classified);
+  }
 
   function updateRouting(edit: (routing: Proxy["routing"]) => Proxy["routing"]) {
     store.updateProxyDraft((p) => ({ ...p, routing: edit(p.routing) }));
@@ -171,6 +235,10 @@
     });
   }
 
+  function setRule(index: number, nextRule: RoutingRule) {
+    setRules(rules.map((r, i) => (i === index ? nextRule : r)));
+  }
+
   function setOverride(next: RoutingTable | undefined) {
     const key = tableKey;
     if (key === "unified") return;
@@ -180,48 +248,180 @@
     });
   }
 
-  // Reordering.
-  let moveButtons = $state<HTMLButtonElement[]>([]);
-
-  async function move(index: number, delta: number) {
-    const target = index + delta;
-    if (target < 0 || target >= rules.length) return;
-    const next = [...rules];
-    const [rule] = next.splice(index, 1);
-    if (rule === undefined) return;
-    next.splice(target, 0, rule);
-    setRules(next);
-    await tick();
-    moveButtons[target]?.focus();
-  }
-
-  function onRowKeydown(event: KeyboardEvent, index: number) {
-    if (!event.altKey) return;
-    if (event.key === "ArrowUp") {
-      event.preventDefault();
-      void move(index, -1);
-    } else if (event.key === "ArrowDown") {
-      event.preventDefault();
-      void move(index, 1);
+  function setActiveDefault(next: RouteTarget) {
+    if (tableKey === "unified") {
+      updateRouting((r) => ({ ...r, default: next }));
+    } else if (override) {
+      setOverride({ ...override, default: next });
     }
   }
 
+  function addCondition() {
+    const nextRule: RoutingRule = {
+      match_all: false,
+      disabled: false,
+      target: defaultSingleTarget,
+    };
+    setRules([...rules, nextRule]);
+  }
+
   function toggleRule(index: number, enabled: boolean) {
-    setRules(rules.map((rule, i) => (i === index ? { ...rule, disabled: !enabled } : rule)));
+    const rule = rules[index];
+    if (!rule) return;
+    setRule(index, { ...rule, disabled: !enabled });
   }
 
   function removeRule(index: number) {
+    const nextOverrides: Record<number, SimpleConditionKind> = {};
+    for (const [k, v] of Object.entries(kindOverrides)) {
+      const i = Number(k);
+      if (i < index) nextOverrides[i] = v;
+      else if (i > index) nextOverrides[i - 1] = v;
+    }
+    kindOverrides = nextOverrides;
     setRules(rules.filter((_, i) => i !== index));
   }
 
-  // Rule editor drawer.
+  function onKindChange(index: number, nextKind: ConditionKind) {
+    const rule = rules[index];
+    if (!rule) return;
+    if (nextKind === "advanced") {
+      openRule(index);
+      return;
+    }
+    if (nextKind === "match_all") {
+      const { [index]: _dropped, ...rest } = kindOverrides;
+      kindOverrides = rest;
+      setRule(index, applySimpleCondition(rule, "match_all", ""));
+      return;
+    }
+    kindOverrides = { ...kindOverrides, [index]: nextKind };
+    setRule(index, applySimpleCondition(rule, nextKind, ""));
+  }
+
+  function onDetailChange(index: number, kind: SimpleConditionKind, value: string) {
+    const rule = rules[index];
+    if (!rule) return;
+    if (value.trim() === "") {
+      kindOverrides = { ...kindOverrides, [index]: kind };
+    }
+    setRule(index, applySimpleCondition(rule, kind, value));
+  }
+
+  function onHostLevelsChange(index: number, minText: string, maxText: string) {
+    const rule = rules[index];
+    if (!rule) return;
+    const combined = minText.trim() || maxText.trim() ? `${minText.trim()}~${maxText.trim()}` : "";
+    onDetailChange(index, "host_levels", combined);
+  }
+
+  function onWeekdayToggle(index: number, day: WeekdayKey, checked: boolean) {
+    const rule = rules[index];
+    if (!rule) return;
+    const current = parseWeekdays(rule.weekday);
+    current[day] = checked;
+    const formatted = formatWeekdays(current);
+    const next = applySimpleCondition(rule, "weekday", "");
+    if (formatted !== undefined) next.weekday = formatted;
+    else kindOverrides = { ...kindOverrides, [index]: "weekday" };
+    setRule(index, next);
+  }
+
+  function onTimeChange(index: number, start: string, end: string) {
+    const rule = rules[index];
+    if (!rule) return;
+    const formatted = formatTimeRange(start, end);
+    const next = applySimpleCondition(rule, "time", "");
+    if (formatted !== undefined) next.time = formatted;
+    else kindOverrides = { ...kindOverrides, [index]: "time" };
+    setRule(index, next);
+  }
+
+  // Drag-and-drop reordering via pointer events (safe in Tauri webview) + Alt+↑/↓ fallback.
+  let tableBody = $state<HTMLTableSectionElement | null>(null);
+  let dragHandles = $state<HTMLButtonElement[]>([]);
+  let dragFrom = $state<number | null>(null);
+  let dragOver = $state<number | null>(null);
+  let announcement = $state("");
+
+  function reorderRules(from: number, to: number) {
+    if (from === to || from < 0 || to < 0 || from >= rules.length || to >= rules.length) return;
+    const nextOverrides: Record<number, SimpleConditionKind> = {};
+    const order = reorderList(
+      rules.map((_, i) => i),
+      from,
+      to,
+    );
+    order.forEach((oldIdx, newIdx) => {
+      const ov = kindOverrides[oldIdx];
+      if (ov) nextOverrides[newIdx] = ov;
+    });
+    kindOverrides = nextOverrides;
+    setRules(reorderList(rules, from, to));
+    announcement = `Moved rule ${from + 1} to position ${to + 1}.`;
+  }
+
+  async function moveByKey(index: number, delta: -1 | 1) {
+    const target = index + delta;
+    if (target < 0 || target >= rules.length) return;
+    reorderRules(index, target);
+    await tick();
+    dragHandles[target]?.focus();
+  }
+
+  function onHandleKeydown(event: KeyboardEvent, index: number) {
+    if (!event.altKey) return;
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      void moveByKey(index, -1);
+    } else if (event.key === "ArrowDown") {
+      event.preventDefault();
+      void moveByKey(index, 1);
+    }
+  }
+
+  function startDrag(event: PointerEvent, index: number) {
+    if (event.button !== 0 || rules.length < 2) return;
+    event.preventDefault();
+    (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+    dragFrom = index;
+    dragOver = index;
+  }
+
+  function onDragMove(event: PointerEvent) {
+    if (dragFrom === null || !tableBody) return;
+    let best = Infinity;
+    let bestIdx = dragOver ?? dragFrom;
+    tableBody.querySelectorAll<HTMLElement>("tr[data-rule-index]").forEach((row) => {
+      const idx = Number(row.dataset.ruleIndex);
+      const box = row.getBoundingClientRect();
+      const distance = Math.abs(event.clientY - (box.top + box.height / 2));
+      if (distance < best) {
+        best = distance;
+        bestIdx = idx;
+      }
+    });
+    dragOver = bestIdx;
+  }
+
+  function endDrag(commit: boolean) {
+    const from = dragFrom;
+    const to = dragOver;
+    dragFrom = null;
+    dragOver = null;
+    if (commit && from !== null && to !== null && from !== to) {
+      reorderRules(from, to);
+    }
+  }
+
+  // Advanced rule editor drawer.
   let editing = $state<{ index: number | null; form: RuleForm } | null>(null);
 
   function openRule(index: number | null, base?: RoutingRule) {
     const rule = index === null ? base : rules[index];
     editing = {
       index,
-      form: ruleToForm(rule ?? { match_all: false, disabled: false, target: targetList(routing.default)[0] ?? "direct" }),
+      form: ruleToForm(rule ?? { match_all: false, disabled: false, target: defaultSingleTarget }),
     };
   }
 
@@ -230,7 +430,13 @@
     if (!editing) return;
     const rule = formToRule(editing.form);
     const { index } = editing;
-    setRules(index === null ? [...rules, rule] : rules.map((r, i) => (i === index ? rule : r)));
+    if (index === null) {
+      setRules([...rules, rule]);
+    } else {
+      const { [index]: _dropped, ...rest } = kindOverrides;
+      kindOverrides = rest;
+      setRule(index, rule);
+    }
     editing = null;
   }
 
@@ -254,7 +460,11 @@
   }
 
   const isMatched = (rule: RoutingRule, index: number) =>
-    !!result && resultTable === tableWire && ruleMatches(rule, index, result.matched_rule);
+    !!result && !result.blocked_by_filter && resultTable === tableWire && ruleMatches(rule, index, result.matched_rule);
+
+  const isDefaultMatched = $derived(
+    !!result && !result.blocked_by_filter && resultTable === tableWire && result.matched_rule === null,
+  );
 
   // Log drawer quick actions, each run once.
   let handledNonce = 0;
@@ -263,7 +473,6 @@
     if (!action || action.nonce === handledNonce) return;
     handledNonce = action.nonce;
     if (action.kind === "test_route") {
-      // An empty host (the header's Test Route shortcut) only focuses the tester.
       if (action.host) {
         testTarget = action.host;
         testInbound = action.inbound;
@@ -281,23 +490,48 @@
         host: hostName,
         match_all: false,
         disabled: false,
-        target: targetList(routing.default)[0] ?? "direct",
+        target: defaultSingleTarget,
       });
     }
   });
 </script>
+
+<svelte:window onkeydown={(e) => e.key === "Escape" && dragFrom !== null && endDrag(false)} />
+
+{#snippet profileSelect(value: string, ariaLabel: string, onChange: (value: string) => void, invalid = false)}
+  {@const known = isKnownProfileOption(value, profileGroups)}
+  <select
+    class="profile-select"
+    class:bad-select={invalid || !known}
+    aria-label={ariaLabel}
+    aria-invalid={invalid || !known}
+    {value}
+    onchange={(e) => onChange(e.currentTarget.value)}
+  >
+    {#if !known}
+      <option value={value} disabled>{formatTargetLabel(value, tunnels, proxy.profiles)}</option>
+    {/if}
+    {#each profileGroups as group (group.label)}
+      <optgroup label={group.label}>
+        {#each group.options as opt (opt.value)}
+          <option value={opt.value}>{opt.label}</option>
+        {/each}
+      </optgroup>
+    {/each}
+  </select>
+{/snippet}
 
 {#snippet targetPicker(label: string, names: string[], onChange: (names: string[]) => void, error?: string)}
   <div class="field">
     <span>{label} <small class="muted">more than one is a failover chain, tried in order</small></span>
     <ol class="target-chain" aria-label={label}>
       {#each names as name, index (`${index}:${name}`)}
-        <li class="rule-chip" class:bad={!targetNames.includes(name)}>
+        <li class="rule-chip" class:bad={!isKnownProfileOption(name, profileGroups)}>
           {#if index > 0}<span class="muted" aria-hidden="true">→</span>{/if}
-          {name}
+          {formatTargetLabel(name, tunnels, proxy.profiles)}
           <button
             type="button"
-            aria-label={`Remove ${name} from ${label}`}
+            aria-label={`Remove ${formatTargetLabel(name, tunnels, proxy.profiles)} from ${label}`}
             disabled={names.length === 1}
             onclick={() => onChange(names.filter((_, i) => i !== index))}
           >×</button>
@@ -314,32 +548,335 @@
       }}
     >
       <option value="">{names.length === 0 ? "Choose a profile…" : "Add a failover profile…"}</option>
-      {#each targetNames.filter((n) => !names.includes(n)) as name (name)}
-        <option value={name}>{name}</option>
+      {#each profileGroups as group (group.label)}
+        {@const available = group.options.filter((opt) => !names.includes(opt.value))}
+        {#if available.length > 0}
+          <optgroup label={group.label}>
+            {#each available as opt (opt.value)}
+              <option value={opt.value}>{opt.label}</option>
+            {/each}
+          </optgroup>
+        {/if}
       {/each}
     </select>
     {#if error}<span class="field-error">{error}</span>{/if}
   </div>
 {/snippet}
 
-<section class="card" aria-labelledby={`${uid}-table`}>
-  <h2 id={`${uid}-table`}>Routing table</h2>
-  <div class="segmented" role="group" aria-label="Routing table">
-    {#each TABLES as table (table.value)}
-      <button type="button" aria-pressed={tableKey === table.value} onclick={() => (tableKey = table.value)}>
-        {table.label}
-        {#if table.value !== "unified" && routing[table.value]}<span class="muted"> ●</span>{/if}
-      </button>
-    {/each}
+<section class="card" aria-labelledby={`${uid}-rules`}>
+  <div class="card-head">
+    <h2 id={`${uid}-rules`}>
+      Routing rules
+      {#if tableKey !== "unified"}
+        <span class="pill busy">{tableKey === "http" ? "HTTP override" : "SOCKS override"}</span>
+      {/if}
+      <small class="muted">first match wins · drag ⋮⋮ or Alt+↑/↓ to reorder</small>
+    </h2>
+    {#if tableKey === "unified" || override}
+      <button type="button" onclick={addCondition}>+ Add condition</button>
+    {/if}
   </div>
 
+  {#if tableKey !== "unified" && !override}
+    <p class="muted">
+      No {tableKey === "http" ? "HTTP" : "SOCKS"} override. {tableKey === "http" ? "HTTP" : "SOCKS"} traffic uses the
+      unified table.
+    </p>
+    <div>
+      <button type="button" onclick={() => setOverride({ inherit: true, rules: [] })}>Add override table</button>
+    </div>
+  {:else}
+    {#if tableKey !== "unified" && override}
+      {@const table = override}
+      <div class="override-controls">
+        <label class="check">
+          <input
+            type="checkbox"
+            checked={table.inherit}
+            onchange={(e) => setOverride({ ...table, inherit: e.currentTarget.checked })}
+          />
+          Fall back to the unified rules when none of these match
+        </label>
+        <label class="check">
+          <input
+            type="checkbox"
+            checked={table.default !== undefined}
+            onchange={(e) => {
+              const { default: _dropped, ...rest } = table;
+              setOverride(e.currentTarget.checked ? { ...rest, default: routing.default } : rest);
+            }}
+          />
+          Own default target
+        </label>
+        <span class="spacer"></span>
+        <button type="button" class="danger" onclick={() => setOverride(undefined)}>Remove override table</button>
+      </div>
+    {/if}
+
+    <div class="routing-table-wrap">
+      <table class="routing-table" aria-label="Routing conditions">
+        <thead>
+          <tr>
+            <th class="col-drag"><span class="sr-only">Order</span></th>
+            <th class="col-enabled"><span class="sr-only">Enabled</span></th>
+            <th class="col-type">Condition type</th>
+            <th class="col-details">Condition details</th>
+            <th class="col-profile">Profile</th>
+            <th class="col-delete"><span class="sr-only">Delete</span></th>
+          </tr>
+        </thead>
+        <tbody bind:this={tableBody}>
+          {#each rules as rule, index (index)}
+            {@const kind = rowKind(rule, index)}
+            {@const chain = targetList(rule.target)}
+            {@const problems = Object.entries(errors).filter(([key]) => key.startsWith(`${errorPrefix}:${index}:`))}
+            {@const matched = isMatched(rule, index)}
+            {@const isDragging = dragFrom === index}
+            {@const dropBefore = dragFrom !== null && dragOver === index && dragFrom > index}
+            {@const dropAfter = dragFrom !== null && dragOver === index && dragFrom < index}
+            <tr
+              class="routing-row"
+              class:off={rule.disabled}
+              class:matched
+              class:dragging={isDragging}
+              class:drop-before={dropBefore}
+              class:drop-after={dropAfter}
+              data-rule-index={index}
+            >
+              <td class="col-drag">
+                <button
+                  type="button"
+                  bind:this={dragHandles[index]}
+                  class="icon drag-handle"
+                  aria-label={`Reorder rule ${index + 1}; drag or press Alt+Up / Alt+Down`}
+                  title="Drag to reorder (or Alt+↑ / Alt+↓)"
+                  disabled={rules.length < 2}
+                  onpointerdown={(e) => startDrag(e, index)}
+                  onpointermove={onDragMove}
+                  onpointerup={() => endDrag(true)}
+                  onpointercancel={() => endDrag(false)}
+                  onkeydown={(e) => onHandleKeydown(e, index)}
+                >⋮⋮</button>
+              </td>
+              <td class="col-enabled">
+                <input
+                  type="checkbox"
+                  checked={!rule.disabled}
+                  aria-label={`Rule ${index + 1} enabled`}
+                  onchange={(e) => toggleRule(index, e.currentTarget.checked)}
+                />
+              </td>
+              <td class="col-type">
+                <select
+                  aria-label={`Rule ${index + 1} condition type`}
+                  value={kind}
+                  onchange={(e) => {
+                    const nextKind = e.currentTarget.value as ConditionKind;
+                    if (nextKind === "advanced") e.currentTarget.value = kind;
+                    onKindChange(index, nextKind);
+                  }}
+                >
+                  {#each CONDITION_GROUPS as group (group.label)}
+                    <optgroup label={group.label}>
+                      {#each group.options as opt (opt.value)}
+                        <option value={opt.value}>{opt.label}</option>
+                      {/each}
+                    </optgroup>
+                  {/each}
+                  <option value="advanced">Advanced…</option>
+                </select>
+              </td>
+              <td class="col-details">
+                <div class="detail-cell">
+                  {#if kind === "advanced"}
+                    <div class="advanced-summary">
+                      {#if rule.name}<strong>{rule.name}</strong>{/if}
+                      <ul class="rule-list" aria-label="Advanced conditions">
+                        {#each conditionChips(rule) as chip, chipIndex (chipIndex)}
+                          <li class="rule-chip">{chip}</li>
+                        {/each}
+                      </ul>
+                      <button type="button" onclick={() => openRule(index)}>Edit…</button>
+                    </div>
+                  {:else if kind === "match_all"}
+                    <span class="muted">Matches every request</span>
+                  {:else if kind === "host_levels"}
+                    <div class="levels-editor">
+                      <input
+                        type="number"
+                        min="0"
+                        class="compact-num"
+                        placeholder="min"
+                        aria-label={`Rule ${index + 1} minimum host levels`}
+                        value={rule.host_levels?.min ?? ""}
+                        oninput={(e) =>
+                          onHostLevelsChange(index, e.currentTarget.value, rule.host_levels?.max?.toString() ?? "")}
+                      />
+                      <span class="muted" aria-hidden="true">~</span>
+                      <input
+                        type="number"
+                        min="0"
+                        class="compact-num"
+                        placeholder="max"
+                        aria-label={`Rule ${index + 1} maximum host levels`}
+                        value={rule.host_levels?.max ?? ""}
+                        oninput={(e) =>
+                          onHostLevelsChange(index, rule.host_levels?.min?.toString() ?? "", e.currentTarget.value)}
+                      />
+                    </div>
+                  {:else if kind === "weekday"}
+                    {@const days = parseWeekdays(rule.weekday)}
+                    <div class="weekday-editor" role="group" aria-label={`Rule ${index + 1} weekdays`}>
+                      {#each WEEKDAYS as day (day.key)}
+                        <label class="day-check">
+                          <input
+                            type="checkbox"
+                            checked={days[day.key]}
+                            onchange={(e) => onWeekdayToggle(index, day.key, e.currentTarget.checked)}
+                          />
+                          <span>{day.label}</span>
+                        </label>
+                      {/each}
+                    </div>
+                  {:else if kind === "time"}
+                    {@const range = parseTimeRange(rule.time)}
+                    <div class="time-editor">
+                      <input
+                        type="time"
+                        aria-label={`Rule ${index + 1} start time`}
+                        value={range.start}
+                        onchange={(e) => onTimeChange(index, e.currentTarget.value, range.end)}
+                      />
+                      <span class="muted" aria-hidden="true">–</span>
+                      <input
+                        type="time"
+                        aria-label={`Rule ${index + 1} end time`}
+                        value={range.end}
+                        onchange={(e) => onTimeChange(index, range.start, e.currentTarget.value)}
+                      />
+                    </div>
+                  {:else if kind === "cidr"}
+                    <input
+                      type="text"
+                      class="detail-input"
+                      spellcheck="false"
+                      aria-label={`Rule ${index + 1} IP or CIDR`}
+                      placeholder={conditionPlaceholder("cidr")}
+                      aria-invalid={!!errors[`${errorPrefix}:${index}:cidr`] || !!errors[`${errorPrefix}:${index}:ip`]}
+                      value={ruleDetailText(rule, "cidr")}
+                      onchange={(e) => onDetailChange(index, "cidr", e.currentTarget.value)}
+                    />
+                  {:else}
+                    <input
+                      type="text"
+                      class="detail-input"
+                      spellcheck="false"
+                      aria-label={`Rule ${index + 1} condition details`}
+                      placeholder={conditionPlaceholder(kind)}
+                      aria-invalid={problems.some(([k]) => !k.endsWith(":target"))}
+                      value={ruleDetailText(rule, kind)}
+                      oninput={(e) => onDetailChange(index, kind, e.currentTarget.value)}
+                    />
+                  {/if}
+
+                  {#if matched || ((isUrlConditionKind(kind) || usesUrl(rule)) && !proxy.mitm)}
+                    <div class="detail-badges">
+                      {#if matched}<span class="pill ok">Matched</span>{/if}
+                      {#if (isUrlConditionKind(kind) || usesUrl(rule)) && !proxy.mitm}
+                        <span
+                          class="pill alert"
+                          title="HTTPS URLs are hidden unless MITM is on, so this only matches plain HTTP"
+                        >
+                          Needs MITM
+                        </span>
+                      {/if}
+                    </div>
+                  {/if}
+                  {#each problems as [key, message] (key)}
+                    <span class="field-error">{message}</span>
+                  {/each}
+                </div>
+              </td>
+              <td class="col-profile">
+                {#if chain.length > 1}
+                  <div class="failover-cell">
+                    <span class="pill busy" title={formatTargetLabel(rule.target, tunnels, proxy.profiles)}>
+                      failover ×{chain.length}
+                    </span>
+                    <button type="button" class="link-button" onclick={() => openRule(index)}>Edit…</button>
+                  </div>
+                {:else}
+                  {@render profileSelect(
+                    chain[0] ?? "direct",
+                    `Rule ${index + 1} target profile`,
+                    (next) => setRule(index, { ...rule, target: next }),
+                    !!errors[`${errorPrefix}:${index}:target`],
+                  )}
+                {/if}
+              </td>
+              <td class="col-delete">
+                <button
+                  type="button"
+                  class="icon danger"
+                  aria-label={`Delete rule ${index + 1}`}
+                  title="Delete condition"
+                  onclick={() => removeRule(index)}
+                >✕</button>
+              </td>
+            </tr>
+          {/each}
+
+          <!-- Pinned non-draggable Default row -->
+          {#if tableKey === "unified" || activeDefault !== undefined}
+            {@const defaultChain = targetList(activeDefault ?? routing.default)}
+            {@const defaultError = errors[defaultErrorKey]}
+            <tr class="routing-row default-row" class:matched={isDefaultMatched}>
+              <td class="col-drag" aria-hidden="true"></td>
+              <td class="col-enabled" aria-hidden="true"></td>
+              <td class="col-type"><strong>Default</strong></td>
+              <td class="col-details">
+                <div class="detail-cell">
+                  <span class="muted">Everything else</span>
+                  {#if isDefaultMatched}
+                    <div class="detail-badges"><span class="pill ok">Matched</span></div>
+                  {/if}
+                  {#if defaultError}<span class="field-error">{defaultError}</span>{/if}
+                </div>
+              </td>
+              <td class="col-profile">
+                {#if defaultChain.length > 1}
+                  <div class="failover-cell">
+                    <span class="pill busy" title={formatTargetLabel(defaultChain, tunnels, proxy.profiles)}>
+                      failover ×{defaultChain.length}
+                    </span>
+                    <button
+                      type="button"
+                      class="link-button"
+                      onclick={() => setActiveDefault(defaultChain[0] ?? "direct")}
+                      title="Collapse failover chain to its primary target"
+                    >
+                      Simplify
+                    </button>
+                  </div>
+                {:else}
+                  {@render profileSelect(
+                    defaultChain[0] ?? "direct",
+                    "Default target profile",
+                    (next) => setActiveDefault(next),
+                    !!defaultError,
+                  )}
+                {/if}
+              </td>
+              <td class="col-delete" aria-hidden="true"></td>
+            </tr>
+          {/if}
+        </tbody>
+      </table>
+    </div>
+    <p class="sr-only" role="status">{announcement}</p>
+  {/if}
+
   {#if tableKey === "unified"}
-    {@render targetPicker(
-      "Default target",
-      targetList(routing.default),
-      (names) => updateRouting((r) => ({ ...r, default: toTarget(names) })),
-      errors["routing.default"],
-    )}
     <label class="check">
       <input
         type="checkbox"
@@ -359,115 +896,34 @@
         Host names are not looked up here. IP and CIDR rules only match targets given as IP addresses.
       {/if}
     </p>
-  {:else if !override}
-    <p class="muted">
-      No {tableKey === "http" ? "HTTP" : "SOCKS"} override. {tableKey === "http" ? "HTTP" : "SOCKS"} traffic uses the
-      unified table.
-    </p>
-    <button type="button" onclick={() => setOverride({ inherit: true, rules: [] })}>Add override table</button>
-  {:else}
-    {@const table = override}
-    <label class="check">
-      <input
-        type="checkbox"
-        checked={table.inherit}
-        onchange={(e) => setOverride({ ...table, inherit: e.currentTarget.checked })}
-      />
-      Fall back to the unified rules when none of these match
-    </label>
-    <label class="check">
-      <input
-        type="checkbox"
-        checked={table.default !== undefined}
-        onchange={(e) => {
-          const { default: _dropped, ...rest } = table;
-          setOverride(e.currentTarget.checked ? { ...rest, default: routing.default } : rest);
-        }}
-      />
-      Own default target
-    </label>
-    {#if table.default !== undefined}
-      {@render targetPicker(
-        "Override default target",
-        targetList(table.default),
-        (names) => setOverride({ ...table, default: toTarget(names) }),
-        errors[`routing.${tableKey}.default`],
-      )}
-    {/if}
-    <button type="button" class="danger" onclick={() => setOverride(undefined)}>Remove override table</button>
   {/if}
-</section>
 
-{#if tableKey === "unified" || override}
-  <section class="card" aria-labelledby={`${uid}-rules`}>
-    <div class="card-head">
-      <h2 id={`${uid}-rules`}>Rules <small class="muted">first match wins · Alt+↑/↓ reorders</small></h2>
-      <button type="button" onclick={() => openRule(null)}>+ Add rule</button>
-    </div>
-    {#if rules.length === 0}
-      <p class="muted">No rules. Everything goes to the default target.</p>
-    {:else}
-      <ol class="plain-list routing-rules" aria-label="Routing rules">
-        {#each rules as rule, index (index)}
-          {@const chain = targetList(rule.target)}
-          {@const problems = Object.entries(errors).filter(([key]) => key.startsWith(`${errorPrefix}:${index}:`))}
-          <li class="routing-rule" class:matched={isMatched(rule, index)} class:off={rule.disabled}>
-            <div class="rule-order">
-              <button
-                type="button"
-                bind:this={moveButtons[index]}
-                aria-label={`Move rule ${index + 1} up`}
-                disabled={index === 0}
-                onclick={() => void move(index, -1)}
-                onkeydown={(e) => onRowKeydown(e, index)}
-              >↑</button>
-              <button
-                type="button"
-                aria-label={`Move rule ${index + 1} down`}
-                disabled={index === rules.length - 1}
-                onclick={() => void move(index, 1)}
-                onkeydown={(e) => onRowKeydown(e, index)}
-              >↓</button>
-            </div>
-            <label class="check">
-              <input
-                type="checkbox"
-                checked={!rule.disabled}
-                aria-label={`Rule ${index + 1} enabled`}
-                onchange={(e) => toggleRule(index, e.currentTarget.checked)}
-              />
-            </label>
-            <div class="rule-body">
-              <button
-                type="button"
-                class="link-button"
-                onclick={() => openRule(index)}
-                onkeydown={(e) => onRowKeydown(e, index)}
-              >
-                {index + 1}. {rule.name || "Unnamed rule"}
-              </button>
-              {#if isMatched(rule, index)}<span class="pill ok">Matched</span>{/if}
-              <span class="muted">→ {chain.join(" → ")}</span>
-              {#if chain.length > 1}<span class="pill busy" title="Tried in order">failover ×{chain.length}</span>{/if}
-              {#if usesUrl(rule) && !proxy.mitm}
-                <span class="pill alert" title="HTTPS URLs are hidden unless MITM is on, so this only matches plain HTTP">
-                  URL rule without MITM
-                </span>
-              {/if}
-              <ul class="rule-list" aria-label="Conditions">
-                {#each conditionChips(rule) as chip, chipIndex (chipIndex)}<li class="rule-chip">{chip}</li>{/each}
-              </ul>
-              {#each problems as [key, message] (key)}<p class="field-error">{message}</p>{/each}
-            </div>
-            <button type="button" class="danger" aria-label={`Delete rule ${index + 1}`} onclick={() => removeRule(index)}>
-              Delete
-            </button>
-          </li>
+  <details
+    class="split-disclosure"
+    open={splitTablesOpen}
+    ontoggle={(e) => (splitTablesOpen = e.currentTarget.open)}
+  >
+    <summary>
+      Advanced: HTTP / SOCKS split tables
+      {#if routing.http || routing.socks}
+        <span class="pill busy">active</span>
+      {/if}
+    </summary>
+    <div class="split-body">
+      <p class="muted">
+        Optionally override routing separately for HTTP or SOCKS listeners.
+      </p>
+      <div class="segmented" role="group" aria-label="Routing table">
+        {#each TABLES as table (table.value)}
+          <button type="button" aria-pressed={tableKey === table.value} onclick={() => (tableKey = table.value)}>
+            {table.label}
+            {#if table.value !== "unified" && routing[table.value]}<span class="muted"> ●</span>{/if}
+          </button>
         {/each}
-      </ol>
-    {/if}
-  </section>
-{/if}
+      </div>
+    </div>
+  </details>
+</section>
 
 {#if editing}
   {@const form = editing.form}
@@ -487,7 +943,7 @@
       </div>
       <label class="check">
         <input type="checkbox" bind:checked={form.match_all} />
-        Match all <small class="muted">every condition must match (otherwise any one does)</small>
+        Match all (matches every request unconditionally; multiple conditions on one rule are always ANDed)
       </label>
       <label class="check"><input type="checkbox" bind:checked={form.disabled} /> Disabled</label>
       <div class="matcher-grid">
@@ -559,14 +1015,16 @@
           <dt>Table</dt>
           <dd><code>{result.table}</code></dd>
           <dt>Matched</dt>
-          <dd>{result.matched_rule ?? "No rule (the table default)"}</dd>
+          <dd>{result.matched_rule ?? "Default (everything else)"}</dd>
           <dt>Route</dt>
           <dd>
             <ol class="plain-list">
               {#each result.targets as target, index (index)}
                 <li>
-                  {index + 1}. <strong>{target.name}</strong>
-                  {#if target.profile !== target.name}<span class="muted">via {target.profile}</span>{/if}
+                  {index + 1}. <strong>{formatTargetLabel(target.name, tunnels, proxy.profiles)}</strong>
+                  {#if target.profile !== target.name}
+                    <span class="muted">via {formatTargetLabel(target.profile, tunnels, proxy.profiles)}</span>
+                  {/if}
                   <code>{target.redacted_upstream}</code>
                   {#if target.bypassed}<span class="pill idle">bypassed → direct</span>{/if}
                 </li>
@@ -580,6 +1038,154 @@
 </section>
 
 <style>
+  .routing-table-wrap {
+    overflow-x: auto;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+  }
+  .routing-table {
+    width: 100%;
+    border-collapse: collapse;
+    background: var(--surface);
+  }
+  .routing-table th,
+  .routing-table td {
+    padding: 5px 6px;
+    text-align: left;
+    vertical-align: middle;
+    border-bottom: 1px solid var(--border);
+  }
+  .routing-table th {
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    white-space: nowrap;
+  }
+  .routing-table tbody tr:last-child td {
+    border-bottom: 0;
+  }
+  .col-drag {
+    width: 28px;
+    text-align: center;
+  }
+  .col-enabled {
+    width: 28px;
+    text-align: center;
+  }
+  .col-type {
+    width: 165px;
+  }
+  .col-type select {
+    width: 100%;
+  }
+  .col-details {
+    min-width: 220px;
+  }
+  .col-profile {
+    width: 210px;
+  }
+  .col-profile .profile-select {
+    width: 100%;
+  }
+  .col-delete {
+    width: 32px;
+    text-align: center;
+  }
+  .routing-row.off {
+    opacity: 0.55;
+  }
+  .routing-row.matched {
+    background: color-mix(in srgb, var(--ok) 12%, transparent);
+  }
+  .routing-row.dragging {
+    opacity: 0.45;
+  }
+  .routing-row.drop-before td {
+    box-shadow: inset 0 2px 0 0 var(--accent);
+  }
+  .routing-row.drop-after td {
+    box-shadow: inset 0 -2px 0 0 var(--accent);
+  }
+  .default-row {
+    background: var(--surface-2);
+  }
+  .detail-cell {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .detail-input {
+    width: 100%;
+    min-width: 0;
+  }
+  .detail-badges {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+  .levels-editor,
+  .time-editor {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .compact-num {
+    width: 72px;
+  }
+  .weekday-editor {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 8px;
+  }
+  .day-check {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .advanced-summary {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+  }
+  .failover-cell {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .bad-select {
+    border-color: var(--alert);
+    color: var(--alert);
+  }
+  .override-controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+  }
+  .split-disclosure {
+    border-top: 1px solid var(--border);
+    padding-top: 8px;
+  }
+  .split-disclosure summary {
+    cursor: pointer;
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 600;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .split-body {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 8px;
+  }
   .target-chain {
     display: flex;
     flex-wrap: wrap;
@@ -588,40 +1194,12 @@
     margin: 0.25rem 0;
     padding: 0;
   }
-  .routing-rules {
-    display: flex;
-    flex-direction: column;
-    gap: 0.4rem;
-  }
-  .routing-rule {
-    display: flex;
-    align-items: flex-start;
-    gap: 0.5rem;
-    padding: 0.4rem;
-    border: 1px solid var(--border, #ccc);
-    border-radius: 6px;
-  }
-  .routing-rule.matched {
-    outline: 2px solid var(--ok, #2e7d32);
-  }
-  .routing-rule.off {
-    opacity: 0.6;
-  }
-  .rule-order {
-    display: flex;
-    flex-direction: column;
-    gap: 0.15rem;
-  }
-  .rule-body {
-    flex: 1;
-    min-width: 0;
-  }
   .matcher-grid {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(14rem, 1fr));
     gap: 0.5rem;
   }
   .rule-drawer {
-    border-left: 3px solid var(--accent, #3b82f6);
+    border-left: 3px solid var(--accent);
   }
 </style>

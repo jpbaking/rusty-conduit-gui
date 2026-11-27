@@ -221,6 +221,40 @@ impl Vault {
         Ok(())
     }
 
+    /// Unlock via `keyring`, falling back to `legacy_vault_id` (e.g. after a data-dir migration)
+    /// when no entry exists under `self.id`. If found under `legacy_vault_id`, best-effort copies
+    /// the DEK to `self.id` so subsequent unlocks hit the current path directly.
+    pub fn unlock_with_keyring_fallback(
+        &mut self,
+        keyring: &dyn KeyringBackend,
+        legacy_vault_id: Option<&str>,
+    ) -> Result<(), VaultError> {
+        match self.unlock_with_keyring(keyring) {
+            Ok(()) => Ok(()),
+            Err(VaultError::KeyringEntryMissing { .. }) => {
+                let Some(old_id) = legacy_vault_id.filter(|id| *id != self.id) else {
+                    return Err(VaultError::KeyringEntryMissing {
+                        vault_id: self.id.clone(),
+                    });
+                };
+                match keyring.get_dek(old_id) {
+                    Ok(dek) => {
+                        let _ = keyring.set_dek(&self.id, &dek);
+                        self.dek = Some(dek);
+                        Ok(())
+                    }
+                    Err(VaultError::KeyringEntryMissing { .. }) => {
+                        Err(VaultError::KeyringEntryMissing {
+                            vault_id: self.id.clone(),
+                        })
+                    }
+                    Err(other) => Err(other),
+                }
+            }
+            Err(other) => Err(other),
+        }
+    }
+
     /// Hybrid unlock: try `keyring` first; if its entry is missing, fall back to `password`.
     /// A keyring store error is returned as-is; a missing entry falls through to the password.
     pub fn unlock(

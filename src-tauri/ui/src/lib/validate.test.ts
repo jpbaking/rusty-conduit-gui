@@ -3,17 +3,22 @@ import assert from "node:assert/strict";
 
 import type { Proxy, SessionProfile, Tunnel } from "./types.ts";
 import {
+  FORWARD_TARGET_PREFIX,
+  TUNNEL_TARGET_PREFIX,
   denylistedFlag,
   filterRuleError,
+  forwardTarget,
   isIpAddress,
   isLoopback,
   isPort,
+  isSyntheticTarget,
   redactArgs,
   sessionErrors,
   configLineArgs,
   portSpecError,
   proxyErrors,
   tunnelErrors,
+  tunnelTarget,
 } from "./validate.ts";
 
 function validProfile(): SessionProfile {
@@ -338,6 +343,7 @@ describe("sessionErrors", () => {
       port: 15432,
       dest_host: "db.internal",
       dest_port: 5432,
+      proxy_protocol: "none" as const,
     };
     profile.port_forwards = [forward];
     assert.deepEqual(sessionErrors(profile), {});
@@ -360,6 +366,7 @@ describe("sessionErrors", () => {
       bind: "0.0.0.0",
       dest_host: "db",
       dest_port: 1,
+      proxy_protocol: "none" as const,
     };
     profile.port_forwards = [
       { ...base, id: "a", port: profile.forward.http_port },
@@ -493,8 +500,11 @@ function validTunnel(): Tunnel {
     start_mode: "linked",
     engine: session.engine,
     hops: session.hops,
+    forward: { ...session.forward, enabled: false, http_port: 0, socks_port: 0 },
     reverse: session.reverse,
     port_forwards: [],
+    mitm: null,
+    socks_block_web: false,
     keepalive: session.tunnel,
     logging: session.logging,
     openssh: session.openssh,
@@ -559,7 +569,7 @@ describe("tunnelErrors", () => {
     const t = validTunnel();
     const reverse = { ...t.reverse, enabled: true, reverse_http_port: 9000, reverse_socks_port: 9001 };
     const fwd = (id: string, direction: "local" | "remote", port: number) => ({
-      id, enabled: true, direction, name: "", bind: "127.0.0.1", port, dest_host: "db.internal", dest_port: 5432,
+      id, enabled: true, direction, name: "", bind: "127.0.0.1", port, dest_host: "db.internal", dest_port: 5432, proxy_protocol: "none" as const,
     });
     const local = { ...t, reverse, port_forwards: [fwd("l1", "local", 3128)] };
     assert.deepEqual(tunnelErrors(local), {});
@@ -573,6 +583,40 @@ describe("tunnelErrors", () => {
     const t = validTunnel();
     assert.ok(tunnelErrors({ ...t, logging: { ...t.logging, level: "loud" } })["logging.level"]);
     assert.ok(tunnelErrors({ ...t, logging: { ...t.logging, format: "xml" } })["logging.format"]);
+  });
+
+  test("validates forward filters always, and forward ports + MITM when enabled", () => {
+    const t = validTunnel();
+    // Forward filters are validated even when forward listener is disabled.
+    const badFilter = { ...t, forward: { ...t.forward, enabled: false, block: ["bad*.example"] } };
+    assert.ok(tunnelErrors(badFilter)["filters.forward.block:0"]);
+
+    // MITM with missing CA is ignored when forward listener is off, rejected when on.
+    const badMitm = { ca: null, cert_ttl: 3600, cert_cache_max_entries: 0, socks_block_web: false };
+    assert.deepEqual(tunnelErrors({ ...t, mitm: badMitm }), {});
+    const onNoPorts = { ...t, forward: { ...t.forward, enabled: true, http_port: 0, socks_port: 0 }, mitm: badMitm };
+    const errs = tunnelErrors(onNoPorts);
+    assert.ok(errs["forward.ports"]);
+    assert.ok(errs["mitm.ca"]);
+
+    // Remote port forward with proxy_protocol !== "none" is rejected.
+    const badRemote = {
+      ...t,
+      port_forwards: [
+        {
+          id: "r1",
+          enabled: true,
+          direction: "remote" as const,
+          name: "",
+          bind: "127.0.0.1",
+          port: 9000,
+          dest_host: "localhost",
+          dest_port: 3000,
+          proxy_protocol: "http" as const,
+        },
+      ],
+    };
+    assert.ok(tunnelErrors(badRemote)["forwards:r1:proxy_protocol"]);
   });
 });
 
@@ -655,6 +699,61 @@ describe("proxyErrors", () => {
     assert.ok(proxyErrors(withRule({ cidr: "10.0.0.0" }), [TUNNEL_ID])["routing.rules:0:cidr"]);
     assert.ok(proxyErrors(withRule({ ip: "not-an-ip" }), [TUNNEL_ID])["routing.rules:0:ip"]);
     assert.ok(proxyErrors(withRule({ host_levels: { min: 3, max: 1 } }), [TUNNEL_ID])["routing.rules:0:host_levels"]);
+  });
+
+  test("rejects @-prefixed profile names and validates @tunnel:/@forward: targets", () => {
+    assert.equal(tunnelTarget(TUNNEL_ID), `${TUNNEL_TARGET_PREFIX}${TUNNEL_ID}`);
+    assert.equal(forwardTarget(TUNNEL_ID, "f1"), `${FORWARD_TARGET_PREFIX}${TUNNEL_ID}:f1`);
+    assert.equal(isSyntheticTarget(tunnelTarget(TUNNEL_ID)), true);
+    assert.equal(isSyntheticTarget(forwardTarget(TUNNEL_ID, "f1")), true);
+    assert.equal(isSyntheticTarget("direct"), false);
+
+    const t: Tunnel = {
+      ...validTunnel(),
+      port_forwards: [
+        {
+          id: "f-http",
+          enabled: true,
+          direction: "local",
+          name: "Corp HTTP",
+          bind: "127.0.0.1",
+          port: 18080,
+          dest_host: "proxy.internal",
+          dest_port: 8080,
+          proxy_protocol: "http",
+        },
+        {
+          id: "f-raw",
+          enabled: true,
+          direction: "local",
+          name: "DB",
+          bind: "127.0.0.1",
+          port: 15432,
+          dest_host: "db.internal",
+          dest_port: 5432,
+          proxy_protocol: "none",
+        },
+      ],
+    };
+
+    const p = validProxy();
+    const [corp] = p.profiles as [Proxy["profiles"][0]];
+    assert.ok(proxyErrors({ ...p, profiles: [{ ...corp, name: "@reserved" }] }, [t])["profiles:0:name"]);
+
+    const okTunnel = { ...p, routing: { ...p.routing, default: tunnelTarget(TUNNEL_ID) } };
+    assert.deepEqual(proxyErrors(okTunnel, [t]), {});
+
+    const okFwd = { ...p, routing: { ...p.routing, default: forwardTarget(TUNNEL_ID, "f-http") } };
+    assert.deepEqual(proxyErrors(okFwd, [t]), {});
+
+    const badTunnel = { ...p, routing: { ...p.routing, default: tunnelTarget("missing") } };
+    assert.ok(proxyErrors(badTunnel, [t])["routing.default"]);
+
+    const rawFwd = { ...p, routing: { ...p.routing, default: forwardTarget(TUNNEL_ID, "f-raw") } };
+    assert.ok(proxyErrors(rawFwd, [t])["routing.default"]);
+
+    const missingFwd = { ...p, routing: { ...p.routing, default: forwardTarget(TUNNEL_ID, "nope") } };
+    assert.ok(proxyErrors(missingFwd, [t])["routing.default"]);
   });
 });
 

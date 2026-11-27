@@ -198,3 +198,37 @@ fn keyring_and_password_unlock_both_work() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+
+/// After a data-dir rename, `unlock_with_keyring_fallback` finds the DEK stored under the legacy
+/// vault path and copies it to the new path so future unlocks work directly.
+#[test]
+fn keyring_fallback_migrates_legacy_path() {
+    let old_path = tmp_vault("legacy-old");
+    let new_path = tmp_vault("legacy-new");
+    let keyring = MemoryKeyringBackend::new();
+    let old_vault =
+        Vault::create_with_keyring(&old_path, &keyring, b"master", fast_params()).unwrap();
+    let old_id = old_vault.id().to_string();
+    drop(old_vault);
+
+    std::fs::rename(&old_path, &new_path).unwrap();
+
+    let mut migrated = Vault::open_locked(&new_path).unwrap();
+    assert!(matches!(
+        migrated.unlock_with_keyring(&keyring),
+        Err(VaultError::KeyringEntryMissing { .. })
+    ));
+
+    migrated
+        .unlock_with_keyring_fallback(&keyring, Some(&old_id))
+        .unwrap();
+    assert!(migrated.is_unlocked());
+
+    // Subsequent unlock hits the new path directly without needing the fallback.
+    let mut direct = Vault::open_locked(&new_path).unwrap();
+    direct.unlock_with_keyring(&keyring).unwrap();
+    assert!(direct.is_unlocked());
+
+    let _ = std::fs::remove_file(&new_path);
+}

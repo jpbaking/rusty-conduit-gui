@@ -22,7 +22,7 @@ Owns everything under `crates/conduit-core/`. Inherits all root DOX rules and ad
 
 ## Feature Map
 - **v1 session model** — legacy `SessionProfile`, host, filter, and log models; validation; mapping into `EngineConfig`. Start: `src/model.rs`. Files: `src/validate.rs`, `src/mapping.rs`, `src/lib.rs`.
-- **v2 Tunnel / Proxy model** — `Tunnel`, `Proxy`, `UpstreamProfile`, and routing; validation; mapping into engine `RoutingInput` / `EngineConfig`. Start: `src/v2_model.rs`. Files: `src/v2_validate.rs`, `src/v2_mapping.rs`.
+- **v2 Tunnel / Proxy model** — `Tunnel` (with optional forward proxy, filters, MITM, and `-L` proxy-tagged forwards), `Proxy`, `UpstreamProfile` (including `tunnel-forward` targets), and routing; validation; mapping into engine `RoutingInput` / `EngineConfig`. Start: `src/v2_model.rs`. Files: `src/v2_validate.rs`, `src/v2_mapping.rs`, `src/model.rs`.
 - **v1 → v2 data migration** — one-way split of each v0.1.0 session into a Tunnel and a Proxy. Start: `src/migrate_v2.rs`.
 - **Atomic persistence** — `config.json` and app-owned `known_hosts.json`. Start: `src/storage.rs`.
 - **CLI `config.toml` import/export** — for `rusty-conduit`, `rusty-conduit-ssh`, and `rusty-conduit-switch`. Start: `src/toml_io.rs`.

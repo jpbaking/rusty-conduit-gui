@@ -4,13 +4,12 @@
   import type { Proxy, UpstreamKind, UpstreamKindName, UpstreamPasswordSource, UpstreamProfile } from "../types";
   import { BUILTIN_PROFILES } from "../validate";
 
-  const KINDS: { value: UpstreamKindName; label: string }[] = [
+  const KINDS: { value: Exclude<UpstreamKindName, "tunnel">; label: string }[] = [
     { value: "http", label: "HTTP proxy" },
     { value: "https", label: "HTTPS proxy" },
     { value: "socks5", label: "SOCKS5 proxy" },
     { value: "socks4a", label: "SOCKS4a proxy" },
     { value: "composite", label: "Composite (per scheme)" },
-    { value: "tunnel", label: "SSH Tunnel" },
   ];
 
   const COMPOSITE_FIELDS = ["http", "https", "fallback"] as const;
@@ -32,9 +31,11 @@
   let passwordBusy = $state<number | null>(null);
   let passwordError = $state<Record<number, string>>({});
 
-  // Test Upstream.
-  let probeHost = $state("example.com");
-  let probePort = $state(443);
+  // Test Upstream (per-profile target host & port).
+  let probeHostFor = $state<Record<number, string>>({});
+  let probePortFor = $state<Record<number, number>>({});
+  const probeHost = (index: number) => probeHostFor[index] ?? "example.com";
+  const probePort = (index: number) => probePortFor[index] ?? 443;
   let probing = $state<number | null>(null);
   let probedIndex = $state<number | null>(null);
   const probe = $derived(store.upstreamTest);
@@ -89,6 +90,9 @@
     store.updateProxyDraft((p) => ({ ...p, profiles: p.profiles.filter((_, i) => i !== index) }));
     passwordText = {};
     passwordError = {};
+    probeHostFor = {};
+    probePortFor = {};
+    if (probedIndex === index) probedIndex = null;
   }
 
   function setPasswordMode(index: number, mode: PasswordMode) {
@@ -132,12 +136,14 @@
 
   async function testUpstream(index: number) {
     const profile = profiles[index];
-    if (!profile || probing !== null || !probeHost.trim()) return;
+    const host = probeHost(index).trim();
+    const port = probePort(index);
+    if (!profile || probing !== null || !host) return;
     probing = index;
     probedIndex = index;
     store.upstreamTest = null;
     try {
-      await store.testUpstream(profile.name, probeHost.trim(), probePort);
+      await store.testUpstream(profile.name, host, port);
     } finally {
       probing = null;
     }
@@ -154,14 +160,15 @@
 <section class="card" aria-labelledby={`${uid}-builtins`}>
   <h2 id={`${uid}-builtins`}>Built-in targets</h2>
   <ul class="plain-list">
-    <li><span class="pill ok">direct</span> <span class="muted">connects straight to the destination</span></li>
-    <li><span class="pill alert">block</span> <span class="muted">refuses the connection</span></li>
+    <li><span class="pill ok">DIRECT</span> <span class="muted">connects straight to the destination</span></li>
+    <li><span class="pill alert">BLOCK</span> <span class="muted">refuses the connection</span></li>
+    <li><span class="pill idle">SSH Tunnels</span> <span class="muted">picked directly in the Routing tab (including tagged local proxy forwards)</span></li>
   </ul>
 </section>
 
 <section class="card" aria-labelledby={`${uid}-profiles`}>
   <div class="card-head">
-    <h2 id={`${uid}-profiles`}>Upstream profiles</h2>
+    <h2 id={`${uid}-profiles`}>Upstream servers</h2>
     <div class="inline-form">
       {#if importable.length > 0}
         <select
@@ -177,18 +184,12 @@
           {#each importable as entry (entry.name)}<option value={entry.name}>{entry.name}</option>{/each}
         </select>
       {/if}
-      <button type="button" onclick={addProfile}>+ Add profile</button>
+      <button type="button" onclick={addProfile}>+ Add upstream server</button>
     </div>
   </div>
 
-  <div class="inline-form">
-    <span class="muted">Test Upstream dials</span>
-    <input aria-label="Test host" bind:value={probeHost} spellcheck="false" />
-    <input aria-label="Test port" type="number" min="1" max="65535" bind:value={probePort} />
-  </div>
-
   {#if profiles.length === 0}
-    <p class="muted">No upstream profiles. Rules can still use direct and block.</p>
+    <p class="muted">No custom upstream servers. Routing can still use DIRECT, BLOCK, and any SSH Tunnel.</p>
   {/if}
 
   {#each profiles as profile, index (index)}
@@ -212,6 +213,9 @@
         <label class="field">
           Type
           <select value={kind.type} onchange={(e) => setKind(index, e.currentTarget.value as UpstreamKindName)}>
+            {#if kind.type === "tunnel"}
+              <option value="tunnel" disabled>SSH Tunnel (legacy)</option>
+            {/if}
             {#each KINDS as option (option.value)}<option value={option.value}>{option.label}</option>{/each}
           </select>
         </label>
@@ -229,6 +233,10 @@
       </div>
 
       {#if kind.type === "tunnel"}
+        <p class="note" role="note">
+          Tunnels are now picked directly in the <strong>Routing</strong> tab without defining an upstream server here.
+          This legacy profile still works, or you can switch your rules to the Tunnel directly and remove it.
+        </p>
         <label class="field">
           Tunnel
           <select
@@ -398,9 +406,27 @@
       {#each profileErrors(index) as [key, message] (key)}<p class="field-error">{message}</p>{/each}
 
       <div class="inline-form">
+        <span class="muted">Test dials</span>
+        <input
+          aria-label={`Test host for ${profile.name || `upstream ${index + 1}`}`}
+          value={probeHost(index)}
+          spellcheck="false"
+          oninput={(e) => (probeHostFor = { ...probeHostFor, [index]: e.currentTarget.value })}
+        />
+        <input
+          aria-label={`Test port for ${profile.name || `upstream ${index + 1}`}`}
+          type="number"
+          min="1"
+          max="65535"
+          value={probePort(index)}
+          oninput={(e) => {
+            const port = Number(e.currentTarget.value);
+            if (!Number.isNaN(port)) probePortFor = { ...probePortFor, [index]: port };
+          }}
+        />
         <button
           type="button"
-          disabled={probing !== null || !profile.name || !probeHost.trim()}
+          disabled={probing !== null || !profile.name || !probeHost(index).trim()}
           onclick={() => void testUpstream(index)}
         >
           {probing === index ? "Testing…" : "Test Upstream"}

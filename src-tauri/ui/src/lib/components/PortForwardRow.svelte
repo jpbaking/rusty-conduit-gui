@@ -1,9 +1,16 @@
 <script lang="ts">
   import { api, errorMessage } from "../api";
   import { forwardFlag } from "../portForwards";
-  import { NEW_SESSION_ID, store } from "../stores.svelte";
-  import type { ForwardDirection, ForwardStatus, PortConflict, PortForward } from "../types";
+  import { store } from "../stores.svelte";
+  import type {
+    ForwardDirection,
+    ForwardProxyProtocol,
+    ForwardStatus,
+    PortConflict,
+    PortForward,
+  } from "../types";
   import { isIpAddress, isLoopback, isPort } from "../validate";
+  import { chainEditor } from "./JumpChainBuilder.svelte";
   import PortField from "./PortField.svelte";
   import ProxySwitch from "./ProxySwitch.svelte";
 
@@ -29,7 +36,8 @@
     $props();
 
   const uid = $props.id();
-  const errors = $derived(store.draftErrors);
+  const ed = chainEditor();
+  const errors = $derived(ed.draftErrors);
   const key = (field: string) => `forwards:${forward.id}:${field}`;
   const local = $derived(forward.direction === "local");
   const here = "this computer";
@@ -61,13 +69,16 @@
     if (direction === forward.direction) return;
     // Each side has its usual destination: a remote forward most often shares a local service.
     const patch: Partial<PortForward> = { direction };
-    if (direction === "remote" && !forward.dest_host.trim()) patch.dest_host = "localhost";
+    if (direction === "remote") {
+      if (!forward.dest_host.trim()) patch.dest_host = "localhost";
+      if (forward.proxy_protocol !== "none") patch.proxy_protocol = "none";
+    }
     onChange(patch);
   }
 
   // Only a local forward listens on this computer, so only it can clash with other sessions.
   $effect(() => {
-    const id = store.selectedId;
+    const sessionId = ed.selected?.profile.id ?? null;
     const { enabled, bind, port } = forward;
     conflicts = [];
     checkError = null;
@@ -76,7 +87,6 @@
     let cancelled = false;
     const timer = setTimeout(async () => {
       try {
-        const sessionId = id === NEW_SESSION_ID ? null : id;
         const report = await api.checkPortConflicts(sessionId, bind, port, 0);
         if (!cancelled) conflicts = report.conflicts;
       } catch (error) {
@@ -162,6 +172,30 @@
       </div>
       <PortField label="Port" value={forward.dest_port} error={errors[key("dest_port")]} onValue={(dest_port) => onChange({ dest_port })} />
     </div>
+
+    {#if local}
+      <div class="field-row">
+        <div class="field grow">
+          <label class="field">
+            Proxy protocol
+            <select
+              value={forward.proxy_protocol}
+              aria-invalid={!!errors[key("proxy_protocol")]}
+              onchange={(e) => onChange({ proxy_protocol: e.currentTarget.value as ForwardProxyProtocol })}
+            >
+              <option value="none">None (raw TCP)</option>
+              <option value="http">HTTP proxy</option>
+              <option value="socks5">SOCKS5 proxy</option>
+            </select>
+          </label>
+          {#if errors[key("proxy_protocol")]}
+            <span class="field-error">{errors[key("proxy_protocol")]}</span>
+          {:else}
+            <small class="muted">HTTP and SOCKS5 forwards appear as selectable profiles in Proxy Routing.</small>
+          {/if}
+        </div>
+      </div>
+    {/if}
 
     {#if complete}
       <p class="forward-summary">

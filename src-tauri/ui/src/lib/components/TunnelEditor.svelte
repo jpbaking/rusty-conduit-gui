@@ -1,26 +1,11 @@
 <script lang="ts" module>
   import type {
-    ForwardConfig,
     SessionProfile,
     SessionView,
     Tunnel,
     TunnelView,
   } from "../types";
   import type { FieldErrors } from "../validate";
-
-  /**
-   * A Tunnel has no forward proxy. The shared tabs read one, so they get this: on, so the
-   * reverse proxy and port forwards are never "the only listener" because of it.
-   */
-  const NO_FORWARD: ForwardConfig = {
-    enabled: true,
-    bind: "127.0.0.1",
-    http_port: 0,
-    socks_port: 0,
-    max_connections: 4096,
-    allow: [],
-    block: [],
-  };
 
   /** Shows a Tunnel in the session shape the shared SSH tabs edit. */
   export function tunnelAsSession(tunnel: Tunnel): SessionProfile {
@@ -31,10 +16,10 @@
       enabled: tunnel.enabled,
       engine: tunnel.engine,
       hops: tunnel.hops,
-      forward: NO_FORWARD,
+      forward: tunnel.forward,
       reverse: tunnel.reverse,
       port_forwards: tunnel.port_forwards,
-      mitm: null,
+      mitm: tunnel.mitm,
       tunnel: tunnel.keepalive,
       logging: tunnel.logging,
       openssh: tunnel.openssh,
@@ -49,8 +34,11 @@
       enabled: edited.enabled,
       engine: edited.engine,
       hops: edited.hops,
+      forward: edited.forward,
       reverse: edited.reverse,
       port_forwards: edited.port_forwards,
+      mitm: edited.mitm,
+      socks_block_web: edited.mitm ? edited.mitm.socks_block_web : tunnel.socks_block_web,
       keepalive: edited.tunnel,
       logging: edited.logging,
       openssh: edited.openssh,
@@ -78,7 +66,7 @@
         enabled: snapshot.enabled,
         state: snapshot.state,
         stats: snapshot.stats,
-        listeners: [],
+        listeners: snapshot.listeners,
         remote_listeners: snapshot.remote_listeners,
         port_forwards: snapshot.port_forwards,
       },
@@ -94,44 +82,52 @@
   import { NEW_SESSION_ID, store } from "../stores.svelte";
   import type { HopEntry, TunnelStartMode } from "../types";
   import EngineCheck from "./EngineCheck.svelte";
+  import FiltersTab from "./FiltersTab.svelte";
+  import ForwardProxyTab from "./ForwardProxyTab.svelte";
   import HopEditor from "./HopEditor.svelte";
   import JumpChainBuilder, { provideChainEditor, type ChainEditor } from "./JumpChainBuilder.svelte";
   import KeepaliveTab from "./KeepaliveTab.svelte";
   import LoggingAdvancedTab from "./LoggingAdvancedTab.svelte";
+  import MitmTab from "./MitmTab.svelte";
   import OpensshFallbackDialog from "./OpensshFallbackDialog.svelte";
   import PortForwardsTab from "./PortForwardsTab.svelte";
   import ReverseProxyTab from "./ReverseProxyTab.svelte";
 
-  const TABS = [
-    { label: "Connection", title: "Connection & jump chain" },
-    { label: "Reverse", title: "Reverse proxy (-R)" },
-    { label: "Ports", title: "Port forwards (-L / -R)" },
-    { label: "Keepalive", title: "Keepalive, reconnect & start mode" },
-    { label: "Advanced", title: "Logging & advanced" },
-  ] as const;
-  const CONNECTION_TAB = 0;
-  const REVERSE_TAB = 1;
-  const PORTS_TAB = 2;
-  const KEEPALIVE_TAB = 3;
-  const LOGGING_TAB = 4;
+  type TabId = "connection" | "proxy" | "ports" | "filters" | "mitm" | "keepalive" | "advanced";
 
-  /** The tab that shows a field's error, or `null` for the header (the name). */
-  function tabForField(field: string): number | null {
-    if (field === "hops" || field.startsWith("hop:") || field === "tunnel.ip_version") return CONNECTION_TAB;
-    if (field.startsWith("reverse.")) return REVERSE_TAB;
-    if (field === "listeners" || field.startsWith("forwards:")) return PORTS_TAB;
-    if (field.startsWith("tunnel.")) return KEEPALIVE_TAB;
-    if (field.startsWith("logging.") || field.startsWith("openssh.")) return LOGGING_TAB;
-    return null;
-  }
+  const ALL_TABS: readonly { id: TabId; label: string; title: string }[] = [
+    { id: "connection", label: "Connection", title: "Connection & jump chain" },
+    { id: "proxy", label: "Proxy", title: "Forward & reverse (-R) proxy" },
+    { id: "ports", label: "Ports", title: "Port forwards (-L / -R)" },
+    { id: "filters", label: "Filters", title: "Destination filters" },
+    { id: "mitm", label: "MITM", title: "HTTPS MITM (tunnel Forward listener only)" },
+    { id: "keepalive", label: "Keepalive", title: "Keepalive, reconnect & start mode" },
+    { id: "advanced", label: "Advanced", title: "Logging & advanced" },
+  ];
 
   const uid = $props.id();
   const tunnel = $derived(store.tunnelDraft as Tunnel);
   const saved = $derived(store.selectedTunnel);
   const draft = $derived(tunnelAsSession(tunnel));
   const errors = $derived(tunnelErrorsForTabs(store.tunnelDraftErrors));
+  const tabs = $derived(
+    tunnel.forward.enabled ? ALL_TABS : ALL_TABS.filter((tab) => tab.id !== "mitm"),
+  );
+
+  /** The tab that shows a field's error, or `null` for the header (the name). */
+  function tabForField(field: string): TabId | null {
+    if (field === "hops" || field.startsWith("hop:") || field === "tunnel.ip_version") return "connection";
+    if (field.startsWith("forward.") || field.startsWith("reverse.")) return "proxy";
+    if (field === "listeners" || field.startsWith("forwards:")) return "ports";
+    if (field.startsWith("filters.")) return "filters";
+    if (field.startsWith("mitm.")) return tunnel.forward.enabled ? "mitm" : null;
+    if (field.startsWith("tunnel.")) return "keepalive";
+    if (field.startsWith("logging.") || field.startsWith("openssh.")) return "advanced";
+    return null;
+  }
+
   const errorCounts = $derived.by(() => {
-    const counts = TABS.map(() => 0);
+    const counts: Partial<Record<TabId, number>> = {};
     for (const field of Object.keys(errors)) {
       const tab = tabForField(field);
       if (tab !== null) counts[tab] = (counts[tab] ?? 0) + 1;
@@ -202,19 +198,33 @@
   };
   provideChainEditor(editor);
 
-  let activeTab = $state(CONNECTION_TAB);
-  let tabButtons = $state<HTMLButtonElement[]>([]);
-  const tabId = (index: number) => `${uid}-tab-${index}`;
-  const panelId = (index: number) => `${uid}-panel-${index}`;
+  const startModeLabel = $derived(
+    tunnel.start_mode === "linked"
+      ? "Linked"
+      : tunnel.start_mode.manual.autostart
+        ? "Auto-start"
+        : "Manual",
+  );
 
-  async function focusTab(index: number) {
-    activeTab = index;
+  let activeTab = $state<TabId>("connection");
+  let tabButtons = $state<Partial<Record<TabId, HTMLButtonElement>>>({});
+  const tabId = (id: TabId) => `${uid}-tab-${id}`;
+  const panelId = (id: TabId) => `${uid}-panel-${id}`;
+
+  $effect(() => {
+    if (!tunnel.forward.enabled && activeTab === "mitm") {
+      activeTab = "proxy";
+    }
+  });
+
+  async function focusTab(id: TabId) {
+    activeTab = id;
     await tick();
-    tabButtons[index]?.focus();
+    tabButtons[id]?.focus();
   }
 
   function onTabKeydown(event: KeyboardEvent, index: number) {
-    const last = TABS.length - 1;
+    const last = tabs.length - 1;
     const targets: Record<string, number> = {
       ArrowRight: index === last ? 0 : index + 1,
       ArrowLeft: index === 0 ? last : index - 1,
@@ -224,7 +234,8 @@
     const target = targets[event.key];
     if (target === undefined) return;
     event.preventDefault();
-    void focusTab(target);
+    const next = tabs[target];
+    if (next) void focusTab(next.id);
   }
 
   let fallback = $state<Fallback | null>(null);
@@ -286,7 +297,7 @@
   {#if saved && !saved.profile.enabled}
     <span class="pill idle" title="Not included in Start All or autostart">Disabled</span>
   {/if}
-  <span class="pill idle" title="Start mode">{tunnel.start_mode === "linked" ? "Linked" : "Manual"}</span>
+  <span class="pill idle" title="Start mode">{startModeLabel}</span>
 
   <dl class="stats" aria-label="Live statistics">
     <div><dt>Conns</dt><dd>{runtime?.stats.active_connections ?? 0}</dd></div>
@@ -357,19 +368,19 @@
     </section>
 
     <div class="tab-list" role="tablist" aria-label="Tunnel settings">
-      {#each TABS as tab, index (tab.label)}
-        {@const count = errorCounts[index] ?? 0}
+      {#each tabs as tab, index (tab.id)}
+        {@const count = errorCounts[tab.id] ?? 0}
         <button
-          bind:this={tabButtons[index]}
+          bind:this={tabButtons[tab.id]}
           type="button"
           class="tab"
-          class:active={activeTab === index}
+          class:active={activeTab === tab.id}
           role="tab"
-          id={tabId(index)}
-          aria-selected={activeTab === index}
-          aria-controls={panelId(index)}
-          tabindex={activeTab === index ? 0 : -1}
-          onclick={() => (activeTab = index)}
+          id={tabId(tab.id)}
+          aria-selected={activeTab === tab.id}
+          aria-controls={panelId(tab.id)}
+          tabindex={activeTab === tab.id ? 0 : -1}
+          onclick={() => (activeTab = tab.id)}
           onkeydown={(e) => onTabKeydown(e, index)}
           title={tab.title}
         >
@@ -382,7 +393,7 @@
       {/each}
     </div>
 
-    <div class="tab-panel" role="tabpanel" id={panelId(CONNECTION_TAB)} aria-labelledby={tabId(CONNECTION_TAB)} hidden={activeTab !== CONNECTION_TAB}>
+    <div class="tab-panel" role="tabpanel" id={panelId("connection")} aria-labelledby={tabId("connection")} hidden={activeTab !== "connection"}>
       <div class="connection-layout">
         <aside class="route-column">
           <JumpChainBuilder />
@@ -416,7 +427,7 @@
               </select>
             </label>
             {#if tunnel.engine === "OpenSsh"}
-              <EngineCheck onChangeProgram={() => void focusTab(LOGGING_TAB)} />
+              <EngineCheck onChangeProgram={() => void focusTab("advanced")} />
             {/if}
           </section>
         </aside>
@@ -459,20 +470,49 @@
       </div>
     </div>
 
-    <div class="tab-panel" role="tabpanel" id={panelId(REVERSE_TAB)} aria-labelledby={tabId(REVERSE_TAB)} hidden={activeTab !== REVERSE_TAB}>
+    <div class="tab-panel" role="tabpanel" id={panelId("proxy")} aria-labelledby={tabId("proxy")} hidden={activeTab !== "proxy"}>
+      {#key store.selectedTunnelId}
+        <ForwardProxyTab />
+      {/key}
       <ReverseProxyTab />
     </div>
 
     {#key store.selectedTunnelId}
-      <div class="tab-panel" role="tabpanel" id={panelId(PORTS_TAB)} aria-labelledby={tabId(PORTS_TAB)} hidden={activeTab !== PORTS_TAB}>
+      <div class="tab-panel" role="tabpanel" id={panelId("ports")} aria-labelledby={tabId("ports")} hidden={activeTab !== "ports"}>
         <PortForwardsTab />
       </div>
 
-      <div class="tab-panel" role="tabpanel" id={panelId(KEEPALIVE_TAB)} aria-labelledby={tabId(KEEPALIVE_TAB)} hidden={activeTab !== KEEPALIVE_TAB}>
+      <div class="tab-panel" role="tabpanel" id={panelId("filters")} aria-labelledby={tabId("filters")} hidden={activeTab !== "filters"}>
+        <FiltersTab />
+      </div>
+
+      {#if tunnel.forward.enabled}
+        <div class="tab-panel" role="tabpanel" id={panelId("mitm")} aria-labelledby={tabId("mitm")} hidden={activeTab !== "mitm"}>
+          <p class="note">
+            HTTPS MITM and SOCKS web blocking here apply only to this tunnel's own Forward listener, not to Proxies routing through this tunnel.
+          </p>
+          <MitmTab
+            target={{
+              mitm: tunnel.mitm,
+              socksBlockWeb: tunnel.socks_block_web || (tunnel.mitm?.socks_block_web ?? false),
+              errors,
+              set: (mitm) => store.updateTunnelDraft((t) => ({ ...t, mitm })),
+              setSocksBlockWeb: (socks_block_web) =>
+                store.updateTunnelDraft((t) => ({
+                  ...t,
+                  socks_block_web,
+                  mitm: t.mitm ? { ...t.mitm, socks_block_web } : null,
+                })),
+            }}
+          />
+        </div>
+      {/if}
+
+      <div class="tab-panel" role="tabpanel" id={panelId("keepalive")} aria-labelledby={tabId("keepalive")} hidden={activeTab !== "keepalive"}>
         <KeepaliveTab />
       </div>
 
-      <div class="tab-panel" role="tabpanel" id={panelId(LOGGING_TAB)} aria-labelledby={tabId(LOGGING_TAB)} hidden={activeTab !== LOGGING_TAB}>
+      <div class="tab-panel" role="tabpanel" id={panelId("advanced")} aria-labelledby={tabId("advanced")} hidden={activeTab !== "advanced"}>
         <LoggingAdvancedTab />
       </div>
     {/key}

@@ -9,6 +9,7 @@
 //! `RoutingConfig`) field for field, but add `Serialize` so they can be stored in `config.json`.
 //! The v1 types stay in place until U3 switches the runtime and UI over.
 
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -17,8 +18,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::model::{
-    ForwardDirection, HopEntry, LoggingConfig, MitmConfig, OpenSshOptions, PortForward,
-    ReverseConfig, SecretRef, SshEngine, TunnelConfig,
+    ForwardConfig, ForwardDirection, HopEntry, LoggingConfig, MitmConfig, OpenSshOptions,
+    PortForward, ReverseConfig, SecretRef, SshEngine, TunnelConfig,
 };
 
 // ---------------------------------------------------------------------------
@@ -125,8 +126,12 @@ pub enum TunnelStartMode {
     },
 }
 
-/// A saved SSH tunnel: hops, reverse proxy, port forwards, and keepalive. The last
-/// [`HopEntry`] is the SSH target.
+fn default_tunnel_forward() -> ForwardConfig {
+    ForwardConfig { enabled: false, ..ForwardConfig::default() }
+}
+
+/// A saved SSH tunnel: hops, optional forward proxy, reverse proxy, port forwards, MITM, and
+/// keepalive. The last [`HopEntry`] is the SSH target.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tunnel {
     #[serde(default)]
@@ -141,10 +146,16 @@ pub struct Tunnel {
     pub engine: SshEngine,
     #[serde(default)]
     pub hops: Vec<HopEntry>,
+    #[serde(default = "default_tunnel_forward")]
+    pub forward: ForwardConfig,
     #[serde(default)]
     pub reverse: ReverseConfig,
     #[serde(default)]
     pub port_forwards: Vec<PortForward>,
+    #[serde(default)]
+    pub mitm: Option<MitmConfig>,
+    #[serde(default)]
+    pub socks_block_web: bool,
     #[serde(default)]
     pub keepalive: TunnelConfig,
     #[serde(default)]
@@ -162,8 +173,11 @@ impl Default for Tunnel {
             start_mode: TunnelStartMode::default(),
             engine: SshEngine::default(),
             hops: Vec::new(),
+            forward: default_tunnel_forward(),
             reverse: ReverseConfig::default(),
             port_forwards: Vec::new(),
+            mitm: None,
+            socks_block_web: false,
             keepalive: TunnelConfig::default(),
             logging: LoggingConfig::default(),
             openssh: OpenSshOptions::default(),
@@ -574,6 +588,140 @@ impl Default for Proxy {
     }
 }
 
+/// Prefix for synthetic routing targets pointing directly at an SSH [`Tunnel`].
+pub const TUNNEL_TARGET_PREFIX: &str = "@tunnel:";
+
+/// Prefix for synthetic routing targets pointing at a tagged local (`-L`) [`PortForward`] on a
+/// [`Tunnel`].
+pub const FORWARD_TARGET_PREFIX: &str = "@forward:";
+
+/// Build the wire target string for routing directly through a [`Tunnel`].
+pub fn tunnel_target_name(tunnel_id: TunnelId) -> String {
+    format!("{TUNNEL_TARGET_PREFIX}{tunnel_id}")
+}
+
+/// Build the wire target string for routing through a tagged local (`-L`) [`PortForward`] on a
+/// [`Tunnel`].
+pub fn forward_target_name(tunnel_id: TunnelId, forward_id: Uuid) -> String {
+    format!("{FORWARD_TARGET_PREFIX}{tunnel_id}:{forward_id}")
+}
+
+/// Parsed form of one routing target string in a [`RouteTarget`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TargetRef {
+    Direct,
+    Block,
+    Tunnel(TunnelId),
+    TunnelForward { tunnel_id: TunnelId, forward_id: Uuid },
+    Profile(String),
+}
+
+impl TargetRef {
+    /// Parse a wire target name into its structured form.
+    pub fn parse(raw: &str) -> Self {
+        if raw == ROUTE_DIRECT {
+            return Self::Direct;
+        }
+        if raw == "block" {
+            return Self::Block;
+        }
+        if let Some(rest) = raw.strip_prefix(TUNNEL_TARGET_PREFIX) {
+            if let Ok(uuid) = Uuid::parse_str(rest) {
+                return Self::Tunnel(TunnelId::from_uuid(uuid));
+            }
+        }
+        if let Some(rest) = raw.strip_prefix(FORWARD_TARGET_PREFIX) {
+            if let Some((t_str, f_str)) = rest.split_once(':') {
+                if let (Ok(tunnel_uuid), Ok(forward_id)) =
+                    (Uuid::parse_str(t_str), Uuid::parse_str(f_str))
+                {
+                    return Self::TunnelForward {
+                        tunnel_id: TunnelId::from_uuid(tunnel_uuid),
+                        forward_id,
+                    };
+                }
+            }
+        }
+        Self::Profile(raw.to_string())
+    }
+
+    /// Format this target back to its wire string.
+    pub fn to_wire(&self) -> String {
+        match self {
+            Self::Direct => ROUTE_DIRECT.to_string(),
+            Self::Block => "block".to_string(),
+            Self::Tunnel(id) => tunnel_target_name(*id),
+            Self::TunnelForward { tunnel_id, forward_id } => {
+                forward_target_name(*tunnel_id, *forward_id)
+            }
+            Self::Profile(name) => name.clone(),
+        }
+    }
+}
+
+fn rewrite_target(target: &mut RouteTarget, rewrites: &BTreeMap<String, String>) {
+    match target {
+        RouteOneOrMany::One(name) => {
+            if let Some(replacement) = rewrites.get(name.as_str()) {
+                *name = replacement.clone();
+            }
+        }
+        RouteOneOrMany::Many(names) => {
+            for name in names {
+                if let Some(replacement) = rewrites.get(name.as_str()) {
+                    *name = replacement.clone();
+                }
+            }
+        }
+    }
+}
+
+fn rewrite_table(table: &mut RoutingTable, rewrites: &BTreeMap<String, String>) {
+    if let Some(default) = &mut table.default {
+        rewrite_target(default, rewrites);
+    }
+    for rule in &mut table.rules {
+        rewrite_target(&mut rule.target, rewrites);
+    }
+}
+
+/// Rewrite references to any [`UpstreamKind::Tunnel`] profile in `proxy.routing` and composite
+/// profiles to `@tunnel:<id>`, then remove the redundant [`UpstreamKind::Tunnel`] entries from
+/// `proxy.profiles`. Returns `true` if the proxy was modified.
+pub fn migrate_tunnel_profiles(proxy: &mut Proxy) -> bool {
+    let mut rewrites: BTreeMap<String, String> = BTreeMap::new();
+    for profile in &proxy.profiles {
+        if let UpstreamKind::Tunnel { tunnel_id } = profile.kind {
+            rewrites.insert(profile.name.clone(), tunnel_target_name(tunnel_id));
+        }
+    }
+    if rewrites.is_empty() {
+        return false;
+    }
+
+    rewrite_target(&mut proxy.routing.default, &rewrites);
+    for rule in &mut proxy.routing.rules {
+        rewrite_target(&mut rule.target, &rewrites);
+    }
+    if let Some(http) = &mut proxy.routing.http {
+        rewrite_table(http, &rewrites);
+    }
+    if let Some(socks) = &mut proxy.routing.socks {
+        rewrite_table(socks, &rewrites);
+    }
+    for profile in &mut proxy.profiles {
+        if let UpstreamKind::Composite { http, https, fallback } = &mut profile.kind {
+            for slot in [http, https, fallback] {
+                if let Some(replacement) = rewrites.get(slot.as_str()) {
+                    *slot = replacement.clone();
+                }
+            }
+        }
+    }
+    proxy.profiles.retain(|p| !matches!(p.kind, UpstreamKind::Tunnel { .. }));
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -608,6 +756,9 @@ mod tests {
         let tunnel: Tunnel = serde_json::from_value(json!({ "name": "corp" })).unwrap();
         assert_eq!(tunnel.start_mode, TunnelStartMode::Linked);
         assert!(tunnel.enabled);
+        assert!(!tunnel.forward.enabled);
+        assert_eq!(tunnel.mitm, None);
+        assert!(!tunnel.socks_block_web);
         assert_eq!(tunnel.id, TunnelId::default());
         assert_eq!(tunnel, Tunnel { name: "corp".into(), ..Tunnel::default() });
     }
@@ -795,5 +946,111 @@ mod tests {
         ] {
             assert_eq!(round_trip(&filter), filter);
         }
+    }
+
+    #[test]
+    fn target_ref_parses_and_formats_all_variants() {
+        let tid = TunnelId::new();
+        let fid = Uuid::new_v4();
+        let cases = [
+            ("direct".to_string(), TargetRef::Direct),
+            ("block".to_string(), TargetRef::Block),
+            (tunnel_target_name(tid), TargetRef::Tunnel(tid)),
+            (forward_target_name(tid, fid), TargetRef::TunnelForward { tunnel_id: tid, forward_id: fid }),
+            ("corp".to_string(), TargetRef::Profile("corp".into())),
+            ("@tunnel:not-a-uuid".to_string(), TargetRef::Profile("@tunnel:not-a-uuid".into())),
+            ("@forward:not-a-uuid".to_string(), TargetRef::Profile("@forward:not-a-uuid".into())),
+        ];
+        for (wire, parsed) in cases {
+            assert_eq!(TargetRef::parse(&wire), parsed);
+            assert_eq!(parsed.to_wire(), wire);
+        }
+    }
+
+    #[test]
+    fn migrate_tunnel_profiles_rewrites_all_refs_and_removes_tunnel_entries() {
+        let tid = TunnelId::new();
+        let wire = tunnel_target_name(tid);
+        let mut proxy = Proxy {
+            name: "work".into(),
+            profiles: vec![
+                UpstreamProfile {
+                    name: "corp".into(),
+                    kind: UpstreamKind::Http,
+                    host: Some("127.0.0.1".into()),
+                    port: Some(8080),
+                    username: None,
+                    password: None,
+                    bypass: Vec::new(),
+                    color: None,
+                },
+                UpstreamProfile {
+                    name: "ssh".into(),
+                    kind: UpstreamKind::Tunnel { tunnel_id: tid },
+                    host: None,
+                    port: None,
+                    username: None,
+                    password: None,
+                    bypass: Vec::new(),
+                    color: None,
+                },
+                UpstreamProfile {
+                    name: "split".into(),
+                    kind: UpstreamKind::Composite {
+                        http: "corp".into(),
+                        https: "ssh".into(),
+                        fallback: "ssh".into(),
+                    },
+                    host: None,
+                    port: None,
+                    username: None,
+                    password: None,
+                    bypass: Vec::new(),
+                    color: None,
+                },
+            ],
+            routing: RoutingTablesConfig {
+                default: RouteOneOrMany::One("ssh".into()),
+                resolve_dns: false,
+                rules: vec![RoutingRule::to_target(RouteOneOrMany::Many(vec![
+                    "corp".into(),
+                    "ssh".into(),
+                ]))],
+                http: Some(RoutingTable {
+                    default: Some(RouteOneOrMany::One("ssh".into())),
+                    inherit: true,
+                    rules: vec![RoutingRule::to_target(RouteOneOrMany::One("ssh".into()))],
+                }),
+                socks: Some(RoutingTable {
+                    default: Some(RouteOneOrMany::Many(vec!["ssh".into(), "direct".into()])),
+                    inherit: false,
+                    rules: vec![RoutingRule::to_target(RouteOneOrMany::One("direct".into()))],
+                }),
+            },
+            ..Proxy::default()
+        };
+
+        assert!(migrate_tunnel_profiles(&mut proxy));
+        assert!(!migrate_tunnel_profiles(&mut proxy));
+        assert_eq!(proxy.profiles.len(), 2);
+        assert!(proxy.profiles.iter().all(|p| !matches!(p.kind, UpstreamKind::Tunnel { .. })));
+        assert_eq!(proxy.routing.default, RouteOneOrMany::One(wire.clone()));
+        assert_eq!(
+            proxy.routing.rules[0].target,
+            RouteOneOrMany::Many(vec!["corp".into(), wire.clone()])
+        );
+        let http = proxy.routing.http.as_ref().unwrap();
+        assert_eq!(http.default, Some(RouteOneOrMany::One(wire.clone())));
+        assert_eq!(http.rules[0].target, RouteOneOrMany::One(wire.clone()));
+        let socks = proxy.routing.socks.as_ref().unwrap();
+        assert_eq!(socks.default, Some(RouteOneOrMany::Many(vec![wire.clone(), "direct".into()])));
+        assert_eq!(
+            proxy.profiles[1].kind,
+            UpstreamKind::Composite {
+                http: "corp".into(),
+                https: wire.clone(),
+                fallback: wire,
+            }
+        );
     }
 }

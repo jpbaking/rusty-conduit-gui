@@ -8,6 +8,7 @@
 
 pub mod backoff;
 pub mod events;
+pub(crate) mod forward_dialer;
 pub mod hardening;
 pub mod logs;
 pub mod manager;

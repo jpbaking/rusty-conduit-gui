@@ -21,23 +21,36 @@ use rusty_conduit_engine::routing::{
 };
 use rusty_conduit_engine::server::ServerOptions;
 use rusty_conduit_engine::filter::HostFilter;
+use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::mapping::{host_filter, parse_rules};
-use crate::model::{ForwardConfig, SecretRef};
+use crate::model::SecretRef;
 use crate::v2_model::{
     GlobalFilterConfig, Proxy, RouteHostLevels, RouteInbound, RouteOneOrMany, RoutePortSpec,
-    RoutingRule, RoutingTable, RoutingTablesConfig, Tunnel, TunnelId, UpstreamKind,
+    RoutingRule, RoutingTable, RoutingTablesConfig, TargetRef, Tunnel, TunnelId, UpstreamKind,
     UpstreamPasswordSource, UpstreamProfile,
 };
 use crate::{EngineConfig, MappingError, SshIpVersion};
 
-/// Map a [`Tunnel`] into an [`EngineConfig`]: reverse listeners, keepalive, logging, and SSH IP
-/// version come from the tunnel; the forward listener is off (ports `0`) and MITM is off.
+/// Compile a [`Tunnel`]'s forward allow/block rules into a [`HostFilter`]. Always active even
+/// when `tunnel.forward.enabled == false` so Proxy traffic routed through the tunnel is filtered.
+pub fn tunnel_forward_filter(tunnel: &Tunnel) -> Result<Option<HostFilter>, MappingError> {
+    Ok(host_filter(
+        parse_rules("forward", &tunnel.forward.allow)?,
+        parse_rules("forward", &tunnel.forward.block)?,
+    ))
+}
+
+/// Map a [`Tunnel`] into an [`EngineConfig`]: forward listener (when enabled), always-compiled
+/// forward filter, conditional MITM (only when `forward.enabled && tunnel.mitm.is_some()`),
+/// reverse listeners, keepalive, logging, and SSH IP version.
 pub fn tunnel_to_engine_config(tunnel: &Tunnel) -> Result<EngineConfig, MappingError> {
     if tunnel.hops.is_empty() {
         return Err(MappingError::NoHops);
     }
+    let forward = &tunnel.forward;
+    let forward_filter = tunnel_forward_filter(tunnel)?;
     let reverse = &tunnel.reverse;
     let reverse_filter = host_filter(
         parse_rules("reverse", &reverse.reverse_allow)?,
@@ -56,32 +69,50 @@ pub fn tunnel_to_engine_config(tunnel: &Tunnel) -> Result<EngineConfig, MappingE
         interval: k.tcp_keepalive_interval,
         retries: k.tcp_keepalive_retries,
     });
+    let (http_port, socks_port) = forward.effective_ports();
     let (reverse_http_port, reverse_socks_port) = reverse.effective_ports();
-    let forward_defaults = ForwardConfig::default();
-    let mitm_options = MitmOptions { ca: None, passphrase: None, passphrase_file: None, ..MitmOptions::default() };
+    let mitm_enabled = forward.enabled && tunnel.mitm.is_some();
+    let defaults = MitmOptions::default();
+    let mitm_options = MitmOptions {
+        ca: None,
+        passphrase: None,
+        passphrase_file: None,
+        cert_ttl: if mitm_enabled {
+            tunnel.mitm.as_ref().map_or(defaults.cert_ttl, |m| m.cert_ttl)
+        } else {
+            defaults.cert_ttl
+        },
+        cert_cache_max: if mitm_enabled {
+            tunnel.mitm.as_ref().map_or(defaults.cert_cache_max, |m| m.cert_cache_max_entries)
+        } else {
+            defaults.cert_cache_max
+        },
+    };
+    let socks_block_web_in_mitm = tunnel.socks_block_web
+        || (mitm_enabled && tunnel.mitm.as_ref().is_some_and(|m| m.socks_block_web));
 
     Ok(EngineConfig {
         forward_server: ServerOptions {
-            bind: forward_defaults.bind,
-            http_port: 0,
-            socks_port: 0,
-            max_connections: forward_defaults.max_connections,
+            bind: forward.bind,
+            http_port,
+            socks_port,
+            max_connections: forward.max_connections,
             keepalive,
         },
-        forward_enabled: false,
-        forward_filter: None,
+        forward_enabled: http_port != 0 || socks_port != 0,
+        forward_filter,
         reverse_bind: reverse.reverse_bind,
         reverse_http_port,
         reverse_socks_port,
         reverse_max_connections: reverse
             .reverse_max_connections
-            .unwrap_or(forward_defaults.max_connections),
+            .unwrap_or(forward.max_connections),
         reverse_enabled: reverse_http_port != 0 || reverse_socks_port != 0,
         reverse_filter,
         keepalive,
-        mitm_enabled: false,
+        mitm_enabled,
         mitm_options,
-        socks_block_web_in_mitm: false,
+        socks_block_web_in_mitm,
         log_level,
         log_format,
         http_access_log: tunnel.logging.http_access_log.clone(),
@@ -124,13 +155,84 @@ pub fn proxy_mitm_options(proxy: &Proxy) -> Option<MitmOptions> {
     })
 }
 
-/// Every distinct Tunnel the Proxy's profiles route through, in profile order.
+fn push_target_refs(target: &RouteOneOrMany<String>, out: &mut Vec<TargetRef>) {
+    for raw in target.as_slice() {
+        let parsed = TargetRef::parse(raw);
+        if !out.contains(&parsed) {
+            out.push(parsed);
+        }
+    }
+}
+
+fn push_table_refs(table: &RoutingTable, out: &mut Vec<TargetRef>) {
+    if let Some(default) = &table.default {
+        push_target_refs(default, out);
+    }
+    for rule in &table.rules {
+        push_target_refs(&rule.target, out);
+    }
+}
+
+/// Every distinct [`TargetRef`] referenced by a Proxy's routing tables (unified, HTTP, and SOCKS
+/// defaults and rules) and composite upstream profiles, in encounter order.
+pub fn proxy_referenced_targets(proxy: &Proxy) -> Vec<TargetRef> {
+    let mut out = Vec::new();
+    push_target_refs(&proxy.routing.default, &mut out);
+    for rule in &proxy.routing.rules {
+        push_target_refs(&rule.target, &mut out);
+    }
+    if let Some(http) = &proxy.routing.http {
+        push_table_refs(http, &mut out);
+    }
+    if let Some(socks) = &proxy.routing.socks {
+        push_table_refs(socks, &mut out);
+    }
+    for p in &proxy.profiles {
+        if let UpstreamKind::Composite { http, https, fallback } = &p.kind {
+            for slot in [http, https, fallback] {
+                if !slot.is_empty() {
+                    let parsed = TargetRef::parse(slot);
+                    if !out.contains(&parsed) {
+                        out.push(parsed);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Every distinct Tunnel the Proxy routes through (via `UpstreamKind::Tunnel` profiles or
+/// `@tunnel:<id>` / `@forward:<tid>:<fid>` routing targets), in encounter order.
 pub fn proxy_referenced_tunnels(proxy: &Proxy) -> Vec<TunnelId> {
     let mut out = Vec::new();
     for p in &proxy.profiles {
         if let UpstreamKind::Tunnel { tunnel_id } = p.kind {
             if !out.contains(&tunnel_id) {
                 out.push(tunnel_id);
+            }
+        }
+    }
+    for target in proxy_referenced_targets(proxy) {
+        let tunnel_id = match target {
+            TargetRef::Tunnel(id) | TargetRef::TunnelForward { tunnel_id: id, .. } => id,
+            _ => continue,
+        };
+        if !out.contains(&tunnel_id) {
+            out.push(tunnel_id);
+        }
+    }
+    out
+}
+
+/// Every distinct `(TunnelId, forward Uuid)` referenced via `@forward:<tid>:<fid>` in `proxy`.
+pub fn proxy_referenced_forwards(proxy: &Proxy) -> Vec<(TunnelId, Uuid)> {
+    let mut out = Vec::new();
+    for target in proxy_referenced_targets(proxy) {
+        if let TargetRef::TunnelForward { tunnel_id, forward_id } = target {
+            let pair = (tunnel_id, forward_id);
+            if !out.contains(&pair) {
+                out.push(pair);
             }
         }
     }
@@ -300,6 +402,13 @@ pub(crate) fn build_routing_input(
     let mut profiles = BTreeMap::new();
     for p in &proxy.profiles {
         profiles.insert(p.name.clone(), profile_config(p, passwords)?);
+    }
+    for target in proxy_referenced_targets(proxy) {
+        if matches!(target, TargetRef::Tunnel(_) | TargetRef::TunnelForward { .. }) {
+            profiles
+                .entry(target.to_wire())
+                .or_insert_with(|| ProfileConfig::of_kind(ProfileType::External));
+        }
     }
     let mut listeners = proxy_server_options(proxy).listeners();
     listeners.extend_from_slice(extra_listeners);
@@ -592,5 +701,130 @@ mod tests {
             global_filter(&GlobalFilterConfig::Block(vec!["".into()])),
             Err(MappingError::InvalidFilterRule { scope: "filter", .. })
         ));
+    }
+
+    #[test]
+    fn tunnel_maps_forward_off_with_filter_always_compiled_and_mitm_inactive() {
+        let mut tunnel = Tunnel {
+            name: "t".into(),
+            hops: vec![hop()],
+            mitm: Some(MitmConfig {
+                cert_ttl: Duration::from_secs(600),
+                cert_cache_max_entries: 42,
+                ..MitmConfig::default()
+            }),
+            socks_block_web: true,
+            ..Tunnel::default()
+        };
+        tunnel.forward.enabled = false;
+        tunnel.forward.allow = vec!["allowed.example".into()];
+        tunnel.forward.block = vec!["*.example".into()];
+
+        let filter = tunnel_forward_filter(&tunnel).unwrap();
+        assert!(filter.is_some());
+
+        let cfg = tunnel_to_engine_config(&tunnel).unwrap();
+        assert!(!cfg.forward_enabled);
+        assert_eq!((cfg.forward_server.http_port, cfg.forward_server.socks_port), (0, 0));
+        assert_eq!(cfg.forward_filter, filter);
+        assert!(!cfg.mitm_enabled);
+        assert!(cfg.socks_block_web_in_mitm);
+    }
+
+    #[test]
+    fn tunnel_maps_forward_on_with_mitm_and_filter() {
+        let mut tunnel = Tunnel {
+            name: "t".into(),
+            hops: vec![hop()],
+            mitm: Some(MitmConfig {
+                cert_ttl: Duration::from_secs(600),
+                cert_cache_max_entries: 42,
+                socks_block_web: false,
+                ..MitmConfig::default()
+            }),
+            socks_block_web: true,
+            ..Tunnel::default()
+        };
+        tunnel.forward.enabled = true;
+        tunnel.forward.bind = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        tunnel.forward.http_port = 8128;
+        tunnel.forward.socks_port = 1180;
+        tunnel.forward.max_connections = 512;
+        tunnel.forward.block = vec!["ads.example".into()];
+
+        let cfg = tunnel_to_engine_config(&tunnel).unwrap();
+        assert!(cfg.forward_enabled);
+        assert_eq!(cfg.forward_server.http_port, 8128);
+        assert_eq!(cfg.forward_server.socks_port, 1180);
+        assert_eq!(cfg.forward_server.max_connections, 512);
+        assert_eq!(cfg.reverse_max_connections, 512);
+        assert_eq!(
+            cfg.forward_filter,
+            Some(HostFilter::Block(vec![FilterRule::from_str("ads.example").unwrap()]))
+        );
+        assert!(cfg.mitm_enabled);
+        assert_eq!(cfg.mitm_options.cert_ttl, Duration::from_secs(600));
+        assert_eq!(cfg.mitm_options.cert_cache_max, 42);
+        assert!(cfg.socks_block_web_in_mitm);
+    }
+
+    #[test]
+    fn proxy_compiles_synthetic_tunnel_and_forward_targets_without_manual_profiles() {
+        use crate::v2_model::{forward_target_name, tunnel_target_name};
+        use rusty_conduit_engine::router::Router;
+
+        let t1 = TunnelId::new();
+        let t2 = TunnelId::new();
+        let f1 = Uuid::new_v4();
+        let t1_wire = tunnel_target_name(t1);
+        let f1_wire = forward_target_name(t2, f1);
+
+        let mut rule = RoutingRule::to_target(RouteOneOrMany::Many(vec![
+            f1_wire.clone(),
+            "direct".into(),
+        ]));
+        rule.host_wildcard = Some(RouteOneOrMany::One("*.corp.example".into()));
+
+        let mut proxy = Proxy {
+            name: "p".into(),
+            profiles: Vec::new(),
+            routing: RoutingTablesConfig {
+                default: RouteOneOrMany::One(t1_wire.clone()),
+                resolve_dns: false,
+                rules: vec![rule],
+                http: Some(RoutingTable {
+                    default: Some(RouteOneOrMany::One(f1_wire.clone())),
+                    inherit: true,
+                    rules: Vec::new(),
+                }),
+                socks: None,
+            },
+            ..Proxy::default()
+        };
+
+        assert_eq!(proxy_referenced_tunnels(&proxy), vec![t1, t2]);
+        assert_eq!(proxy_referenced_forwards(&proxy), vec![(t2, f1)]);
+        assert_eq!(
+            proxy_referenced_targets(&proxy),
+            vec![
+                TargetRef::Tunnel(t1),
+                TargetRef::TunnelForward { tunnel_id: t2, forward_id: f1 },
+                TargetRef::Direct,
+            ]
+        );
+
+        let input = proxy_to_routing_input(&proxy, &BTreeMap::new(), &[]).unwrap();
+        assert_eq!(input.profiles[&t1_wire].kind, ProfileType::External);
+        assert_eq!(input.profiles[&f1_wire].kind, ProfileType::External);
+        input.validate().unwrap();
+        Router::from_input(&input).unwrap();
+
+        // Also ensure no duplicate entries if referenced again.
+        proxy.routing.socks = Some(RoutingTable {
+            default: Some(RouteOneOrMany::One(t1_wire)),
+            inherit: false,
+            rules: Vec::new(),
+        });
+        assert_eq!(proxy_referenced_tunnels(&proxy), vec![t1, t2]);
     }
 }
