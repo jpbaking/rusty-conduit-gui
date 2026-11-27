@@ -20,6 +20,10 @@ use zeroize::Zeroizing;
 use crate::error::SshError;
 use crate::handler::{ChannelPolicy, DisconnectEvent, HopHandler};
 use crate::host_key::{HopIdentity, HostKeyVerifier};
+use crate::nested::NestedTransport;
+
+/// Time allowed for each hop to accept a disconnect. A wedged session must not hang teardown.
+const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Upper bound on keyboard-interactive rounds, so a server cannot loop the client forever.
 const MAX_KEYBOARD_ROUNDS: usize = 8;
@@ -200,10 +204,12 @@ impl SshChain {
 
 async fn disconnect_all(mut handles: Vec<Handle<HopHandler>>) {
     while let Some(handle) = handles.pop() {
-        // The session may already be gone, and teardown continues either way.
-        let _ = handle
-            .disconnect(Disconnect::ByApplication, "closing", "en")
-            .await;
+        // The session may already be gone or stuck, and teardown continues either way.
+        let _ = timeout(
+            DISCONNECT_TIMEOUT,
+            handle.disconnect(Disconnect::ByApplication, "closing", "en"),
+        )
+        .await;
     }
 }
 
@@ -364,7 +370,7 @@ async fn connect_hop(
                         port: spec.port,
                         detail: e.to_string(),
                     })?;
-                client::connect_stream(config, channel.into_stream(), handler).await
+                client::connect_stream(config, NestedTransport::new(channel), handler).await
             }
         };
         let mut handle = connected.map_err(|e| with_hop_context(e, index, spec))?;
