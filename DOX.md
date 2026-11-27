@@ -247,7 +247,7 @@ When the user requests a durable behavior change, record it here or in the relev
 - Business logic lives in `crates/*`, which stay UI-agnostic. `src-tauri` only adapts them, and `src-tauri/ui` only talks to the backend over Tauri IPC.
 - The app never reads or writes `~/.ssh/config`, `~/.ssh/id_*`, `~/.ssh/known_hosts`, or the ambient `SSH_AUTH_SOCK`. Secrets live only in the vault, are referenced by UUID, and never appear in logs, exports, or UI state in clear.
 - Crypto stays pure Rust: no C crypto library may enter the dependency graph.
-- Root-owned files: `scripts/` (CI and release helpers, run from the repo root), `.github/workflows/` (`ci.yml` gates every push and pull request; `release.yml` runs it on `v*` tags, then packages), and `docs/` (`RELEASING.md`, `TODO.md`).
+- Root-owned files: `scripts/` (CI and release helpers, run from the repo root), `.github/workflows/` (`ci.yml` gates every push and pull request; `release.yml` runs it on `v*` tags, then packages), and `docs/` (`RELEASING.md`, `TODO.md`, and design proposals such as `FUTURE-EXPORTER.md`).
 - Requirements: Rust stable, Node 22, Python 3 (PyYAML for `scripts/validate-release-config.py`). On Linux, the WebKitGTK, AppIndicator, librsvg, patchelf, D-Bus, and GTK 3 dev packages listed in `README.md`.
 
 ### Verification

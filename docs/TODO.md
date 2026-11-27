@@ -13,3 +13,9 @@
   and `Tunnel.socks_block_web`. Migrate saved vault data to the top-level field, remove the
   nested field from `MitmConfig` / runtime / mapping, and move the toggle out of `MitmTab`
   before `v0.2.0` stable.
+- **Docker Compose project exporter.** Export a Proxy with the Tunnels it routes through as a
+  zip holding a runnable Compose project (`rusty-conduit-switch` plus one `rusty-conduit-ssh`
+  service per Tunnel) and a generated `README.md`, with secrets as placeholders by default.
+  Packaging the real secrets needs an owner-approved exception to the "never in exports" rule
+  in the Project Contract. Design, mapping, limits, and phases are in
+  [FUTURE-EXPORTER.md](FUTURE-EXPORTER.md).
