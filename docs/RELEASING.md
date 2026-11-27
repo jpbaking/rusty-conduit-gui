@@ -35,7 +35,7 @@ Tags use the format `vX.Y.Z`, for example `v0.2.0`. The tag must point at the co
 The workspace `Cargo.toml` pulls the shared engine, `rusty-conduit-engine`, from its pinned Git tag:
 
 ```toml
-rusty-conduit-engine = { git = "https://github.com/jpbaking/rusty-conduit-engine", tag = "v0.5.0" }
+rusty-conduit-engine = { git = "https://github.com/jpbaking/rusty-conduit-engine", tag = "v0.5.1" }
 ```
 
 No sibling checkout is needed, locally or in CI. Cargo fetches the tag on the first build, and `Cargo.lock` records the exact commit.
