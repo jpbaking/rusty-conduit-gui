@@ -249,12 +249,12 @@
         disabled={!store.proxyDirty || store.savingProxy || !store.proxyDraftValid}
         title={store.proxyDirty && !store.proxyDraftValid
           ? "Fix the highlighted fields first"
-          : running
-            ? "Saves and applies the new routing without dropping connections"
+          : active
+            ? "Saves and restarts the proxy so all changes take effect immediately"
             : undefined}
-        onclick={() => store.saveProxy()}
+        onclick={() => store.saveProxy(active)}
       >
-        {store.savingProxy ? "Saving…" : running ? "Save (Hot-Reload)" : "Save"}
+        {store.savingProxy ? "Saving…" : active ? "Save & Restart" : "Save"}
       </button>
       {#if saved}
         <button onclick={() => store.openLogsFor(saved.profile.id)}>Logs</button>

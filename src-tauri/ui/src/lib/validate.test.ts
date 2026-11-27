@@ -1,7 +1,7 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 
-import type { Proxy, SessionProfile, Tunnel } from "./types.ts";
+import type { MitmConfig, Proxy, SessionProfile, Tunnel } from "./types.ts";
 import {
   FORWARD_TARGET_PREFIX,
   TUNNEL_TARGET_PREFIX,
@@ -20,6 +20,11 @@ import {
   tunnelErrors,
   tunnelTarget,
 } from "./validate.ts";
+
+const STRICT_TLS = { upstream_tls_mode: "strict", insecure_hosts: [] } satisfies Pick<
+  MitmConfig,
+  "upstream_tls_mode" | "insecure_hosts"
+>;
 
 function validProfile(): SessionProfile {
   return {
@@ -402,6 +407,7 @@ describe("sessionErrors", () => {
       cert_ttl: 9,
       cert_cache_max_entries: 0,
       socks_block_web: false,
+      ...STRICT_TLS,
     };
     assert.equal(
       sessionErrors(profile)["mitm.cert_ttl"],
@@ -411,9 +417,29 @@ describe("sessionErrors", () => {
     assert.deepEqual(sessionErrors(profile), {});
   });
 
+  test("checks every MITM insecure host rule", () => {
+    const profile = validProfile();
+    profile.mitm = {
+      ca: "ca-1",
+      cert_ttl: 3600,
+      cert_cache_max_entries: 0,
+      socks_block_web: false,
+      upstream_tls_mode: "allowlist",
+      insecure_hosts: ["localhost", "*.corp.local", "10.0.0.0/8"],
+    };
+    assert.deepEqual(sessionErrors(profile), {});
+    profile.mitm.insecure_hosts = ["localhost", "10.0.0.0/33"];
+    assert.equal(sessionErrors(profile)["mitm.insecure_hosts"], 'CIDR prefix exceeds /32 in "10.0.0.0/33".');
+    // Like the backend, a saved list is checked in every mode.
+    profile.mitm.upstream_tls_mode = "insecure_all";
+    assert.ok(sessionErrors(profile)["mitm.insecure_hosts"]);
+    profile.mitm.insecure_hosts = [];
+    assert.deepEqual(sessionErrors(profile), {});
+  });
+
   test("requires a MITM CA to be chosen", () => {
     const profile = validProfile();
-    profile.mitm = { ca: null, cert_ttl: 3600, cert_cache_max_entries: 0, socks_block_web: false };
+    profile.mitm = { ca: null, cert_ttl: 3600, cert_cache_max_entries: 0, socks_block_web: false, ...STRICT_TLS };
     assert.equal(sessionErrors(profile)["mitm.ca"], "Choose a CA, or upload one.");
     profile.mitm.ca = "ca-1";
     assert.deepEqual(sessionErrors(profile), {});
@@ -592,12 +618,16 @@ describe("tunnelErrors", () => {
     assert.ok(tunnelErrors(badFilter)["filters.forward.block:0"]);
 
     // MITM with missing CA is ignored when forward listener is off, rejected when on.
-    const badMitm = { ca: null, cert_ttl: 3600, cert_cache_max_entries: 0, socks_block_web: false };
+    const badMitm = { ca: null, cert_ttl: 3600, cert_cache_max_entries: 0, socks_block_web: false, ...STRICT_TLS };
     assert.deepEqual(tunnelErrors({ ...t, mitm: badMitm }), {});
     const onNoPorts = { ...t, forward: { ...t.forward, enabled: true, http_port: 0, socks_port: 0 }, mitm: badMitm };
     const errs = tunnelErrors(onNoPorts);
     assert.ok(errs["forward.ports"]);
     assert.ok(errs["mitm.ca"]);
+    const badHosts = { ...badMitm, ca: "c", insecure_hosts: ["bad*.example"] };
+    assert.deepEqual(tunnelErrors({ ...t, mitm: badHosts }), {});
+    const onBadHosts = { ...t, forward: { ...t.forward, enabled: true }, mitm: badHosts };
+    assert.ok(tunnelErrors(onBadHosts)["mitm.insecure_hosts"]);
 
     // Remote port forward with proxy_protocol !== "none" is rejected.
     const badRemote = {
@@ -634,8 +664,18 @@ describe("proxyErrors", () => {
 
   test("checks MITM, network, filter, and logging", () => {
     const p = validProxy();
-    assert.ok(proxyErrors({ ...p, mitm: { ca: null, cert_ttl: 3600, cert_cache_max_entries: 0, socks_block_web: false } }, [TUNNEL_ID])["mitm.ca"]);
-    assert.ok(proxyErrors({ ...p, mitm: { ca: "c", cert_ttl: 1, cert_cache_max_entries: 0, socks_block_web: false } }, [TUNNEL_ID])["mitm.cert_ttl"]);
+    assert.ok(proxyErrors({ ...p, mitm: { ca: null, cert_ttl: 3600, cert_cache_max_entries: 0, socks_block_web: false, ...STRICT_TLS } }, [TUNNEL_ID])["mitm.ca"]);
+    assert.ok(proxyErrors({ ...p, mitm: { ca: "c", cert_ttl: 1, cert_cache_max_entries: 0, socks_block_web: false, ...STRICT_TLS } }, [TUNNEL_ID])["mitm.cert_ttl"]);
+    const allowlist = {
+      ca: "c",
+      cert_ttl: 3600,
+      cert_cache_max_entries: 0,
+      socks_block_web: false,
+      upstream_tls_mode: "allowlist" as const,
+      insecure_hosts: ["*.corp.local", "bad*.example"],
+    };
+    assert.ok(proxyErrors({ ...p, mitm: allowlist }, [TUNNEL_ID])["mitm.insecure_hosts"]);
+    assert.deepEqual(proxyErrors({ ...p, mitm: { ...allowlist, insecure_hosts: ["*.corp.local"] } }, [TUNNEL_ID]), {});
     assert.ok(proxyErrors({ ...p, network: { ...p.network, connect_timeout: 0 } }, [TUNNEL_ID])["network.connect_timeout"]);
     assert.ok(proxyErrors({ ...p, network: { ...p.network, tcp_keepalive_interval: 0 } }, [TUNNEL_ID])["network.tcp_keepalive_interval"]);
     assert.deepEqual(proxyErrors({ ...p, network: { ...p.network, tcp_keepalive: 0, tcp_keepalive_retries: 0 } }, [TUNNEL_ID]), {});

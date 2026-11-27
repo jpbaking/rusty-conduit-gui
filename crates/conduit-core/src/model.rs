@@ -652,6 +652,19 @@ fn default_ssh_bin() -> String {
     "ssh".to_string()
 }
 
+/// How a MITM session verifies upstream HTTPS server certificates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MitmUpstreamTlsMode {
+    /// Verify every upstream certificate with the OS trust store.
+    #[default]
+    Strict,
+    /// Skip verification only for targets matching [`MitmConfig::insecure_hosts`].
+    Allowlist,
+    /// Skip verification for every target ("blind trust", unsafe).
+    InsecureAll,
+}
+
 /// HTTPS MITM inspection configuration. `None` disables MITM.
 ///
 /// The CA lives in the vault ([`VaultCaMeta`]); a session only refers to it. Sessions saved
@@ -667,6 +680,11 @@ pub struct MitmConfig {
     pub cert_cache_max_entries: usize,
     #[serde(default)]
     pub socks_block_web: bool,
+    #[serde(default)]
+    pub upstream_tls_mode: MitmUpstreamTlsMode,
+    /// Domain, `*.domain`, IP, or CIDR rules; used only in [`MitmUpstreamTlsMode::Allowlist`].
+    #[serde(default)]
+    pub insecure_hosts: Vec<String>,
 }
 
 impl Default for MitmConfig {
@@ -676,6 +694,8 @@ impl Default for MitmConfig {
             cert_ttl: default_cert_ttl(),
             cert_cache_max_entries: default_cert_cache_max_entries(),
             socks_block_web: false,
+            upstream_tls_mode: MitmUpstreamTlsMode::Strict,
+            insecure_hosts: Vec::new(),
         }
     }
 }
@@ -1055,6 +1075,26 @@ mod tests {
         assert_eq!((mitm.cert_ttl.as_secs(), mitm.socks_block_web), (3600, true));
         let saved = serde_json::to_string(&mitm).unwrap();
         assert!(!saved.contains("ca_mode") && !saved.contains("passphrase"), "{saved}");
+        assert_eq!(mitm.upstream_tls_mode, MitmUpstreamTlsMode::Strict);
+        assert!(mitm.insecure_hosts.is_empty());
+    }
+
+    #[test]
+    fn mitm_upstream_tls_mode_round_trips_in_snake_case() {
+        for (mode, name) in [
+            (MitmUpstreamTlsMode::Strict, "strict"),
+            (MitmUpstreamTlsMode::Allowlist, "allowlist"),
+            (MitmUpstreamTlsMode::InsecureAll, "insecure_all"),
+        ] {
+            let mitm = MitmConfig {
+                upstream_tls_mode: mode,
+                insecure_hosts: vec!["*.corp.local".into(), "10.0.0.0/8".into()],
+                ..MitmConfig::default()
+            };
+            let json = serde_json::to_string(&mitm).unwrap();
+            assert!(json.contains(&format!("\"upstream_tls_mode\":\"{name}\"")), "{json}");
+            assert_eq!(serde_json::from_str::<MitmConfig>(&json).unwrap(), mitm);
+        }
     }
 
     #[test]

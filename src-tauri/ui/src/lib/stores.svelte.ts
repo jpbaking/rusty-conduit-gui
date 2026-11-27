@@ -1226,7 +1226,7 @@ class AppStore {
    * Saves the selected Proxy. A running Proxy hot-reloads; the outcome is kept in
    * `proxySaveNote` for the `gen #N · hot-reloaded` / `Restart to Apply` header.
    */
-  async saveProxy(): Promise<void> {
+  async saveProxy(restart = false): Promise<void> {
     const id = this.selectedProxyId;
     const proxy = this.proxyDraft;
     if (id === null || !proxy || !this.proxyDirty || this.savingProxy || !this.proxyDraftValid) return;
@@ -1248,6 +1248,10 @@ class AppStore {
       this.proxies = this.proxies.some((p) => p.profile.id === savedId)
         ? this.proxies.map((p) => (p.profile.id === savedId ? viewed : p))
         : [...this.proxies, viewed];
+      if (restart) {
+        await api.restartProxy(savedId);
+        this.proxySaveNote = null;
+      }
       await this.refreshV2();
       await this.#deleteOrphanedSecrets();
     } catch (error) {
@@ -1257,7 +1261,7 @@ class AppStore {
     }
   }
 
-  async saveTunnel(): Promise<void> {
+  async saveTunnel(restart = false): Promise<void> {
     const id = this.selectedTunnelId;
     const tunnel = this.tunnelDraft;
     if (id === null || !tunnel || !this.tunnelDirty || this.savingTunnel || !this.tunnelDraftValid) return;
@@ -1269,6 +1273,9 @@ class AppStore {
       this.tunnelDrafts =
         latest && latest !== tunnel ? { ...rest, [saved.id]: { ...latest, id: saved.id } } : rest;
       if (this.selectedTunnelId === id) this.selectedTunnelId = saved.id;
+      if (restart) {
+        await api.restartTunnel(saved.id);
+      }
       await this.refreshV2();
       await this.#deleteOrphanedSecrets();
     } catch (error) {

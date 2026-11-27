@@ -362,6 +362,15 @@ pub fn validate(profile: &SessionProfile) -> Result<(), ValidateError> {
         if mitm.cert_ttl < MIN_MITM_CERT_TTL {
             return Err(ValidateError::CertTtlTooShort(mitm.cert_ttl));
         }
+        for rule in &mitm.insecure_hosts {
+            if let Err(message) = FilterRule::from_str(rule) {
+                return Err(ValidateError::InvalidFilterRule {
+                    scope: "mitm_insecure_hosts",
+                    rule: rule.clone(),
+                    message,
+                });
+            }
+        }
     }
 
     // SSH target is derived from the last hop.
@@ -641,6 +650,23 @@ mod tests {
         assert!(matches!(validate(&p), Err(ValidateError::MissingMitmCa)));
         p.mitm.as_mut().unwrap().ca = Some(MitmCaId::new());
         assert!(validate(&p).is_ok());
+    }
+
+    #[test]
+    fn mitm_insecure_hosts_must_be_filter_rules() {
+        let mut p = forward_profile();
+        p.mitm = Some(crate::MitmConfig {
+            ca: Some(MitmCaId::new()),
+            upstream_tls_mode: crate::MitmUpstreamTlsMode::Allowlist,
+            insecure_hosts: vec!["localhost".into(), "*.corp.local".into(), "10.0.0.0/8".into()],
+            ..Default::default()
+        });
+        assert!(validate(&p).is_ok());
+        p.mitm.as_mut().unwrap().insecure_hosts.push("bad rule".into());
+        assert!(matches!(
+            validate(&p),
+            Err(ValidateError::InvalidFilterRule { scope: "mitm_insecure_hosts", .. })
+        ));
     }
 
     #[test]

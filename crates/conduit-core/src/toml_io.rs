@@ -26,8 +26,8 @@ use zeroize::Zeroizing;
 
 use crate::airswitch_import::ExtractedSecret;
 use crate::model::{
-    AuthMethod, HopEntry, HostProfile, LoggingConfig, MitmConfig, OpenSshOptions, ReverseConfig,
-    TunnelConfig,
+    AuthMethod, HopEntry, HostProfile, LoggingConfig, MitmConfig, MitmUpstreamTlsMode,
+    OpenSshOptions, ReverseConfig, TunnelConfig,
 };
 use crate::v2_model::{
     GlobalFilterConfig, ListenerConfig, NetworkConfig, Proxy, RouteOneOrMany, RouteTarget,
@@ -170,6 +170,12 @@ struct MitmFile {
     /// name, still read on import.
     #[serde(default, skip_serializing_if = "Option::is_none", alias = "cert_cache_max")]
     cert_cache_max_entries: Option<usize>,
+    /// Upstream hosts (domain, `*.domain`, IP, or CIDR) whose certificates are not verified.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    insecure_hosts: Vec<String>,
+    /// Blind trust: no upstream certificate is verified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    insecure: Option<bool>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -532,7 +538,32 @@ fn mitm_of(file: Option<MitmFile>, warnings: &mut Vec<String>) -> Option<MitmCon
             ca.join(", ")
         ));
     }
+    match upstream_tls_of(&m) {
+        (MitmUpstreamTlsMode::Strict, _) => {}
+        (MitmUpstreamTlsMode::InsecureAll, _) => warnings.push(
+            "[mitm] insecure = true (blind trust) was not applied because MITM is off: choose \
+             \"Blind trust\" under Upstream TLS certificates in the HTTPS MITM tab if you need it"
+                .into(),
+        ),
+        (MitmUpstreamTlsMode::Allowlist, hosts) => warnings.push(format!(
+            "[mitm] insecure_hosts ({}) was not applied because MITM is off: choose \
+             \"Allowlist\" under Upstream TLS certificates in the HTTPS MITM tab and list them",
+            hosts.join(", ")
+        )),
+    }
     None
+}
+
+/// The upstream TLS mode a `[mitm]` table asks for, as the CLIs read it: `insecure = true`
+/// wins, then a non-empty `insecure_hosts`, else strict.
+fn upstream_tls_of(m: &MitmFile) -> (MitmUpstreamTlsMode, Vec<String>) {
+    if m.insecure == Some(true) {
+        (MitmUpstreamTlsMode::InsecureAll, Vec::new())
+    } else if !m.insecure_hosts.is_empty() {
+        (MitmUpstreamTlsMode::Allowlist, m.insecure_hosts.clone())
+    } else {
+        (MitmUpstreamTlsMode::Strict, Vec::new())
+    }
 }
 
 /// Write a `[mitm]` table for an exported Proxy, with the CA left for the user.
@@ -545,6 +576,11 @@ fn mitm_to_file(mitm: &MitmConfig, notes: &mut Vec<String>) -> MitmFile {
     MitmFile {
         cert_ttl: Some(format_duration(mitm.cert_ttl)),
         cert_cache_max_entries: Some(mitm.cert_cache_max_entries),
+        insecure_hosts: match mitm.upstream_tls_mode {
+            MitmUpstreamTlsMode::Allowlist => mitm.insecure_hosts.clone(),
+            _ => Vec::new(),
+        },
+        insecure: (mitm.upstream_tls_mode == MitmUpstreamTlsMode::InsecureAll).then_some(true),
         ..MitmFile::default()
     }
 }
@@ -1658,6 +1694,81 @@ inherit = true
         assert!(!out.toml.contains("\nca_cert"));
         assert!(out.notes.iter().any(|n| n.contains("MITM")));
         assert!(out.toml.contains("# Setup notes:"));
+    }
+
+    #[test]
+    fn toml_io_mitm_upstream_tls_round_trips_for_every_cli() {
+        let (tunnel, ssh_proxy) = ssh_pair();
+        let hosts = vec!["localhost".to_string(), "*.corp.local".into(), "10.0.0.0/8".into()];
+        for format in [
+            CliTomlFormat::RustyConduit,
+            CliTomlFormat::RustyConduitSsh,
+            CliTomlFormat::RustyConduitSwitch,
+        ] {
+            for mode in [
+                MitmUpstreamTlsMode::Strict,
+                MitmUpstreamTlsMode::Allowlist,
+                MitmUpstreamTlsMode::InsecureAll,
+            ] {
+                let mut proxy =
+                    if format == CliTomlFormat::RustyConduit { direct_proxy() } else { ssh_proxy.clone() };
+                proxy.mitm = Some(MitmConfig {
+                    ca: Some(MitmCaId::new()),
+                    upstream_tls_mode: mode,
+                    insecure_hosts: hosts.clone(),
+                    ..MitmConfig::default()
+                });
+                let out = export_cli_toml(format, &proxy, std::slice::from_ref(&tunnel)).unwrap();
+                let toml = &out.toml;
+                assert_eq!(toml.contains("insecure = true"), mode == MitmUpstreamTlsMode::InsecureAll, "{toml}");
+                assert_eq!(
+                    toml.contains("insecure_hosts = [\"localhost\", \"*.corp.local\", \"10.0.0.0/8\"]"),
+                    mode == MitmUpstreamTlsMode::Allowlist,
+                    "{toml}"
+                );
+
+                // The `[mitm]` table reads back as the same mode, as each CLI reads it.
+                let table: toml::Table = toml.parse().unwrap();
+                let file: MitmFile = table["mitm"].clone().try_into().unwrap();
+                let expected_hosts =
+                    if mode == MitmUpstreamTlsMode::Allowlist { hosts.clone() } else { Vec::new() };
+                assert_eq!(upstream_tls_of(&file), (mode, expected_hosts));
+
+                // Import keeps MITM off (the CA is in the Vault) and says what was not applied.
+                let back = import_cli_toml(toml, format, "x").unwrap();
+                let warnings = match back {
+                    CliTomlImport::RustyConduit(i) => (i.proxy.mitm, i.warnings),
+                    CliTomlImport::RustyConduitSsh(i) => (i.proxy.and_then(|p| p.mitm), i.warnings),
+                    CliTomlImport::RustyConduitSwitch(i) => (i.proxy.mitm, i.warnings),
+                };
+                assert!(warnings.0.is_none());
+                let notice = warnings.1.iter().any(|w| w.contains("Upstream TLS certificates"));
+                assert_eq!(notice, mode != MitmUpstreamTlsMode::Strict, "{:?}", warnings.1);
+            }
+        }
+    }
+
+    #[test]
+    fn toml_io_mitm_insecure_wins_over_insecure_hosts_on_import() {
+        let file: MitmFile =
+            toml::from_str("insecure = true\ninsecure_hosts = [\"a.example\"]\n").unwrap();
+        assert_eq!(upstream_tls_of(&file), (MitmUpstreamTlsMode::InsecureAll, Vec::new()));
+        let file: MitmFile = toml::from_str("insecure = false\ninsecure_hosts = [\"a.example\"]\n").unwrap();
+        assert_eq!(upstream_tls_of(&file), (MitmUpstreamTlsMode::Allowlist, vec!["a.example".into()]));
+        let file: MitmFile = toml::from_str("insecure = false\n").unwrap();
+        assert_eq!(upstream_tls_of(&file), (MitmUpstreamTlsMode::Strict, Vec::new()));
+        // Every CLI's `[mitm]` accepts both keys.
+        let keys = "insecure = true\ninsecure_hosts = [\"a.example\"]\n";
+        let conduit = CONDUIT_TOML.replacen("[mitm]\n", &format!("[mitm]\n{keys}"), 1);
+        assert_ne!(conduit, CONDUIT_TOML);
+        for (cli_toml, format) in [
+            (conduit, CliTomlFormat::RustyConduit),
+            (format!("{SSH_TOML}\n[mitm]\n{keys}"), CliTomlFormat::RustyConduitSsh),
+            (format!("{SWITCH_TOML}\n[mitm]\n{keys}"), CliTomlFormat::RustyConduitSwitch),
+        ] {
+            assert_eq!(detect_cli_toml_format(&cli_toml), format);
+            import_cli_toml(&cli_toml, format, "x").unwrap();
+        }
     }
 
     #[test]

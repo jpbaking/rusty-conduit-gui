@@ -1197,7 +1197,19 @@
   .matcher-grid {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(14rem, 1fr));
-    gap: 0.5rem;
+    gap: 0.75rem 0.6rem;
+    align-items: stretch;
+  }
+  .matcher-grid .field {
+    justify-content: space-between;
+  }
+  .matcher-grid .field > input,
+  .matcher-grid .field > textarea,
+  .matcher-grid .field > select {
+    margin-top: auto;
+  }
+  .matcher-grid .field-row {
+    align-items: end;
   }
   .rule-drawer {
     border-left: 3px solid var(--accent);

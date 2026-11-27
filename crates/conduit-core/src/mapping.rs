@@ -14,12 +14,12 @@ use std::str::FromStr;
 
 use rusty_conduit_engine::filter::{FilterRule, HostFilter};
 use rusty_conduit_engine::logging::{LogFormat, LogLevel};
-use rusty_conduit_engine::mitm::MitmOptions;
+use rusty_conduit_engine::mitm::{MitmOptions, UpstreamTlsVerification};
 use rusty_conduit_engine::net::KeepaliveSettings;
 use rusty_conduit_engine::server::ServerOptions;
 use thiserror::Error;
 
-use crate::{SessionProfile, SshIpVersion};
+use crate::{MitmConfig, MitmUpstreamTlsMode, SessionProfile, SshIpVersion};
 
 /// Errors raised while mapping a [`SessionProfile`] into an [`EngineConfig`].
 #[derive(Debug, Error)]
@@ -100,6 +100,41 @@ pub(crate) fn parse_rules(scope: &'static str, rules: &[String]) -> Result<Vec<F
         .collect()
 }
 
+/// Map a [`MitmConfig`]'s upstream TLS mode into the engine's [`UpstreamTlsVerification`].
+/// An `Allowlist` with no rules verifies strictly.
+pub fn mitm_upstream_tls(mitm: &MitmConfig) -> Result<UpstreamTlsVerification, MappingError> {
+    Ok(match mitm.upstream_tls_mode {
+        MitmUpstreamTlsMode::Strict => UpstreamTlsVerification::Strict,
+        MitmUpstreamTlsMode::Allowlist if mitm.insecure_hosts.is_empty() => {
+            UpstreamTlsVerification::Strict
+        }
+        MitmUpstreamTlsMode::Allowlist => UpstreamTlsVerification::AllowInsecureHosts(
+            parse_rules("mitm_insecure_hosts", &mitm.insecure_hosts)?,
+        ),
+        MitmUpstreamTlsMode::InsecureAll => UpstreamTlsVerification::InsecureAll,
+    })
+}
+
+/// The startup warning for upstream TLS verification that skips certificate checks, in the
+/// CLIs' `WARN:` wording (`None` when every upstream certificate is verified).
+pub fn mitm_tls_warning(upstream_tls: &UpstreamTlsVerification) -> Option<String> {
+    match upstream_tls {
+        UpstreamTlsVerification::Strict => None,
+        UpstreamTlsVerification::AllowInsecureHosts(rules) if rules.is_empty() => None,
+        UpstreamTlsVerification::AllowInsecureHosts(rules) => Some(format!(
+            "WARN: MITM upstream TLS certificate verification is skipped for {} insecure host \
+             rule(s): {}",
+            rules.len(),
+            rules.iter().map(ToString::to_string).collect::<Vec<_>>().join(",")
+        )),
+        UpstreamTlsVerification::InsecureAll => Some(
+            "WARN: MITM blind-trust mode is enabled: upstream HTTPS certificates will NOT be \
+             verified for any destination"
+                .to_string(),
+        ),
+    }
+}
+
 /// Build a destination filter: allowlist, blocklist, or blocklist with allowlist exceptions.
 pub(crate) fn host_filter(allow: Vec<FilterRule>, block: Vec<FilterRule>) -> Option<HostFilter> {
     HostFilter::from_lists(allow, block)
@@ -155,6 +190,10 @@ pub fn to_engine_config(profile: &SessionProfile) -> Result<EngineConfig, Mappin
             .mitm
             .as_ref()
             .map_or(defaults.cert_cache_max, |m| m.cert_cache_max_entries),
+        upstream_tls: match &profile.mitm {
+            Some(m) => mitm_upstream_tls(m)?,
+            None => UpstreamTlsVerification::Strict,
+        },
     };
 
     Ok(EngineConfig {
@@ -293,6 +332,7 @@ mod tests {
             cert_ttl: Duration::from_secs(600),
             cert_cache_max_entries: 50,
             socks_block_web: true,
+            ..crate::MitmConfig::default()
         });
         let cfg = to_engine_config(&p).unwrap();
         assert!(cfg.mitm_enabled);
@@ -303,6 +343,45 @@ mod tests {
         assert!(cfg.mitm_options.passphrase_file.is_none());
         assert_eq!(cfg.mitm_options.cert_ttl, Duration::from_secs(600));
         assert_eq!(cfg.mitm_options.cert_cache_max, 50);
+    }
+
+    #[test]
+    fn mitm_maps_each_upstream_tls_mode() {
+        let mut p = profile();
+        let base = crate::MitmConfig {
+            ca: Some(MitmCaId::new()),
+            insecure_hosts: vec!["*.corp.local".into(), "10.0.0.0/8".into()],
+            ..crate::MitmConfig::default()
+        };
+        p.mitm = Some(base.clone());
+        let cfg = to_engine_config(&p).unwrap();
+        assert_eq!(cfg.mitm_options.upstream_tls, UpstreamTlsVerification::Strict);
+
+        p.mitm = Some(crate::MitmConfig { upstream_tls_mode: MitmUpstreamTlsMode::Allowlist, ..base.clone() });
+        let cfg = to_engine_config(&p).unwrap();
+        assert!(matches!(
+            &cfg.mitm_options.upstream_tls,
+            UpstreamTlsVerification::AllowInsecureHosts(rules) if rules.len() == 2
+        ));
+
+        p.mitm = Some(crate::MitmConfig { upstream_tls_mode: MitmUpstreamTlsMode::InsecureAll, ..base.clone() });
+        let cfg = to_engine_config(&p).unwrap();
+        assert_eq!(cfg.mitm_options.upstream_tls, UpstreamTlsVerification::InsecureAll);
+        assert!(mitm_tls_warning(&cfg.mitm_options.upstream_tls).unwrap().contains("blind-trust"));
+        assert!(mitm_tls_warning(&UpstreamTlsVerification::Strict).is_none());
+        let rules = vec![FilterRule::from_str("10.0.0.0/8").unwrap()];
+        let warning = mitm_tls_warning(&UpstreamTlsVerification::AllowInsecureHosts(rules)).unwrap();
+        assert!(warning.contains("1 insecure host rule(s): 10.0.0.0/8"), "{warning}");
+
+        p.mitm = Some(crate::MitmConfig {
+            upstream_tls_mode: MitmUpstreamTlsMode::Allowlist,
+            insecure_hosts: vec!["bad rule with spaces".into()],
+            ..base
+        });
+        assert!(matches!(
+            to_engine_config(&p),
+            Err(MappingError::InvalidFilterRule { scope: "mitm_insecure_hosts", .. })
+        ));
     }
 
     #[test]

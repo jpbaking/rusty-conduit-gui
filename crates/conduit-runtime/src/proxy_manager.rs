@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use conduit_core::{
-    proxy_mitm_options, proxy_referenced_targets, proxy_referenced_tunnels, proxy_server_options,
+    mitm_tls_warning, proxy_mitm_options, proxy_referenced_targets, proxy_referenced_tunnels, proxy_server_options,
     proxy_to_routing_input, proxy_vault_secret_refs, validate_proxy_with_tunnels, Proxy, ProxyId,
     RouteInbound, SourceMode, TargetRef, Tunnel, TunnelId, UpstreamKind, UpstreamPasswordSource,
 };
@@ -879,7 +879,9 @@ impl ProxyManager {
 
         let secrets = self.read_secrets(proxy, true)?;
         let state = self.compile_routing(proxy, &secrets.passwords, &extra)?;
-        let mitm = match (proxy_mitm_options(proxy), secrets.ca_pem.as_deref()) {
+        let mitm_options = proxy_mitm_options(proxy).map_err(invalid)?;
+        let tls_warning = mitm_options.as_ref().and_then(|o| mitm_tls_warning(&o.upstream_tls));
+        let mitm = match (mitm_options, secrets.ca_pem.as_deref()) {
             (Some(opts), Some(pem)) => Some(
                 MitmState::from_pem_bytes(pem, pem, &opts)
                     .map_err(|e| ProxyError::Mitm(e.to_string()))?,
@@ -892,6 +894,9 @@ impl ProxyManager {
         let logger = Logger::with_writer(level, Box::new(slot.logs.writer()));
         if let Some(m) = &mitm {
             m.cache.set_logger(logger.clone());
+            if let Some(warning) = tls_warning {
+                logger.error(warning);
+            }
         }
         for notice in state.router.notices() {
             logger.info(notice.clone());

@@ -14,6 +14,7 @@ Owns everything under `crates/conduit-core/`. Inherits all root DOX rules and ad
 - Validation mirrors the `rusty-conduit` CLI family's `FATAL` config rules; keep it aligned with the engine version pinned in the workspace `Cargo.toml`.
 - `known_hosts_import.rs` only parses text it is handed; it never opens `~/.ssh/known_hosts`.
 - `toml_io.rs` mirrors each CLI's `FileConfig` shape and rejects unknown keys, as the CLIs do.
+- MITM upstream TLS verification (`MitmUpstreamTlsMode`: `strict` / `allowlist` / `insecure_all`) maps to the engine's `UpstreamTlsVerification` in `mapping.rs::mitm_upstream_tls`; an empty allowlist verifies strictly. `insecure_hosts` entries must parse as `FilterRule`s whenever MITM is active. `[mitm] insecure` / `insecure_hosts` are written on export; on import MITM stays off (its CA is in the Vault), so they are only reported as warnings.
 - Every write in `storage.rs` is atomic (temp file, `sync_all`, rename).
 
 ## Verification

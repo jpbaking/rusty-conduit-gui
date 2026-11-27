@@ -19,8 +19,6 @@ const ROLE_HTTP: &str = "HTTP/HTTPS";
 const ROLE_SOCKS: &str = "SOCKS4/4a/5";
 const ROLE_MULTIPLEXED: &str = "multiplexed HTTP/HTTPS + SOCKS4/4a/5";
 
-/// Longest failure reason shown in a menu label, in characters.
-const MAX_REASON_CHARS: usize = 48;
 
 /// Something the user picked from the tray menu.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -438,47 +436,19 @@ fn listener_addr(listeners: &[ListenerInfo], role: &str) -> Option<SocketAddr> {
     by_role(role).or_else(|| by_role(ROLE_MULTIPLEXED))
 }
 
-// One line, bounded, so a long engine error cannot break the menu layout.
-fn short_reason(reason: &str) -> String {
-    let flat = reason.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.chars().count() <= MAX_REASON_CHARS {
-        return flat;
-    }
-    let kept: String = flat.chars().take(MAX_REASON_CHARS - 1).collect();
-    format!("{}…", kept.trim_end())
-}
-
-fn port_labels(http: Option<SocketAddr>, socks: Option<SocketAddr>) -> Vec<String> {
-    [("HTTP", http), ("SOCKS", socks)]
-        .into_iter()
-        .filter_map(|(name, addr)| addr.map(|a| format!("{name} :{}", a.port())))
-        .collect()
-}
-
-fn status_text(
-    state: &SessionState,
-    http: Option<SocketAddr>,
-    socks: Option<SocketAddr>,
-) -> String {
+fn status_text(state: &SessionState) -> String {
     match state {
-        SessionState::Stopped => "Stopped → Start".into(),
+        SessionState::Stopped => "Stopped".into(),
         SessionState::Starting => "Starting…".into(),
-        SessionState::Connected => {
-            let ports = port_labels(http, socks);
-            if ports.is_empty() {
-                "Connected".into()
-            } else {
-                format!("Connected ({})", ports.join(" · "))
-            }
-        }
+        SessionState::Connected => "Connected".into(),
         SessionState::Reconnecting {
             next_retry_secs, ..
         } => format!("Reconnecting ({next_retry_secs}s)…"),
         SessionState::WaitingForNetwork => "Waiting for network…".into(),
         SessionState::Locked => "Vault locked".into(),
-        SessionState::AwaitingHostKey(_) => "Host key needs review → Open Manage Window".into(),
-        SessionState::NeedsAttention { reason } | SessionState::Failed { reason } => {
-            format!("{} → Open Manage Window", short_reason(reason))
+        SessionState::AwaitingHostKey(_) => "Host key review".into(),
+        SessionState::NeedsAttention { .. } | SessionState::Failed { .. } => {
+            "Needs attention".into()
         }
     }
 }
@@ -547,18 +517,10 @@ fn session_entry(snapshot: &SessionSnapshot, vault_locked: bool) -> TraySessionE
         id,
         name: snapshot.name.clone(),
         marker: Health::of_session(state).marker(),
-        status: status_text(state, http, socks),
+        status: status_text(state),
         http_url,
         socks_url,
         items,
-    }
-}
-
-/// `Auto Switch` or `Override: <profile>`.
-fn mode_text(override_profile: Option<&str>) -> String {
-    match override_profile {
-        None => "Auto Switch".into(),
-        Some(profile) => format!("Override: {profile}"),
     }
 }
 
@@ -624,20 +586,12 @@ fn proxy_entry(proxy: &ProxyTrayItem, vault_locked: bool) -> TrayProxyEntry {
     let socks_url = socks.map(socks_proxy_url);
 
     let status = match &proxy.state {
-        ProxyState::Stopped => "Stopped → Start".into(),
+        ProxyState::Stopped => "Stopped".into(),
         ProxyState::Starting => "Starting…".into(),
-        ProxyState::Running {
-            override_profile, ..
-        } => {
-            let mut parts = vec![mode_text(override_profile.as_deref())];
-            parts.extend(port_labels(http, socks));
-            parts.join(" · ")
-        }
+        ProxyState::Running { .. } => "Running".into(),
         ProxyState::Reloading => "Reloading…".into(),
         ProxyState::Locked => "Vault locked".into(),
-        ProxyState::NeedsAttention { reason } => {
-            format!("{} → Open Manage Window", short_reason(reason))
-        }
+        ProxyState::NeedsAttention { .. } => "Needs attention".into(),
         ProxyState::Stopping => "Stopping…".into(),
     };
 
@@ -681,10 +635,7 @@ fn proxy_entry(proxy: &ProxyTrayItem, vault_locked: bool) -> TrayProxyEntry {
 fn tunnel_entry(tunnel: &TunnelTrayItem, vault_locked: bool) -> TrayTunnelEntry {
     let id = tunnel.id;
     let state = &tunnel.state;
-    let mut status = status_text(state, None, None);
-    if tunnel.linked && !tunnel.linked_to.is_empty() && !state.is_terminal() {
-        status = format!("{status} (linked to {})", tunnel.linked_to.join(", "));
-    }
+    let status = status_text(state);
 
     let mut items = Vec::new();
     if *state == SessionState::Locked && vault_locked {
@@ -756,10 +707,7 @@ mod tests {
 
         assert_eq!(model.summary, "1 connected · 0 needs attention");
         assert_eq!(model.icon, TrayIconState::Connected);
-        assert_eq!(
-            entry.label(),
-            "● Prod Bastion — Connected (HTTP :3128 · SOCKS :1080)"
-        );
+        assert_eq!(entry.label(), "● Prod Bastion — Connected");
         assert_eq!(
             labels(&entry.items),
             [
@@ -881,11 +829,8 @@ mod tests {
         assert_eq!(model.summary, "2 connected · 1 needs attention");
         assert_eq!(model.icon, TrayIconState::Attention);
         assert_eq!(model.sessions[2].status, "Reconnecting (8s)…");
-        assert_eq!(
-            model.sessions[3].status,
-            "Auth rejected → Open Manage Window"
-        );
-        assert_eq!(model.sessions[4].status, "Stopped → Start");
+        assert_eq!(model.sessions[3].status, "Needs attention");
+        assert_eq!(model.sessions[4].status, "Stopped");
     }
 
     #[test]
@@ -936,14 +881,6 @@ mod tests {
         disabled.enabled = false;
         let only_disabled = TrayMenuModel::from_snapshots(&[disabled], false);
         assert!(!only_disabled.global_items[0].enabled, "Start All would start nothing");
-    }
-
-    #[test]
-    fn model_long_reason_is_one_bounded_line() {
-        let text = short_reason(&format!("first\nsecond {}", "x".repeat(200)));
-        assert!(!text.contains('\n'));
-        assert_eq!(text.chars().count(), MAX_REASON_CHARS);
-        assert!(text.ends_with('…'));
     }
 
     fn proxy(name: &str, state: ProxyState, listeners: &[(&str, &str)]) -> ProxyTrayItem {
@@ -1019,10 +956,7 @@ mod tests {
 
         assert_eq!(model.summary, "1 proxy running · 0 tunnels need attention");
         assert_eq!(model.icon, TrayIconState::Connected);
-        assert_eq!(
-            entry.label(),
-            "● Work — Auto Switch · HTTP :3128 · SOCKS :1080"
-        );
+        assert_eq!(entry.label(), "● Work — Running");
         assert_eq!(
             entry_labels(&entry.entries),
             [
@@ -1094,7 +1028,7 @@ mod tests {
                 .map(|(i, _)| i)
                 .collect();
             assert_eq!(marked, [checked], "{labels:?}");
-            assert!(model.proxies[0].status.starts_with(&format!("Override: {forced}")));
+            assert_eq!(model.proxies[0].status, "Running");
         }
     }
 
@@ -1107,7 +1041,7 @@ mod tests {
             ..TrayState::default()
         });
         let entry = &model.proxies[0];
-        assert_eq!(entry.label(), "○ Lab — Stopped → Start");
+        assert_eq!(entry.label(), "○ Lab — Stopped");
         assert_eq!(entry_labels(&entry.entries), ["Start", "View Logs"]);
         assert_eq!(item(&entry.entries[0]).action, TrayAction::StartProxy(id));
         assert_eq!(entry.http_url, None);
@@ -1139,11 +1073,8 @@ mod tests {
             "1 proxy running · 1 tunnel needs attention"
         );
         assert_eq!(model.icon, TrayIconState::Attention);
-        assert_eq!(model.tunnels[0].label(), "● Bastion — Connected (linked to Work)");
-        assert_eq!(
-            model.tunnels[1].label(),
-            "! Client VPN — Auth rejected → Open Manage Window"
-        );
+        assert_eq!(model.tunnels[0].label(), "● Bastion — Connected");
+        assert_eq!(model.tunnels[1].label(), "! Client VPN — Needs attention");
         assert_eq!(
             labels(&model.tunnels[1].items),
             ["Start", "View Logs", "Open Manage Window…"]
@@ -1153,7 +1084,7 @@ mod tests {
             model.tunnels[1].items[1].action,
             TrayAction::ViewTunnelLogs(broken_id)
         );
-        assert!(model.proxies[0].status.starts_with("Auto Switch"));
+        assert_eq!(model.proxies[0].status, "Running");
     }
 
     #[test]

@@ -921,6 +921,12 @@ async fn start_proxies(
     access: &AccessLogger,
     logger: &Logger,
 ) -> Result<(Option<ReverseProxy>, Option<MitmState>), String> {
+    // Reverse and forward MITM share these options: warn once when either may use them.
+    if cfg.mitm_enabled && mitm_ca_pem.is_some() && (cfg.forward_enabled || cfg.reverse_enabled) {
+        if let Some(warning) = conduit_core::mitm_tls_warning(&cfg.mitm_options.upstream_tls) {
+            logger.error(warning);
+        }
+    }
     let reverse = ReverseProxy::start(cfg, mitm_ca_pem, access, logger).await?;
     if !cfg.forward_enabled {
         return Ok((reverse, None));

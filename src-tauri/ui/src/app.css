@@ -67,7 +67,7 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 button.danger { color: var(--alert); border-color: var(--alert); }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
-.shell { display: grid; grid-template-columns: 236px minmax(0, 1fr); height: 100%; }
+.shell { display: grid; grid-template-columns: clamp(236px, 21vw, 380px) minmax(0, 1fr); height: 100%; }
 .workspace { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
 
 .sidebar { display: flex; flex-direction: column; gap: 10px; min-height: 0; padding: 12px 10px; background: var(--surface); border-right: 1px solid var(--border); }
@@ -247,7 +247,7 @@ button.link-button { min-height: 0; padding: 0; color: var(--accent); background
 .forward-arrow { align-self: center; padding-top: 14px; color: var(--muted); }
 .forward-summary { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 12px; margin: 0; color: var(--muted); font-size: 12px; }
 .forward-flag { display: inline-flex; align-items: center; gap: 4px; }
-.session-editor { display: flex; flex-direction: column; gap: 12px; max-width: 980px; }
+.session-editor { display: flex; flex-direction: column; gap: 12px; width: 100%; }
 .session-editor section small { font-weight: 400; }
 .tab-list { display: flex; gap: 2px; border-bottom: 1px solid var(--border); }
 .tab { display: inline-flex; align-items: center; gap: 5px; padding: 6px 14px; color: var(--muted); background: transparent; border: 0; border-bottom: 2px solid transparent; border-radius: 4px 4px 0 0; }

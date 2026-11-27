@@ -319,10 +319,14 @@
     {/if}
     <button
       disabled={!store.tunnelDirty || store.savingTunnel || !store.tunnelDraftValid}
-      title={store.tunnelDirty && !store.tunnelDraftValid ? "Fix the highlighted fields first" : undefined}
-      onclick={() => store.saveTunnel()}
+      title={store.tunnelDirty && !store.tunnelDraftValid
+        ? "Fix the highlighted fields first"
+        : active
+          ? "Saves and restarts the tunnel so all changes take effect immediately"
+          : undefined}
+      onclick={() => store.saveTunnel(active)}
     >
-      {store.savingTunnel ? "Saving…" : "Save"}
+      {store.savingTunnel ? "Saving…" : active ? "Save & Restart" : "Save"}
     </button>
     {#if saved}
       <button onclick={() => store.openLogsFor(saved.profile.id)}>Logs</button>

@@ -694,8 +694,8 @@ mod tests {
         let model = current_model(&controller);
         let names: Vec<&str> = model.proxies.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["lab", "work"], "sorted by name");
-        assert_eq!(model.proxies[0].label(), "○ lab — Stopped → Start");
-        assert_eq!(model.tunnels[0].label(), "○ bastion — Stopped → Start");
+        assert_eq!(model.proxies[0].label(), "○ lab — Stopped");
+        assert_eq!(model.tunnels[0].label(), "○ bastion — Stopped");
         assert_eq!(model.summary, "0 proxies running · 0 tunnels need attention");
         assert!(model.global_items[0].enabled, "Start All has something to start");
     }
@@ -710,20 +710,23 @@ mod tests {
 
         handle_action(&controller, &shell, &quit, TrayAction::StartProxy(id)).await;
         let model = current_model(&controller);
-        assert!(model.proxies[0].status.starts_with("Auto Switch"), "{}", model.proxies[0].status);
+        assert_eq!(model.proxies[0].status, "Running");
         assert!(model.proxies[0].http_url.is_some());
 
         let force_direct = TrayAction::SetProxyOverride { id, profile: Some("direct".into()) };
         handle_action(&controller, &shell, &quit, force_direct).await;
-        assert!(current_model(&controller).proxies[0].status.starts_with("Override: direct"));
+        assert_eq!(
+            controller.list_proxies().unwrap()[0].snapshot.override_profile.as_deref(),
+            Some("direct")
+        );
 
         let auto = TrayAction::SetProxyOverride { id, profile: None };
         handle_action(&controller, &shell, &quit, auto).await;
-        assert!(current_model(&controller).proxies[0].status.starts_with("Auto Switch"));
+        assert_eq!(controller.list_proxies().unwrap()[0].snapshot.override_profile, None);
 
         handle_action(&controller, &shell, &quit, TrayAction::RestartProxy(id)).await;
         handle_action(&controller, &shell, &quit, TrayAction::StopProxy(id)).await;
-        assert_eq!(current_model(&controller).proxies[0].status, "Stopped → Start");
+        assert_eq!(current_model(&controller).proxies[0].status, "Stopped");
 
         // Unknown ids are reported, and must not panic.
         for action in [
@@ -753,7 +756,7 @@ mod tests {
 
         handle_action(&controller, &shell, &quit, TrayAction::StopAll).await;
         let model = current_model(&controller);
-        assert_eq!(model.proxies[0].status, "Stopped → Start");
+        assert_eq!(model.proxies[0].status, "Stopped");
         assert!(!model.quit_needs_confirmation);
     }
 
@@ -779,14 +782,14 @@ mod tests {
         for _ in 0..200 {
             let running = backend
                 .last_model()
-                .is_some_and(|m| m.proxies[0].status.starts_with("Auto Switch"));
+                .is_some_and(|m| m.proxies[0].status == "Running");
             if running {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         let model = backend.last_model().unwrap();
-        assert!(model.proxies[0].status.starts_with("Auto Switch"), "{}", model.proxies[0].status);
+        assert_eq!(model.proxies[0].status, "Running");
         bridge.abort();
         controller.stop_all_v2().await;
     }

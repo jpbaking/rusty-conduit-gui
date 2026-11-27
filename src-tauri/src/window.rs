@@ -244,12 +244,9 @@ fn set_dock_visible<R: Runtime>(app: &AppHandle<R>, visible: bool) {
 #[cfg(not(target_os = "macos"))]
 fn set_dock_visible<R: Runtime>(_app: &AppHandle<R>, _visible: bool) {}
 
-/// Logical width and starting height of the Manage Window. The width is fixed, because the UI
-/// is laid out for it; the height can only grow from here, for more log and editor space.
+/// Starting and minimum logical size of the Manage Window. The window can resize freely,
+/// maximize, and enter fullscreen in both dimensions so the sidebar and wide forms can expand.
 const MANAGE_WINDOW_SIZE: (f64, f64) = (1100.0, 720.0);
-/// Height cap for the Manage Window, well above any screen: the OS limits the window to the
-/// screen, so maximize or zoom fills the screen's height and keeps the width.
-const MANAGE_WINDOW_MAX_HEIGHT: f64 = 16_384.0;
 
 /// Focuses the Manage Window, creating it if needed. Do not call from a synchronous command,
 /// where creating a window can deadlock on Windows.
@@ -266,11 +263,8 @@ pub fn open_or_focus_manage_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Res
     set_dock_visible(app, true);
     let built = WebviewWindowBuilder::new(app, MAIN_WINDOW, WebviewUrl::App("index.html".into()))
         .title(conduit_tray::APP_TITLE)
-        // Fixed width, so the layout stays predictable; the height can grow (drag the top or
-        // bottom edge, or maximize/zoom) when the logs need more room.
         .inner_size(MANAGE_WINDOW_SIZE.0, MANAGE_WINDOW_SIZE.1)
         .min_inner_size(MANAGE_WINDOW_SIZE.0, MANAGE_WINDOW_SIZE.1)
-        .max_inner_size(MANAGE_WINDOW_SIZE.0, MANAGE_WINDOW_MAX_HEIGHT)
         .resizable(true)
         .maximizable(true)
         .build();

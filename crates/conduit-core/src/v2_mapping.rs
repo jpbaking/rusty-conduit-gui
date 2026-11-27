@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 
 use rusty_conduit_engine::logging::{LogFormat, LogLevel};
-use rusty_conduit_engine::mitm::MitmOptions;
+use rusty_conduit_engine::mitm::{MitmOptions, UpstreamTlsVerification};
 use rusty_conduit_engine::net::KeepaliveSettings;
 use rusty_conduit_engine::routing::{
     HostLevels, Inbound, OneOrMany, PortSpec, ProfileConfig, ProfileType, RoutingConfig,
@@ -24,7 +24,7 @@ use rusty_conduit_engine::filter::HostFilter;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::mapping::{host_filter, parse_rules};
+use crate::mapping::{host_filter, mitm_upstream_tls, parse_rules};
 use crate::model::SecretRef;
 use crate::v2_model::{
     GlobalFilterConfig, Proxy, RouteHostLevels, RouteInbound, RouteOneOrMany, RoutePortSpec,
@@ -87,6 +87,10 @@ pub fn tunnel_to_engine_config(tunnel: &Tunnel) -> Result<EngineConfig, MappingE
         } else {
             defaults.cert_cache_max
         },
+        upstream_tls: match &tunnel.mitm {
+            Some(m) if mitm_enabled => mitm_upstream_tls(m)?,
+            _ => UpstreamTlsVerification::Strict,
+        },
     };
     let socks_block_web_in_mitm = tunnel.socks_block_web
         || (mitm_enabled && tunnel.mitm.as_ref().is_some_and(|m| m.socks_block_web));
@@ -143,16 +147,24 @@ pub fn proxy_server_options(proxy: &Proxy) -> ServerOptions {
     }
 }
 
-/// Map a Proxy's MITM settings into [`MitmOptions`] (`None` when MITM is off). `ca` is always
-/// `None`: the runtime loads the CA in memory from the vault.
-pub fn proxy_mitm_options(proxy: &Proxy) -> Option<MitmOptions> {
-    proxy.mitm.as_ref().map(|m| MitmOptions {
-        ca: None,
-        passphrase: None,
-        passphrase_file: None,
-        cert_ttl: m.cert_ttl,
-        cert_cache_max: m.cert_cache_max_entries,
-    })
+/// Map a Proxy's MITM settings into [`MitmOptions`] (`Ok(None)` when MITM is off). `ca` is
+/// always `None`: the runtime loads the CA in memory from the vault. Fails on a malformed
+/// `insecure_hosts` rule in `Allowlist` mode.
+pub fn proxy_mitm_options(proxy: &Proxy) -> Result<Option<MitmOptions>, MappingError> {
+    proxy
+        .mitm
+        .as_ref()
+        .map(|m| {
+            Ok(MitmOptions {
+                ca: None,
+                passphrase: None,
+                passphrase_file: None,
+                cert_ttl: m.cert_ttl,
+                cert_cache_max: m.cert_cache_max_entries,
+                upstream_tls: mitm_upstream_tls(m)?,
+            })
+        })
+        .transpose()
 }
 
 fn push_target_refs(target: &RouteOneOrMany<String>, out: &mut Vec<TargetRef>) {
@@ -440,7 +452,7 @@ pub fn proxy_to_routing_input(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{HopEntry, HostProfile, MitmConfig, ReverseConfig};
+    use crate::model::{HopEntry, HostProfile, MitmConfig, MitmUpstreamTlsMode, ReverseConfig};
     use rusty_conduit_engine::filter::FilterRule;
     use std::net::{IpAddr, Ipv4Addr};
     use std::path::PathBuf;
@@ -523,16 +535,78 @@ mod tests {
         proxy.network.tcp_keepalive = Duration::ZERO;
         assert!(proxy_server_options(&proxy).keepalive.is_none());
 
-        assert!(proxy_mitm_options(&proxy).is_none());
+        assert!(proxy_mitm_options(&proxy).unwrap().is_none());
         proxy.mitm = Some(MitmConfig {
             cert_ttl: Duration::from_secs(3600),
             cert_cache_max_entries: 7,
             ..MitmConfig::default()
         });
-        let mitm = proxy_mitm_options(&proxy).unwrap();
+        let mitm = proxy_mitm_options(&proxy).unwrap().unwrap();
         assert!(mitm.ca.is_none());
         assert_eq!(mitm.cert_ttl, Duration::from_secs(3600));
         assert_eq!(mitm.cert_cache_max, 7);
+        assert_eq!(mitm.upstream_tls, UpstreamTlsVerification::Strict);
+    }
+
+    #[test]
+    fn proxy_mitm_options_map_each_upstream_tls_mode() {
+        let mut proxy = Proxy::default();
+        let base = MitmConfig {
+            insecure_hosts: vec!["localhost".into(), "*.corp.local".into(), "10.0.0.0/8".into()],
+            ..MitmConfig::default()
+        };
+        let tls = |proxy: &Proxy| proxy_mitm_options(proxy).unwrap().unwrap().upstream_tls;
+
+        proxy.mitm = Some(MitmConfig { upstream_tls_mode: MitmUpstreamTlsMode::Allowlist, ..base.clone() });
+        assert_eq!(
+            tls(&proxy),
+            UpstreamTlsVerification::AllowInsecureHosts(vec![
+                FilterRule::from_str("localhost").unwrap(),
+                FilterRule::from_str("*.corp.local").unwrap(),
+                FilterRule::from_str("10.0.0.0/8").unwrap(),
+            ])
+        );
+        proxy.mitm = Some(MitmConfig {
+            upstream_tls_mode: MitmUpstreamTlsMode::Allowlist,
+            insecure_hosts: Vec::new(),
+            ..base.clone()
+        });
+        assert_eq!(tls(&proxy), UpstreamTlsVerification::Strict);
+        proxy.mitm = Some(MitmConfig { upstream_tls_mode: MitmUpstreamTlsMode::InsecureAll, ..base.clone() });
+        assert_eq!(tls(&proxy), UpstreamTlsVerification::InsecureAll);
+        // Strict ignores a leftover list.
+        proxy.mitm = Some(base.clone());
+        assert_eq!(tls(&proxy), UpstreamTlsVerification::Strict);
+
+        proxy.mitm = Some(MitmConfig {
+            upstream_tls_mode: MitmUpstreamTlsMode::Allowlist,
+            insecure_hosts: vec!["bad rule with spaces".into()],
+            ..base
+        });
+        assert!(matches!(
+            proxy_mitm_options(&proxy),
+            Err(MappingError::InvalidFilterRule { scope: "mitm_insecure_hosts", .. })
+        ));
+    }
+
+    #[test]
+    fn tunnel_maps_upstream_tls_only_while_mitm_is_active() {
+        let mut tunnel = Tunnel {
+            name: "t".into(),
+            hops: vec![hop()],
+            mitm: Some(MitmConfig {
+                upstream_tls_mode: MitmUpstreamTlsMode::InsecureAll,
+                ..MitmConfig::default()
+            }),
+            ..Tunnel::default()
+        };
+        tunnel.forward.enabled = false;
+        let cfg = tunnel_to_engine_config(&tunnel).unwrap();
+        assert_eq!(cfg.mitm_options.upstream_tls, UpstreamTlsVerification::Strict);
+        tunnel.forward.enabled = true;
+        tunnel.forward.http_port = 8128;
+        let cfg = tunnel_to_engine_config(&tunnel).unwrap();
+        assert_eq!(cfg.mitm_options.upstream_tls, UpstreamTlsVerification::InsecureAll);
     }
 
     fn full_proxy() -> (Proxy, TunnelId, SecretRef) {

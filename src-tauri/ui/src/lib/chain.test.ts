@@ -51,6 +51,8 @@ function profile(hops: HopEntry[], ca: string | null): SessionProfile {
             cert_ttl: 3600,
             cert_cache_max_entries: 0,
             socks_block_web: false,
+            upstream_tls_mode: "strict",
+            insecure_hosts: [],
           },
     tunnel: {
       ip_version: "auto",

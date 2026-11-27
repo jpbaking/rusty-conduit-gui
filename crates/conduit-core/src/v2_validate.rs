@@ -110,6 +110,9 @@ pub fn validate_tunnel(tunnel: &Tunnel) -> Result<(), ValidateError> {
             if mitm.cert_ttl < MIN_MITM_CERT_TTL {
                 return Err(ValidateError::CertTtlTooShort(mitm.cert_ttl));
             }
+            filter_rules("mitm_insecure_hosts", &mitm.insecure_hosts, |scope, rule, message| {
+                ValidateError::InvalidFilterRule { scope, rule, message }
+            })?;
         }
     }
 
@@ -213,6 +216,9 @@ fn validate_proxy_inner(
         if mitm.cert_ttl < MIN_MITM_CERT_TTL {
             return Err(ProxyValidateError::CertTtlTooShort(mitm.cert_ttl));
         }
+        filter_rules("mitm_insecure_hosts", &mitm.insecure_hosts, |scope, rule, message| {
+            ProxyValidateError::InvalidFilterRule { scope, rule, message }
+        })?;
     }
 
     let n = &proxy.network;
@@ -311,7 +317,7 @@ fn validate_proxy_inner(
 mod tests {
     use super::*;
     use crate::model::{
-        ForwardDirection, HopEntry, HostProfile, MitmCaId, MitmConfig, PortForward,
+        ForwardDirection, HopEntry, HostProfile, MitmCaId, MitmConfig, MitmUpstreamTlsMode, PortForward,
         ReverseConfig,
     };
     use crate::v2_model::{
@@ -486,6 +492,18 @@ mod tests {
         assert!(matches!(
             validate_proxy(&p, &[id], &[]),
             Err(ProxyValidateError::CertTtlTooShort(_))
+        ));
+        p.mitm = Some(MitmConfig {
+            ca: Some(MitmCaId::new()),
+            upstream_tls_mode: MitmUpstreamTlsMode::Allowlist,
+            insecure_hosts: vec!["localhost".into(), "*.corp.local".into(), "10.0.0.0/8".into()],
+            ..MitmConfig::default()
+        });
+        assert!(validate_proxy(&p, &[id], &[]).is_ok());
+        p.mitm.as_mut().unwrap().insecure_hosts.push("bad rule with spaces".into());
+        assert!(matches!(
+            validate_proxy(&p, &[id], &[]),
+            Err(ProxyValidateError::InvalidFilterRule { scope: "mitm_insecure_hosts", .. })
         ));
     }
 
@@ -668,6 +686,18 @@ mod tests {
             cert_ttl: Duration::from_secs(60),
             ..MitmConfig::default()
         });
+        validate_tunnel(&t).unwrap();
+
+        // Forward on checks every MITM insecure host rule; forward off does not.
+        t.mitm.as_mut().unwrap().insecure_hosts = vec!["*.corp.local".into(), "bad rule".into()];
+        assert!(matches!(
+            validate_tunnel(&t),
+            Err(ValidateError::InvalidFilterRule { scope: "mitm_insecure_hosts", .. })
+        ));
+        t.forward.enabled = false;
+        validate_tunnel(&t).unwrap();
+        t.forward.enabled = true;
+        t.mitm.as_mut().unwrap().insecure_hosts = vec!["10.0.0.0/8".into()];
         validate_tunnel(&t).unwrap();
 
         // Local port forward colliding with active forward proxy port is rejected.

@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
 use conduit_core::{
-    tunnel_forward_filter, tunnel_to_engine_config, validate_tunnel, EngineConfig,
+    mitm_tls_warning, tunnel_forward_filter, tunnel_to_engine_config, validate_tunnel, EngineConfig,
     ForwardDirection, ForwardProxyProtocol, HostKeyLookup, HostKeyRecord, KnownHostsStore,
     PortForward, ProxyId, SessionProfile, SshEngine, Timestamp, Tunnel, TunnelId, TunnelStartMode,
 };
@@ -479,6 +479,9 @@ impl TunnelStack {
                 Some(pem) => match MitmState::from_pem_bytes(pem, pem, &cfg.mitm_options) {
                     Ok(state) => {
                         state.cache.set_logger(logger.clone());
+                        if let Some(warning) = mitm_tls_warning(&cfg.mitm_options.upstream_tls) {
+                            logger.error(warning);
+                        }
                         Some(state)
                     }
                     Err(e) => {

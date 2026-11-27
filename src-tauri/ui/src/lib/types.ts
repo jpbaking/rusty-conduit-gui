@@ -221,6 +221,9 @@ export interface ForwardPreset {
   dest_port: number;
 }
 
+/** How upstream HTTPS server certificates are verified while MITM is on. */
+export type MitmUpstreamTlsMode = "strict" | "allowlist" | "insecure_all";
+
 export interface MitmConfig {
   /** A CA in the vault. `null` until one is chosen; the session cannot start without it. */
   ca: MitmCaId | null;
@@ -228,6 +231,9 @@ export interface MitmConfig {
   cert_ttl: number;
   cert_cache_max_entries: number;
   socks_block_web: boolean;
+  upstream_tls_mode: MitmUpstreamTlsMode;
+  /** Domain, `*.domain`, IP, or CIDR rules; used only in `allowlist` mode. */
+  insecure_hosts: string[];
 }
 
 export interface TunnelConfig {

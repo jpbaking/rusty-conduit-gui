@@ -248,6 +248,14 @@ function mitmErrors(errors: FieldErrors, mitm: MitmConfig): void {
   if (!isWholeNumber(mitm.cert_cache_max_entries)) {
     errors["mitm.cert_cache_max_entries"] = "Use a whole number. 0 means unlimited.";
   }
+  // Like the backend, every saved rule must parse, whichever mode is chosen.
+  for (const rule of mitm.insecure_hosts) {
+    const problem = filterRuleError(rule);
+    if (problem) {
+      errors["mitm.insecure_hosts"] = problem;
+      break;
+    }
+  }
 }
 
 function keepaliveErrors(errors: FieldErrors, tunnel: TunnelConfig, prefix = "tunnel"): void {
