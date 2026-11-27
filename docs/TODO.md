@@ -6,7 +6,15 @@
   Windows Authenticode certificate.
 - **Advanced routing & HTTP/SOCKS split UX.** The Advanced routing drawer (multi-condition
   rules, failover chains, bypass/inbound) and HTTP/SOCKS split override tables in Proxy
-  Routing are kept as-is for now. Rework their UX or remove them in a future pass.
+  Routing are hidden from the UI for now (`SHOW_ADVANCED_ROUTING` in
+  `ProxyRoutingTab.svelte`) because their UX is incomplete. Rework their UX and re-enable
+  (or remove) them in a future pass.
+- **Inline access-log actions.** Inline action buttons on Proxy access log rows in
+  `LogDrawer.svelte` are hidden for now (`SHOW_INLINE_LOG_ACTIONS`) to keep log rows clean
+  until their UX is revisited:
+  - **Test route** — jump to the Route Tester prefilled with the row's target and inbound
+    protocol.
+  - **Create rule for this host…** — create a routing rule prefilled with the row's host.
 - **Unify `MitmConfig.socks_block_web` with top-level `socks_block_web`.** TOML import/export
   already uses top-level `socks_block_web` only, and the editors keep both fields in sync,
   but `MitmConfig.socks_block_web` still exists in `v2_model.rs` alongside `Proxy.socks_block_web`

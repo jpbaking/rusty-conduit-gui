@@ -405,7 +405,15 @@
 
       {#each profileErrors(index) as [key, message] (key)}<p class="field-error">{message}</p>{/each}
 
-      <div class="inline-form">
+      <div class="profile-actions">
+        {#if traffic}
+          <small class="muted">{traffic.active} active · {traffic.hits} hits</small>
+        {/if}
+        <span class="spacer"></span>
+        <button type="button" class="danger" onclick={() => removeProfile(index)}>Remove</button>
+      </div>
+
+      <div class="inline-form test-dial-row">
         <span class="muted">Test dials</span>
         <input
           aria-label={`Test host for ${profile.name || `upstream ${index + 1}`}`}
@@ -414,6 +422,7 @@
           oninput={(e) => (probeHostFor = { ...probeHostFor, [index]: e.currentTarget.value })}
         />
         <input
+          class="port-input"
           aria-label={`Test port for ${profile.name || `upstream ${index + 1}`}`}
           type="number"
           min="1"
@@ -431,11 +440,6 @@
         >
           {probing === index ? "Testing…" : "Test Upstream"}
         </button>
-        {#if traffic}
-          <small class="muted">{traffic.active} active · {traffic.hits} hits</small>
-        {/if}
-        <span class="spacer"></span>
-        <button type="button" class="danger" onclick={() => removeProfile(index)}>Remove</button>
       </div>
       {#if probedIndex === index && probe}
         <p role="status">
@@ -454,10 +458,29 @@
 
 <style>
   .profile-card {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
     border: 1px solid var(--border, #ccc);
     border-left-width: 4px;
     border-radius: 6px;
     padding: 0.6rem;
     margin-top: 0.6rem;
+  }
+
+  .profile-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .test-dial-row {
+    align-items: center;
+    padding-top: 8px;
+    border-top: 1px solid var(--border);
+  }
+
+  .test-dial-row .port-input {
+    flex: 0 0 104px;
   }
 </style>

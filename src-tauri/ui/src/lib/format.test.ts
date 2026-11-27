@@ -6,6 +6,7 @@ import {
   caExpiry,
   checkStatus,
   formatBytes,
+  formatDateTime,
   formatUptime,
   isActive,
   logLevel,
@@ -13,6 +14,7 @@ import {
   proxyUrls,
   stateReason,
   statusOf,
+  stripLeadingTimestamp,
 } from "./format.ts";
 
 const awaitingHostKey: SessionState = {
@@ -140,6 +142,35 @@ describe("formatUptime", () => {
     assert.equal(formatUptime(3600), "1h 0m");
     assert.equal(formatUptime(3725), "1h 2m");
     assert.equal(formatUptime(90000), "25h 0m");
+  });
+});
+
+describe("formatDateTime", () => {
+  test("formats local YYYY-MM-DD HH:MM:SS with zero padding", () => {
+    const local = new Date(2026, 0, 5, 8, 4, 9);
+    assert.equal(formatDateTime(local.getTime() / 1000), "2026-01-05 08:04:09");
+  });
+});
+
+describe("stripLeadingTimestamp", () => {
+  test("removes leading RFC 3339 / ISO timestamps from engine log lines", () => {
+    assert.equal(
+      stripLeadingTimestamp("2026-11-27T13:59:52.123Z INFO    listening"),
+      "INFO    listening",
+    );
+    assert.equal(
+      stripLeadingTimestamp("2026-11-27T13:59:52Z WARN retrying"),
+      "WARN retrying",
+    );
+    assert.equal(
+      stripLeadingTimestamp("2026-11-27 21:59:52+08:00 DEBUG frame"),
+      "DEBUG frame",
+    );
+  });
+
+  test("leaves lines without a leading timestamp unchanged", () => {
+    assert.equal(stripLeadingTimestamp("connected"), "connected");
+    assert.equal(stripLeadingTimestamp("INFO at 2026-11-27T13:59:52Z"), "INFO at 2026-11-27T13:59:52Z");
   });
 });
 

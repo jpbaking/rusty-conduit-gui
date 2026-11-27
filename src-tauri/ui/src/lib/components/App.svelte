@@ -17,8 +17,78 @@
   import VaultUnlockModal from "./VaultUnlockModal.svelte";
   import type { PendingHostKey } from "../stores.svelte";
 
+  const SIDEBAR_WIDTH_KEY = "rcg.sidebarWidth";
+  const MIN_SIDEBAR_WIDTH = 180;
+  const MAX_SIDEBAR_WIDTH = 520;
+
   let copyFailed = $state(false);
   let wizardOpen = $state(false);
+  let shellEl = $state<HTMLDivElement | null>(null);
+  let sidebarWidth = $state<number | null>(readStoredWidth());
+  let sidebarDrag = $state<{ startX: number; startWidth: number } | null>(null);
+
+  function readStoredWidth(): number | null {
+    try {
+      const raw = localStorage.getItem(SIDEBAR_WIDTH_KEY);
+      if (!raw) return null;
+      const n = Number(raw);
+      return Number.isFinite(n) && n >= MIN_SIDEBAR_WIDTH && n <= MAX_SIDEBAR_WIDTH ? n : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function clampSidebarWidth(width: number): number {
+    const max = Math.min(MAX_SIDEBAR_WIDTH, Math.max(MIN_SIDEBAR_WIDTH, Math.floor(window.innerWidth * 0.5)));
+    return Math.round(Math.min(max, Math.max(MIN_SIDEBAR_WIDTH, width)));
+  }
+
+  function saveSidebarWidth(width: number | null) {
+    try {
+      if (width === null) localStorage.removeItem(SIDEBAR_WIDTH_KEY);
+      else localStorage.setItem(SIDEBAR_WIDTH_KEY, String(width));
+    } catch {
+      // Ignore storage errors in restricted webviews.
+    }
+  }
+
+  function currentSidebarWidth(): number {
+    if (sidebarWidth !== null) return sidebarWidth;
+    const aside = shellEl?.querySelector<HTMLElement>(".sidebar");
+    return aside ? Math.round(aside.getBoundingClientRect().width) : 260;
+  }
+
+  function startSidebarResize(event: PointerEvent) {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+    sidebarDrag = { startX: event.clientX, startWidth: currentSidebarWidth() };
+  }
+
+  function moveSidebarResize(event: PointerEvent) {
+    if (!sidebarDrag) return;
+    sidebarWidth = clampSidebarWidth(sidebarDrag.startWidth + (event.clientX - sidebarDrag.startX));
+  }
+
+  function endSidebarResize() {
+    if (!sidebarDrag) return;
+    sidebarDrag = null;
+    saveSidebarWidth(sidebarWidth);
+  }
+
+  function onSidebarResizeKeydown(event: KeyboardEvent) {
+    if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+      event.preventDefault();
+      const delta = event.key === "ArrowLeft" ? -16 : 16;
+      sidebarWidth = clampSidebarWidth(currentSidebarWidth() + delta);
+      saveSidebarWidth(sidebarWidth);
+    }
+  }
+
+  function resetSidebarWidth() {
+    sidebarWidth = null;
+    saveSidebarWidth(null);
+  }
 
   /** A running Tunnel waiting for a host-key answer: the selected one first. */
   const tunnelHostKey = $derived.by<PendingHostKey | null>(() => {
@@ -57,10 +127,32 @@
   }
 </script>
 
-<div class="shell">
+<div
+  class="shell"
+  class:resizing-x={sidebarDrag !== null}
+  bind:this={shellEl}
+  style:--sidebar-width={sidebarWidth !== null ? `${sidebarWidth}px` : undefined}
+>
   <Sidebar onNewProxy={() => (wizardOpen = true)} />
 
   <div class="workspace">
+    <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+    <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+    <div
+      class="resize-handle-x"
+      class:active={sidebarDrag !== null}
+      role="separator"
+      aria-orientation="vertical"
+      aria-label="Resize sidebar"
+      tabindex="0"
+      title="Drag to resize sidebar (double-click to reset)"
+      onpointerdown={startSidebarResize}
+      onpointermove={moveSidebarResize}
+      onpointerup={endSidebarResize}
+      onpointercancel={endSidebarResize}
+      onkeydown={onSidebarResizeKeydown}
+      ondblclick={resetSidebarWidth}
+    ></div>
     {#if !store.trayAvailable && !store.trayBannerDismissed}
       <div class="banner info" role="status">
         <span>No system tray was found. Closing this window will ask whether to keep tunnels running.</span>

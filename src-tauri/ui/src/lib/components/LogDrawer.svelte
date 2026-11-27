@@ -1,13 +1,25 @@
 <script lang="ts">
   import { untrack } from "svelte";
   import { api, errorMessage } from "../api";
-  import { formatBytes, formatTime, logLevel, passesLevel, type LogFilter, type LogLevel } from "../format";
+  import {
+    formatBytes,
+    formatDateTime,
+    logLevel,
+    passesLevel,
+    stripLeadingTimestamp,
+    type LogFilter,
+    type LogLevel,
+  } from "../format";
   import { store, type LogTarget } from "../stores.svelte";
   import type { AccessRecordView, LogLine } from "../types";
 
   const ROW_HEIGHT = 20;
   const OVERSCAN = 10;
   const POLL_MS = 1_000;
+  const LOG_HEIGHT_KEY = "rcg.logDrawerHeight";
+  const MIN_LOG_HEIGHT = 140;
+  // Hidden until inline log row actions are reworked (see docs/TODO.md).
+  const SHOW_INLINE_LOG_ACTIONS = false;
 
   /** `app`: the text log. `access`: HTTP and SOCKS access records of a Proxy. */
   type KindFilter = "all" | "app" | "access" | "http" | "socks";
@@ -30,8 +42,71 @@
   let scrollTop = $state(0);
   let viewportHeight = $state(0);
   let viewport = $state<HTMLDivElement | null>(null);
+  let drawerEl = $state<HTMLElement | null>(null);
+  let drawerHeight = $state<number | null>(readStoredHeight());
+  let drawerDrag = $state<{ startY: number; startHeight: number } | null>(null);
   /** Bumped on clear and target change, so a response already in flight is ignored. */
   let generation = 0;
+
+  function readStoredHeight(): number | null {
+    try {
+      const raw = localStorage.getItem(LOG_HEIGHT_KEY);
+      if (!raw) return null;
+      const n = Number(raw);
+      return Number.isFinite(n) && n >= MIN_LOG_HEIGHT ? n : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function saveDrawerHeight(height: number | null) {
+    try {
+      if (height === null) localStorage.removeItem(LOG_HEIGHT_KEY);
+      else localStorage.setItem(LOG_HEIGHT_KEY, String(height));
+    } catch {
+      // Ignore storage errors in restricted webviews.
+    }
+  }
+
+  function clampDrawerHeight(height: number): number {
+    const parentHeight = drawerEl?.parentElement?.getBoundingClientRect().height ?? window.innerHeight;
+    const max = Math.max(MIN_LOG_HEIGHT, Math.floor(parentHeight - 120));
+    return Math.round(Math.min(max, Math.max(MIN_LOG_HEIGHT, height)));
+  }
+
+  function startDrawerResize(event: PointerEvent) {
+    if (event.button !== 0 || !store.logsOpen || !drawerEl) return;
+    event.preventDefault();
+    (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+    drawerDrag = { startY: event.clientY, startHeight: Math.round(drawerEl.getBoundingClientRect().height) };
+  }
+
+  function moveDrawerResize(event: PointerEvent) {
+    if (!drawerDrag) return;
+    drawerHeight = clampDrawerHeight(drawerDrag.startHeight + (drawerDrag.startY - event.clientY));
+  }
+
+  function endDrawerResize() {
+    if (!drawerDrag) return;
+    drawerDrag = null;
+    saveDrawerHeight(drawerHeight);
+  }
+
+  function onDrawerResizeKeydown(event: KeyboardEvent) {
+    if (!store.logsOpen || !drawerEl) return;
+    if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+      event.preventDefault();
+      const delta = event.key === "ArrowUp" ? 20 : -20;
+      const current = drawerHeight ?? Math.round(drawerEl.getBoundingClientRect().height);
+      drawerHeight = clampDrawerHeight(current + delta);
+      saveDrawerHeight(drawerHeight);
+    }
+  }
+
+  function resetDrawerHeight() {
+    drawerHeight = null;
+    saveDrawerHeight(null);
+  }
 
   /** The selected item of the open view; the last explicit target otherwise. */
   const target = $derived.by<LogTarget | null>(() => {
@@ -70,7 +145,7 @@
       key: `t${line.seq}`,
       time: line.timestamp,
       level: logLevel(line.text),
-      line,
+      line: { ...line, text: stripLeadingTimestamp(line.text) },
     }));
     const access: Row[] = records.map((record, index) => ({
       type: "access",
@@ -195,7 +270,7 @@
 
   async function copyLogs() {
     const text = visibleRows
-      .map((row) => `${formatTime(row.time)} ${row.type === "text" ? row.line.text : accessText(row.record)}`)
+      .map((row) => `${formatDateTime(row.time)} ${row.type === "text" ? row.line.text : accessText(row.record)}`)
       .join("\n");
     try {
       await navigator.clipboard.writeText(text);
@@ -212,7 +287,32 @@
   }
 </script>
 
-<section class="log-drawer" class:open={store.logsOpen} aria-label="Logs">
+<section
+  class="log-drawer"
+  class:open={store.logsOpen}
+  aria-label="Logs"
+  bind:this={drawerEl}
+  style:flex-basis={store.logsOpen && drawerHeight !== null ? `${drawerHeight}px` : undefined}
+>
+  {#if store.logsOpen}
+    <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+    <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+    <div
+      class="resize-handle-y"
+      class:active={drawerDrag !== null}
+      role="separator"
+      aria-orientation="horizontal"
+      aria-label="Resize logs"
+      tabindex="0"
+      title="Drag to resize logs (double-click to reset)"
+      onpointerdown={startDrawerResize}
+      onpointermove={moveDrawerResize}
+      onpointerup={endDrawerResize}
+      onpointercancel={endDrawerResize}
+      onkeydown={onDrawerResizeKeydown}
+      ondblclick={resetDrawerHeight}
+    ></div>
+  {/if}
   <div class="log-toolbar">
     <button
       class="log-toggle"
@@ -286,22 +386,24 @@
           <div class="log-rows" style:transform="translateY({firstRow * ROW_HEIGHT}px)">
             {#each rows as row (row.key)}
               <div class="log-row {row.level}" style:height="{ROW_HEIGHT}px">
-                <span class="log-time">{formatTime(row.time)}</span>
+                <span class="log-time">{formatDateTime(row.time)}</span>
                 {#if row.type === "text"}
                   <span class="log-text">{row.line.text}</span>
                 {:else}
-                  <span class="log-actions">
-                    <button
-                      type="button"
-                      title={`Open the Route Tester with ${row.record.target}`}
-                      onclick={() => quickAction("test_route", row.record)}
-                    >Test route</button>
-                    <button
-                      type="button"
-                      title={`Add a routing rule for ${row.record.target}`}
-                      onclick={() => quickAction("create_rule", row.record)}
-                    >Create rule for this host…</button>
-                  </span>
+                  {#if SHOW_INLINE_LOG_ACTIONS}
+                    <span class="log-actions">
+                      <button
+                        type="button"
+                        title={`Open the Route Tester with ${row.record.target}`}
+                        onclick={() => quickAction("test_route", row.record)}
+                      >Test route</button>
+                      <button
+                        type="button"
+                        title={`Add a routing rule for ${row.record.target}`}
+                        onclick={() => quickAction("create_rule", row.record)}
+                      >Create rule for this host…</button>
+                    </span>
+                  {/if}
                   <span class="log-text">{accessText(row.record)}</span>
                 {/if}
               </div>

@@ -159,6 +159,9 @@
 
   let { quickAction }: Props = $props();
 
+  // Hidden until the Advanced routing & HTTP/SOCKS split UX is reworked (see docs/TODO.md).
+  const SHOW_ADVANCED_ROUTING = false;
+
   const uid = $props.id();
   const proxy = $derived(store.proxyDraft as Proxy);
   const routing = $derived(proxy.routing);
@@ -683,7 +686,11 @@
                       {/each}
                     </optgroup>
                   {/each}
-                  <option value="advanced">Advanced…</option>
+                  {#if SHOW_ADVANCED_ROUTING}
+                    <option value="advanced">Advanced…</option>
+                  {:else if kind === "advanced"}
+                    <option value="advanced" disabled>Advanced</option>
+                  {/if}
                 </select>
               </td>
               <td class="col-details">
@@ -696,7 +703,9 @@
                           <li class="rule-chip">{chip}</li>
                         {/each}
                       </ul>
-                      <button type="button" onclick={() => openRule(index)}>Edit…</button>
+                      {#if SHOW_ADVANCED_ROUTING}
+                        <button type="button" onclick={() => openRule(index)}>Edit…</button>
+                      {/if}
                     </div>
                   {:else if kind === "match_all"}
                     <span class="muted">Matches every request</span>
@@ -803,7 +812,18 @@
                     <span class="pill busy" title={formatTargetLabel(rule.target, tunnels, proxy.profiles)}>
                       failover ×{chain.length}
                     </span>
-                    <button type="button" class="link-button" onclick={() => openRule(index)}>Edit…</button>
+                    {#if SHOW_ADVANCED_ROUTING}
+                      <button type="button" class="link-button" onclick={() => openRule(index)}>Edit…</button>
+                    {:else}
+                      <button
+                        type="button"
+                        class="link-button"
+                        onclick={() => setRule(index, { ...rule, target: chain[0] ?? "direct" })}
+                        title="Collapse failover chain to its primary target"
+                      >
+                        Simplify
+                      </button>
+                    {/if}
                   </div>
                 {:else}
                   {@render profileSelect(
@@ -898,34 +918,36 @@
     </p>
   {/if}
 
-  <details
-    class="split-disclosure"
-    open={splitTablesOpen}
-    ontoggle={(e) => (splitTablesOpen = e.currentTarget.open)}
-  >
-    <summary>
-      Advanced: HTTP / SOCKS split tables
-      {#if routing.http || routing.socks}
-        <span class="pill busy">active</span>
-      {/if}
-    </summary>
-    <div class="split-body">
-      <p class="muted">
-        Optionally override routing separately for HTTP or SOCKS listeners.
-      </p>
-      <div class="segmented" role="group" aria-label="Routing table">
-        {#each TABLES as table (table.value)}
-          <button type="button" aria-pressed={tableKey === table.value} onclick={() => (tableKey = table.value)}>
-            {table.label}
-            {#if table.value !== "unified" && routing[table.value]}<span class="muted"> ●</span>{/if}
-          </button>
-        {/each}
+  {#if SHOW_ADVANCED_ROUTING}
+    <details
+      class="split-disclosure"
+      open={splitTablesOpen}
+      ontoggle={(e) => (splitTablesOpen = e.currentTarget.open)}
+    >
+      <summary>
+        Advanced: HTTP / SOCKS split tables
+        {#if routing.http || routing.socks}
+          <span class="pill busy">active</span>
+        {/if}
+      </summary>
+      <div class="split-body">
+        <p class="muted">
+          Optionally override routing separately for HTTP or SOCKS listeners.
+        </p>
+        <div class="segmented" role="group" aria-label="Routing table">
+          {#each TABLES as table (table.value)}
+            <button type="button" aria-pressed={tableKey === table.value} onclick={() => (tableKey = table.value)}>
+              {table.label}
+              {#if table.value !== "unified" && routing[table.value]}<span class="muted"> ●</span>{/if}
+            </button>
+          {/each}
+        </div>
       </div>
-    </div>
-  </details>
+    </details>
+  {/if}
 </section>
 
-{#if editing}
+{#if SHOW_ADVANCED_ROUTING && editing}
   {@const form = editing.form}
   <aside class="rule-drawer card" aria-labelledby={`${uid}-drawer`}>
     <form onsubmit={applyRule}>
