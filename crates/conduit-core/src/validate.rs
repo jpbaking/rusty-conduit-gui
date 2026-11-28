@@ -371,6 +371,15 @@ pub fn validate(profile: &SessionProfile) -> Result<(), ValidateError> {
                 });
             }
         }
+        for rule in &mitm.bypass_hosts {
+            if let Err(message) = FilterRule::from_str(rule) {
+                return Err(ValidateError::InvalidFilterRule {
+                    scope: "mitm_bypass_hosts",
+                    rule: rule.clone(),
+                    message,
+                });
+            }
+        }
     }
 
     // SSH target is derived from the last hop.
@@ -666,6 +675,23 @@ mod tests {
         assert!(matches!(
             validate(&p),
             Err(ValidateError::InvalidFilterRule { scope: "mitm_insecure_hosts", .. })
+        ));
+    }
+
+    #[test]
+    fn mitm_bypass_hosts_must_be_filter_rules() {
+        let mut p = forward_profile();
+        p.mitm = Some(crate::MitmConfig {
+            ca: Some(MitmCaId::new()),
+            bypass_hosts: vec!["*.bank.example".into(), "192.0.2.0/24".into()],
+            ..Default::default()
+        });
+        assert!(validate(&p).is_ok());
+        assert_eq!(crate::to_engine_config(&p).unwrap().mitm_options.bypass_hosts.len(), 2);
+        p.mitm.as_mut().unwrap().bypass_hosts.push("bad rule".into());
+        assert!(matches!(
+            validate(&p),
+            Err(ValidateError::InvalidFilterRule { scope: "mitm_bypass_hosts", .. })
         ));
     }
 

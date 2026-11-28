@@ -44,6 +44,10 @@ fn enabled_by_default() -> bool {
     true
 }
 
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
 // ---------------------------------------------------------------------------
 // Identifiers.
 // ---------------------------------------------------------------------------
@@ -466,6 +470,10 @@ pub struct RoutingRule {
     /// Per-rule override of [`RoutingTablesConfig::resolve_dns`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolve_dns: Option<bool>,
+    /// Skip HTTPS MITM interception when this rule matches a `CONNECT` request
+    /// (`rusty-conduit-switch` `[[routing.rules]] bypass_mitm`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bypass_mitm: bool,
     pub target: RouteTarget,
 }
 
@@ -491,6 +499,7 @@ impl RoutingRule {
             match_all: false,
             disabled: false,
             resolve_dns: None,
+            bypass_mitm: false,
             target,
         }
     }

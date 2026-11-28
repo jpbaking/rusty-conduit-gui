@@ -13,8 +13,8 @@ Owns everything under `crates/conduit-core/`. Inherits all root DOX rules and ad
 - Profiles reference secrets only by opaque vault UUIDs; never store secret values in models.
 - Validation mirrors the `rusty-conduit` CLI family's `FATAL` config rules; keep it aligned with the engine version pinned in the workspace `Cargo.toml`.
 - `known_hosts_import.rs` only parses text it is handed; it never opens `~/.ssh/known_hosts`.
-- `toml_io.rs` mirrors each CLI's `FileConfig` shape and rejects unknown keys, as the CLIs do.
-- MITM upstream TLS verification (`MitmUpstreamTlsMode`: `strict` / `allowlist` / `insecure_all`) maps to the engine's `UpstreamTlsVerification` in `mapping.rs::mitm_upstream_tls`; an empty allowlist verifies strictly. `insecure_hosts` entries must parse as `FilterRule`s whenever MITM is active. `[mitm] insecure` / `insecure_hosts` are written on export; on import MITM stays off (its CA is in the Vault), so they are only reported as warnings.
+- `toml_io.rs` mirrors each CLI's `FileConfig` shape and rejects unknown keys, as the CLIs do. Per-rule `RoutingRule::bypass_mitm` round-trips as `bypass_mitm = true` in `rusty-conduit-switch`'s `[[routing.rules]]`.
+- MITM upstream TLS verification (`MitmUpstreamTlsMode`: `strict` / `allowlist` / `insecure_all`) maps to the engine's `UpstreamTlsVerification` in `mapping.rs::mitm_upstream_tls`; an empty allowlist verifies strictly. `MitmConfig::bypass_hosts` (hosts never intercepted) maps to `MitmOptions::bypass_hosts` via `mapping.rs::mitm_bypass_hosts` for v1 sessions, Tunnels, and Proxies. `insecure_hosts` and `bypass_hosts` entries must parse as `FilterRule`s whenever MITM is active. `[mitm] insecure` / `insecure_hosts` / `bypass_hosts` are written on export for every CLI; on import MITM stays off (its CA is in the Vault), so they are only reported as warnings.
 - Every write in `storage.rs` is atomic (temp file, `sync_all`, rename).
 
 ## Verification

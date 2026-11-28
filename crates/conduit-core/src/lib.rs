@@ -19,7 +19,7 @@ mod validate;
 
 pub use airswitch_import::{import_airswitch_bak, AirSwitchImport, ExtractedSecret, ImportError};
 pub use known_hosts_import::{parse_openssh_known_hosts_for_host, ImportedHostKey};
-pub use mapping::{mitm_tls_warning, mitm_upstream_tls, to_engine_config, EngineConfig, MappingError};
+pub use mapping::{mitm_bypass_hosts, mitm_tls_warning, mitm_upstream_tls, to_engine_config, EngineConfig, MappingError};
 pub use migrate_v2::{
     load_or_migrate_app_config, migrate_v1_sessions, MigrationReport, CURRENT_SCHEMA_VERSION,
     V1_BACKUP_FILE_NAME,

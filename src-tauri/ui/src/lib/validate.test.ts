@@ -21,9 +21,9 @@ import {
   tunnelTarget,
 } from "./validate.ts";
 
-const STRICT_TLS = { upstream_tls_mode: "strict", insecure_hosts: [] } satisfies Pick<
+const STRICT_TLS = { upstream_tls_mode: "strict", insecure_hosts: [], bypass_hosts: [] } satisfies Pick<
   MitmConfig,
-  "upstream_tls_mode" | "insecure_hosts"
+  "upstream_tls_mode" | "insecure_hosts" | "bypass_hosts"
 >;
 
 function validProfile(): SessionProfile {
@@ -426,6 +426,7 @@ describe("sessionErrors", () => {
       socks_block_web: false,
       upstream_tls_mode: "allowlist",
       insecure_hosts: ["localhost", "*.corp.local", "10.0.0.0/8"],
+      bypass_hosts: [],
     };
     assert.deepEqual(sessionErrors(profile), {});
     profile.mitm.insecure_hosts = ["localhost", "10.0.0.0/33"];
@@ -435,6 +436,22 @@ describe("sessionErrors", () => {
     assert.ok(sessionErrors(profile)["mitm.insecure_hosts"]);
     profile.mitm.insecure_hosts = [];
     assert.deepEqual(sessionErrors(profile), {});
+  });
+
+  test("checks every MITM bypass host rule", () => {
+    const profile = validProfile();
+    profile.mitm = {
+      ca: "ca-1",
+      cert_ttl: 3600,
+      cert_cache_max_entries: 0,
+      socks_block_web: false,
+      ...STRICT_TLS,
+      bypass_hosts: ["*.bank.example", "192.0.2.10", "10.0.0.0/8"],
+    };
+    assert.deepEqual(sessionErrors(profile), {});
+    profile.mitm.bypass_hosts = ["*.bank.example", "bad*.example"];
+    assert.ok(sessionErrors(profile)["mitm.bypass_hosts"]);
+    assert.equal(sessionErrors(profile)["mitm.insecure_hosts"], undefined);
   });
 
   test("requires a MITM CA to be chosen", () => {
@@ -628,6 +645,9 @@ describe("tunnelErrors", () => {
     assert.deepEqual(tunnelErrors({ ...t, mitm: badHosts }), {});
     const onBadHosts = { ...t, forward: { ...t.forward, enabled: true }, mitm: badHosts };
     assert.ok(tunnelErrors(onBadHosts)["mitm.insecure_hosts"]);
+    const badBypass = { ...badMitm, ca: "c", bypass_hosts: ["bad*.example"] };
+    assert.deepEqual(tunnelErrors({ ...t, mitm: badBypass }), {});
+    assert.ok(tunnelErrors({ ...t, forward: { ...t.forward, enabled: true }, mitm: badBypass })["mitm.bypass_hosts"]);
 
     // Remote port forward with proxy_protocol !== "none" is rejected.
     const badRemote = {
@@ -673,9 +693,13 @@ describe("proxyErrors", () => {
       socks_block_web: false,
       upstream_tls_mode: "allowlist" as const,
       insecure_hosts: ["*.corp.local", "bad*.example"],
+      bypass_hosts: [],
     };
     assert.ok(proxyErrors({ ...p, mitm: allowlist }, [TUNNEL_ID])["mitm.insecure_hosts"]);
     assert.deepEqual(proxyErrors({ ...p, mitm: { ...allowlist, insecure_hosts: ["*.corp.local"] } }, [TUNNEL_ID]), {});
+    const bypass = { ...allowlist, insecure_hosts: [], bypass_hosts: ["*.bank.example", "bad*.example"] };
+    assert.ok(proxyErrors({ ...p, mitm: bypass }, [TUNNEL_ID])["mitm.bypass_hosts"]);
+    assert.deepEqual(proxyErrors({ ...p, mitm: { ...bypass, bypass_hosts: ["*.bank.example"] } }, [TUNNEL_ID]), {});
     assert.ok(proxyErrors({ ...p, network: { ...p.network, connect_timeout: 0 } }, [TUNNEL_ID])["network.connect_timeout"]);
     assert.ok(proxyErrors({ ...p, network: { ...p.network, tcp_keepalive_interval: 0 } }, [TUNNEL_ID])["network.tcp_keepalive_interval"]);
     assert.deepEqual(proxyErrors({ ...p, network: { ...p.network, tcp_keepalive: 0, tcp_keepalive_retries: 0 } }, [TUNNEL_ID]), {});

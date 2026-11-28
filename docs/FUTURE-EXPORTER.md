@@ -54,6 +54,7 @@ Always export the Proxy as `rusty-conduit-switch`: it covers every Proxy mode, s
 | Tunnel port forwards (`-L`, `-R`) | `ssh` arguments after `--`; a local forward binds `0.0.0.0` in the container and is published on `127.0.0.1` |
 | MITM CA (vault) | Compose secrets; `RUSTY_CONDUIT_SWITCH_MITM_CA_CERT` / `_KEY` (or `_P12` plus a passphrase file) |
 | MITM upstream TLS mode, insecure hosts | `[mitm] insecure_hosts` / `insecure` |
+| MITM bypass hosts, per-rule MITM bypass | `[mitm] bypass_hosts`; `bypass_mitm = true` on `[[routing.rules]]` (`rusty-conduit-switch`) |
 | Tunnel-level MITM, Forward listener, and filters | The same keys in that tunnel's `config.toml` |
 
 ## 3. What cannot be exported unattended

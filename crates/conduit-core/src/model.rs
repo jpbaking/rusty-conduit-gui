@@ -685,6 +685,10 @@ pub struct MitmConfig {
     /// Domain, `*.domain`, IP, or CIDR rules; used only in [`MitmUpstreamTlsMode::Allowlist`].
     #[serde(default)]
     pub insecure_hosts: Vec<String>,
+    /// Domain, `*.domain`, IP, or CIDR rules for targets that are never intercepted: their
+    /// CONNECT tunnels are passed through as plain TLS.
+    #[serde(default)]
+    pub bypass_hosts: Vec<String>,
 }
 
 impl Default for MitmConfig {
@@ -696,6 +700,7 @@ impl Default for MitmConfig {
             socks_block_web: false,
             upstream_tls_mode: MitmUpstreamTlsMode::Strict,
             insecure_hosts: Vec::new(),
+            bypass_hosts: Vec::new(),
         }
     }
 }

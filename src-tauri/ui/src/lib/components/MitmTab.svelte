@@ -75,6 +75,7 @@
       socks_block_web: lastSettings?.socks_block_web ?? false,
       upstream_tls_mode: lastSettings?.upstream_tls_mode ?? "strict",
       insecure_hosts: lastSettings?.insecure_hosts ?? [],
+      bypass_hosts: lastSettings?.bypass_hosts ?? [],
     };
     update(() => ({ ...settings }));
   }
@@ -86,17 +87,24 @@
       .split(/\r?\n/)
       .map((line) => line.trim())
       .filter((line) => line !== "");
-  let hostsDraft = $state<string | null>(null);
-  const hostsText = $derived.by(() => {
-    const saved = mitm?.insecure_hosts ?? [];
-    const draft = hostsDraft === null ? null : parseHosts(hostsDraft);
+  function listText(draftText: string | null, saved: string[]): string {
+    const draft = draftText === null ? null : parseHosts(draftText);
     const same = draft !== null && draft.length === saved.length && draft.every((h, i) => h === saved[i]);
-    return same && hostsDraft !== null ? hostsDraft : saved.join("\n");
-  });
+    return same && draftText !== null ? draftText : saved.join("\n");
+  }
+  let hostsDraft = $state<string | null>(null);
+  const hostsText = $derived(listText(hostsDraft, mitm?.insecure_hosts ?? []));
+  let bypassDraft = $state<string | null>(null);
+  const bypassText = $derived(listText(bypassDraft, mitm?.bypass_hosts ?? []));
 
   function setInsecureHosts(text: string) {
     hostsDraft = text;
     setMitm({ insecure_hosts: parseHosts(text) });
+  }
+
+  function setBypassHosts(text: string) {
+    bypassDraft = text;
+    setMitm({ bypass_hosts: parseHosts(text) });
   }
 
   function added(ca: VaultCaMeta) {
@@ -180,6 +188,25 @@
         onValue={(cert_cache_max_entries) => setMitm({ cert_cache_max_entries })}
       />
     </div>
+  </section>
+{/if}
+
+{#if mitm}
+  <section class="card" aria-labelledby={`${uid}-bypass`}>
+    <h2 id={`${uid}-bypass`}>Bypass MITM hosts</h2>
+    <label class="field">
+      <span>Never intercept <small class="muted">one domain, *.wildcard, IP, or CIDR per line</small></span>
+      <textarea
+        class="code-text"
+        spellcheck="false"
+        placeholder={"*.bank.example\n192.0.2.10\n10.0.0.0/8"}
+        aria-invalid={!!errors["mitm.bypass_hosts"]}
+        value={bypassText}
+        oninput={(e) => setBypassHosts(e.currentTarget.value)}
+      ></textarea>
+    </label>
+    {#if errors["mitm.bypass_hosts"]}<span class="field-error">{errors["mitm.bypass_hosts"]}</span>{/if}
+    <small class="muted">HTTPS to these hosts passes through as plain TLS, without decryption or a generated certificate.</small>
   </section>
 {/if}
 

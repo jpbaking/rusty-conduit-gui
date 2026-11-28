@@ -115,6 +115,11 @@ pub fn mitm_upstream_tls(mitm: &MitmConfig) -> Result<UpstreamTlsVerification, M
     })
 }
 
+/// Parse a [`MitmConfig`]'s `bypass_hosts` into the engine's MITM exclusion rules.
+pub fn mitm_bypass_hosts(mitm: &MitmConfig) -> Result<Vec<FilterRule>, MappingError> {
+    parse_rules("mitm_bypass_hosts", &mitm.bypass_hosts)
+}
+
 /// The startup warning for upstream TLS verification that skips certificate checks, in the
 /// CLIs' `WARN:` wording (`None` when every upstream certificate is verified).
 pub fn mitm_tls_warning(upstream_tls: &UpstreamTlsVerification) -> Option<String> {
@@ -193,6 +198,10 @@ pub fn to_engine_config(profile: &SessionProfile) -> Result<EngineConfig, Mappin
         upstream_tls: match &profile.mitm {
             Some(m) => mitm_upstream_tls(m)?,
             None => UpstreamTlsVerification::Strict,
+        },
+        bypass_hosts: match &profile.mitm {
+            Some(m) => mitm_bypass_hosts(m)?,
+            None => Vec::new(),
         },
     };
 

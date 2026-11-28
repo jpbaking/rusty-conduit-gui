@@ -209,6 +209,8 @@ pub struct RouteTestResult {
     pub matched_rule: Option<String>,
     pub blocked_by_filter: bool,
     pub filter_reason: Option<String>,
+    /// `true` when the matched rule bypasses HTTPS MITM interception.
+    pub bypass_mitm: bool,
     /// The failover chain, in order.
     pub targets: Vec<RouteTestTarget>,
 }
@@ -1263,6 +1265,7 @@ impl ProxyManager {
                     matched_rule: None,
                     blocked_by_filter: true,
                     filter_reason: Some(denied.to_string()),
+                    bypass_mitm: false,
                     targets: Vec::new(),
                 })
             }
@@ -1302,6 +1305,7 @@ impl ProxyManager {
             matched_rule: decision.rule.clone(),
             blocked_by_filter: false,
             filter_reason: None,
+            bypass_mitm: decision.bypass_mitm,
             targets: decision
                 .targets
                 .iter()
@@ -1628,6 +1632,7 @@ mod tests {
         assert_eq!(hit.table.as_deref(), Some("[routing]"));
         assert_eq!(hit.matched_rule.as_deref(), Some("corp-sites"));
         assert!(!hit.blocked_by_filter);
+        assert!(!hit.bypass_mitm);
         assert_eq!(
             hit.targets,
             vec![RouteTestTarget {
@@ -1637,6 +1642,16 @@ mod tests {
                 bypassed: false,
             }]
         );
+
+        let mut bypass_proxy = corp_proxy(8080);
+        bypass_proxy.routing.rules[0].bypass_mitm = true;
+        let bypassed = ProxyManager::test_route(
+            &bypass_proxy,
+            "https://app.corp.example/x",
+            RouteInbound::Http,
+        )
+        .unwrap();
+        assert!(bypassed.bypass_mitm);
 
         let miss =
             ProxyManager::test_route(&proxy, "example.com:443", RouteInbound::Socks).unwrap();

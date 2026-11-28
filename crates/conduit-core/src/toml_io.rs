@@ -173,6 +173,9 @@ struct MitmFile {
     /// Upstream hosts (domain, `*.domain`, IP, or CIDR) whose certificates are not verified.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     insecure_hosts: Vec<String>,
+    /// Hosts (domain, `*.domain`, IP, or CIDR) that are never intercepted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    bypass_hosts: Vec<String>,
     /// Blind trust: no upstream certificate is verified.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     insecure: Option<bool>,
@@ -551,6 +554,13 @@ fn mitm_of(file: Option<MitmFile>, warnings: &mut Vec<String>) -> Option<MitmCon
             hosts.join(", ")
         )),
     }
+    if !m.bypass_hosts.is_empty() {
+        warnings.push(format!(
+            "[mitm] bypass_hosts ({}) was not applied because MITM is off: list them under \
+             \"Bypass MITM hosts\" in the HTTPS MITM tab after choosing a CA",
+            m.bypass_hosts.join(", ")
+        ));
+    }
     None
 }
 
@@ -581,6 +591,7 @@ fn mitm_to_file(mitm: &MitmConfig, notes: &mut Vec<String>) -> MitmFile {
             _ => Vec::new(),
         },
         insecure: (mitm.upstream_tls_mode == MitmUpstreamTlsMode::InsecureAll).then_some(true),
+        bypass_hosts: mitm.bypass_hosts.clone(),
         ..MitmFile::default()
     }
 }
@@ -1402,6 +1413,8 @@ pub fn export_rusty_conduit_switch_toml(
         profiles.insert(p.name.clone(), out);
     }
 
+    let routing = proxy.routing.clone();
+
     let (allow, block) = filter_to_file(&proxy.filter);
     let l = &proxy.listeners;
     let n = &proxy.network;
@@ -1422,7 +1435,7 @@ pub fn export_rusty_conduit_switch_toml(
         mitm: proxy.mitm.as_ref().map(|m| mitm_to_file(m, &mut notes)),
         logging: Some(logging_to_file(&proxy.logging)),
         profiles,
-        routing: Some(proxy.routing.clone()),
+        routing: Some(routing),
         ..SwitchFile::default()
     };
     let toml = header(CLI, proxy) + &to_toml(&file)? + &placeholders;
@@ -1716,10 +1729,12 @@ inherit = true
                     ca: Some(MitmCaId::new()),
                     upstream_tls_mode: mode,
                     insecure_hosts: hosts.clone(),
+                    bypass_hosts: vec!["*.bank.example".into(), "192.0.2.0/24".into()],
                     ..MitmConfig::default()
                 });
                 let out = export_cli_toml(format, &proxy, std::slice::from_ref(&tunnel)).unwrap();
                 let toml = &out.toml;
+                assert!(toml.contains("bypass_hosts = [\"*.bank.example\", \"192.0.2.0/24\"]"), "{toml}");
                 assert_eq!(toml.contains("insecure = true"), mode == MitmUpstreamTlsMode::InsecureAll, "{toml}");
                 assert_eq!(
                     toml.contains("insecure_hosts = [\"localhost\", \"*.corp.local\", \"10.0.0.0/8\"]"),
@@ -1744,6 +1759,11 @@ inherit = true
                 assert!(warnings.0.is_none());
                 let notice = warnings.1.iter().any(|w| w.contains("Upstream TLS certificates"));
                 assert_eq!(notice, mode != MitmUpstreamTlsMode::Strict, "{:?}", warnings.1);
+                assert!(
+                    warnings.1.iter().any(|w| w.contains("bypass_hosts (*.bank.example, 192.0.2.0/24)")),
+                    "{:?}",
+                    warnings.1
+                );
             }
         }
     }
@@ -1757,8 +1777,8 @@ inherit = true
         assert_eq!(upstream_tls_of(&file), (MitmUpstreamTlsMode::Allowlist, vec!["a.example".into()]));
         let file: MitmFile = toml::from_str("insecure = false\n").unwrap();
         assert_eq!(upstream_tls_of(&file), (MitmUpstreamTlsMode::Strict, Vec::new()));
-        // Every CLI's `[mitm]` accepts both keys.
-        let keys = "insecure = true\ninsecure_hosts = [\"a.example\"]\n";
+        // Every CLI's `[mitm]` accepts these keys.
+        let keys = "insecure = true\ninsecure_hosts = [\"a.example\"]\nbypass_hosts = [\"*.bank.example\"]\n";
         let conduit = CONDUIT_TOML.replacen("[mitm]\n", &format!("[mitm]\n{keys}"), 1);
         assert_ne!(conduit, CONDUIT_TOML);
         for (cli_toml, format) in [
@@ -2112,5 +2132,21 @@ inherit = true
             );
             assert!(ok);
         }
+    }
+
+    #[test]
+    fn toml_io_switch_export_round_trips_bypass_mitm() {
+        let mut imported = import_rusty_conduit_switch_toml(SWITCH_TOML, "auto").unwrap().proxy;
+        imported.routing.rules[0].bypass_mitm = true;
+        let out = export_rusty_conduit_switch_toml(&imported, &[]).unwrap();
+        assert!(out.toml.contains("bypass_mitm = true"), "export must write bypass_mitm: {}", out.toml);
+        assert!(
+            !out.notes.iter().any(|n| n.contains("MITM bypass")),
+            "no MITM bypass note expected, got {:?}",
+            out.notes
+        );
+        let back = import_rusty_conduit_switch_toml(&out.toml, "auto").unwrap();
+        assert!(back.proxy.routing.rules[0].bypass_mitm);
+        assert!(!back.proxy.routing.rules[1].bypass_mitm);
     }
 }

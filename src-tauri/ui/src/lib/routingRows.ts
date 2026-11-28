@@ -286,12 +286,14 @@ function stripSimpleMatchers(rule: RoutingRule): RoutingRule {
     target: Array.isArray(rule.target) ? (rule.target[0] ?? "direct") : rule.target,
   };
   if (rule.name !== undefined) next.name = rule.name;
+  if (rule.bypass_mitm) next.bypass_mitm = true;
   return next;
 }
 
 /**
  * Replaces the rule's condition with a single simple condition of `kind` and `value`.
- * Clears all other simple matchers and preserves `name`, `disabled`, and primary `target`.
+ * Clears all other simple matchers and preserves `name`, `disabled`, `bypass_mitm` (cleared for
+ * URL conditions, which require MITM), and primary `target`.
  */
 export function applySimpleCondition(
   rule: RoutingRule,
@@ -299,6 +301,7 @@ export function applySimpleCondition(
   value: string,
 ): RoutingRule {
   const next = stripSimpleMatchers(rule);
+  if (isUrlConditionKind(kind)) delete next.bypass_mitm;
   switch (kind) {
     case "host_wildcard": {
       const v = toOneOrMany(splitPipe(value));

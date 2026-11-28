@@ -256,6 +256,13 @@ function mitmErrors(errors: FieldErrors, mitm: MitmConfig): void {
       break;
     }
   }
+  for (const rule of mitm.bypass_hosts) {
+    const problem = filterRuleError(rule);
+    if (problem) {
+      errors["mitm.bypass_hosts"] = problem;
+      break;
+    }
+  }
 }
 
 function keepaliveErrors(errors: FieldErrors, tunnel: TunnelConfig, prefix = "tunnel"): void {

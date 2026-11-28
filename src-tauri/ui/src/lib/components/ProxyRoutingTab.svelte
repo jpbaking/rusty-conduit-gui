@@ -55,6 +55,7 @@
     if (ports.length > 0) chips.push(`port: ${ports.join(", ")}`);
     if (rule.host_levels) chips.push(`levels: ${rule.host_levels.min ?? 0}–${rule.host_levels.max ?? "∞"}`);
     if (rule.resolve_dns !== undefined) chips.push(rule.resolve_dns ? "resolve DNS" : "no DNS");
+    if (rule.bypass_mitm) chips.push("bypass MITM");
     return chips;
   }
 
@@ -80,6 +81,7 @@
     match_all: boolean;
     disabled: boolean;
     resolve_dns: "inherit" | "on" | "off";
+    bypass_mitm: boolean;
     target: string[];
   }
 
@@ -97,6 +99,7 @@
       match_all: rule.match_all,
       disabled: rule.disabled,
       resolve_dns: rule.resolve_dns === undefined ? "inherit" : rule.resolve_dns ? "on" : "off",
+      bypass_mitm: Boolean(rule.bypass_mitm),
       target: targetList(rule.target),
     };
   }
@@ -121,6 +124,7 @@
       if (form.levelsMax.trim()) rule.host_levels.max = Number(form.levelsMax);
     }
     if (form.resolve_dns !== "inherit") rule.resolve_dns = form.resolve_dns === "on";
+    if (form.bypass_mitm) rule.bypass_mitm = true;
     return rule;
   }
 
@@ -165,6 +169,7 @@
   const uid = $props.id();
   const proxy = $derived(store.proxyDraft as Proxy);
   const routing = $derived(proxy.routing);
+  const showMitmBypass = $derived(proxy.mitm !== null);
   const errors = $derived(store.proxyDraftErrors);
   const tunnels = $derived(store.tunnels.map((t) => t.profile));
   const profileGroups = $derived(buildProfileOptionGroups(tunnels, proxy.profiles));
@@ -272,6 +277,17 @@
     const rule = rules[index];
     if (!rule) return;
     setRule(index, { ...rule, disabled: !enabled });
+  }
+
+  function toggleBypassMitm(index: number, bypass: boolean) {
+    const rule = rules[index];
+    if (!rule) return;
+    if (bypass) {
+      setRule(index, { ...rule, bypass_mitm: true });
+    } else {
+      const { bypass_mitm: _dropped, ...rest } = rule;
+      setRule(index, rest);
+    }
   }
 
   function removeRule(index: number) {
@@ -625,6 +641,14 @@
             <th class="col-type">Condition type</th>
             <th class="col-details">Condition details</th>
             <th class="col-profile">Profile</th>
+            {#if showMitmBypass}
+              <th
+                class="col-mitm-bypass"
+                title="Skip HTTPS MITM interception for matching requests (use an opaque tunnel instead)"
+              >
+                Bypass MITM
+              </th>
+            {/if}
             <th class="col-delete"><span class="sr-only">Delete</span></th>
           </tr>
         </thead>
@@ -834,6 +858,21 @@
                   )}
                 {/if}
               </td>
+              {#if showMitmBypass}
+                {@const urlRule = isUrlConditionKind(kind) || usesUrl(rule)}
+                <td class="col-mitm-bypass">
+                  <input
+                    type="checkbox"
+                    checked={!urlRule && Boolean(rule.bypass_mitm)}
+                    disabled={urlRule}
+                    aria-label={`Rule ${index + 1} bypass MITM`}
+                    title={urlRule
+                      ? "URL conditions require MITM to inspect HTTPS URLs"
+                      : "Skip HTTPS MITM interception for matching requests"}
+                    onchange={(e) => toggleBypassMitm(index, e.currentTarget.checked)}
+                  />
+                </td>
+              {/if}
               <td class="col-delete">
                 <button
                   type="button"
@@ -887,6 +926,9 @@
                   )}
                 {/if}
               </td>
+              {#if showMitmBypass}
+                <td class="col-mitm-bypass" aria-hidden="true"></td>
+              {/if}
               <td class="col-delete" aria-hidden="true"></td>
             </tr>
           {/if}
@@ -968,6 +1010,12 @@
         Match all (matches every request unconditionally; multiple conditions on one rule are always ANDed)
       </label>
       <label class="check"><input type="checkbox" bind:checked={form.disabled} /> Disabled</label>
+      {#if showMitmBypass}
+        <label class="check">
+          <input type="checkbox" bind:checked={form.bypass_mitm} />
+          Bypass HTTPS MITM (tunnel matching HTTPS connections without interception)
+        </label>
+      {/if}
       <div class="matcher-grid">
         {#each LIST_MATCHERS as matcher (matcher.key)}
           <label class="field">
@@ -1037,7 +1085,12 @@
           <dt>Table</dt>
           <dd><code>{result.table}</code></dd>
           <dt>Matched</dt>
-          <dd>{result.matched_rule ?? "Default (everything else)"}</dd>
+          <dd>
+            {result.matched_rule ?? "Default (everything else)"}
+            {#if showMitmBypass && result.bypass_mitm}
+              <span class="pill idle">MITM bypassed</span>
+            {/if}
+          </dd>
           <dt>Route</dt>
           <dd>
             <ol class="plain-list">
@@ -1110,6 +1163,10 @@
   }
   .col-profile .profile-select {
     width: 100%;
+  }
+  .col-mitm-bypass {
+    width: 84px;
+    text-align: center;
   }
   .col-delete {
     width: 32px;

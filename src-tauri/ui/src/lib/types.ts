@@ -234,6 +234,8 @@ export interface MitmConfig {
   upstream_tls_mode: MitmUpstreamTlsMode;
   /** Domain, `*.domain`, IP, or CIDR rules; used only in `allowlist` mode. */
   insecure_hosts: string[];
+  /** Domain, `*.domain`, IP, or CIDR rules for targets that are never intercepted. */
+  bypass_hosts: string[];
 }
 
 export interface TunnelConfig {
@@ -732,6 +734,8 @@ export interface RoutingRule {
   match_all: boolean;
   disabled: boolean;
   resolve_dns?: boolean;
+  /** Skip HTTPS MITM interception when this rule matches a `CONNECT` request (`rusty-conduit-switch` `[[routing.rules]] bypass_mitm`). */
+  bypass_mitm?: boolean;
   target: RouteTarget;
 }
 
@@ -863,6 +867,8 @@ export interface RouteTestResult {
   matched_rule: string | null;
   blocked_by_filter: boolean;
   filter_reason: string | null;
+  /** `true` when the matched rule bypasses HTTPS MITM interception. */
+  bypass_mitm: boolean;
   /** The failover chain, in order. */
   targets: RouteTestTarget[];
 }

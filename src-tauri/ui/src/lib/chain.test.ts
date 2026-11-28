@@ -53,6 +53,7 @@ function profile(hops: HopEntry[], ca: string | null): SessionProfile {
             socks_block_web: false,
             upstream_tls_mode: "strict",
             insecure_hosts: [],
+            bypass_hosts: [],
           },
     tunnel: {
       ip_version: "auto",

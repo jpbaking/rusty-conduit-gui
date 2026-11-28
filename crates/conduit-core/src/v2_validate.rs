@@ -113,6 +113,9 @@ pub fn validate_tunnel(tunnel: &Tunnel) -> Result<(), ValidateError> {
             filter_rules("mitm_insecure_hosts", &mitm.insecure_hosts, |scope, rule, message| {
                 ValidateError::InvalidFilterRule { scope, rule, message }
             })?;
+            filter_rules("mitm_bypass_hosts", &mitm.bypass_hosts, |scope, rule, message| {
+                ValidateError::InvalidFilterRule { scope, rule, message }
+            })?;
         }
     }
 
@@ -217,6 +220,9 @@ fn validate_proxy_inner(
             return Err(ProxyValidateError::CertTtlTooShort(mitm.cert_ttl));
         }
         filter_rules("mitm_insecure_hosts", &mitm.insecure_hosts, |scope, rule, message| {
+            ProxyValidateError::InvalidFilterRule { scope, rule, message }
+        })?;
+        filter_rules("mitm_bypass_hosts", &mitm.bypass_hosts, |scope, rule, message| {
             ProxyValidateError::InvalidFilterRule { scope, rule, message }
         })?;
     }
@@ -500,6 +506,12 @@ mod tests {
             ..MitmConfig::default()
         });
         assert!(validate_proxy(&p, &[id], &[]).is_ok());
+        p.mitm.as_mut().unwrap().bypass_hosts = vec!["*.bank.example".into(), "bad rule".into()];
+        assert!(matches!(
+            validate_proxy(&p, &[id], &[]),
+            Err(ProxyValidateError::InvalidFilterRule { scope: "mitm_bypass_hosts", .. })
+        ));
+        p.mitm.as_mut().unwrap().bypass_hosts = vec!["*.bank.example".into()];
         p.mitm.as_mut().unwrap().insecure_hosts.push("bad rule with spaces".into());
         assert!(matches!(
             validate_proxy(&p, &[id], &[]),
@@ -698,6 +710,16 @@ mod tests {
         validate_tunnel(&t).unwrap();
         t.forward.enabled = true;
         t.mitm.as_mut().unwrap().insecure_hosts = vec!["10.0.0.0/8".into()];
+        validate_tunnel(&t).unwrap();
+        t.mitm.as_mut().unwrap().bypass_hosts = vec!["bad rule".into()];
+        assert!(matches!(
+            validate_tunnel(&t),
+            Err(ValidateError::InvalidFilterRule { scope: "mitm_bypass_hosts", .. })
+        ));
+        t.forward.enabled = false;
+        validate_tunnel(&t).unwrap();
+        t.forward.enabled = true;
+        t.mitm.as_mut().unwrap().bypass_hosts = vec!["*.bank.example".into()];
         validate_tunnel(&t).unwrap();
 
         // Local port forward colliding with active forward proxy port is rejected.

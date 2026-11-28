@@ -519,6 +519,7 @@ function mockRouteTest(args?: Record<string, unknown>): RouteTestResult {
     matched_rule: rule ? (rule.name ?? "rule") : null,
     blocked_by_filter: false,
     filter_reason: null,
+    bypass_mitm: Boolean(rule?.bypass_mitm),
     targets: names.map((name) => ({ name, profile: name, redacted_upstream: name === "direct" ? "direct" : `${name} (redacted)`, bypassed: false })),
   };
 }

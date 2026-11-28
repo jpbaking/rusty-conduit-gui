@@ -295,4 +295,15 @@ describe("routingRows profile option groups and target labels", () => {
     assert.match(formatTargetLabel("@tunnel:gone", tunnels, profiles), /Unknown tunnel/);
     assert.match(formatTargetLabel("missing-prof", tunnels, profiles), /missing-prof/);
   });
+
+  test("preserves bypass_mitm on simple non-URL conditions and clears it for URL conditions", () => {
+    const bypassed = baseRule({ host_wildcard: "*.bank.example", bypass_mitm: true });
+    assert.equal(classifyRule(bypassed), "host_wildcard");
+
+    const switchedHost = applySimpleCondition(bypassed, "host", "bank.example");
+    assert.equal(switchedHost.bypass_mitm, true);
+
+    const switchedUrl = applySimpleCondition(bypassed, "url_wildcard", "*bank.example/api*");
+    assert.equal(switchedUrl.bypass_mitm, undefined);
+  });
 });

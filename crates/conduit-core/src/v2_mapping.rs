@@ -24,7 +24,7 @@ use rusty_conduit_engine::filter::HostFilter;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::mapping::{host_filter, mitm_upstream_tls, parse_rules};
+use crate::mapping::{host_filter, mitm_bypass_hosts, mitm_upstream_tls, parse_rules};
 use crate::model::SecretRef;
 use crate::v2_model::{
     GlobalFilterConfig, Proxy, RouteHostLevels, RouteInbound, RouteOneOrMany, RoutePortSpec,
@@ -91,6 +91,10 @@ pub fn tunnel_to_engine_config(tunnel: &Tunnel) -> Result<EngineConfig, MappingE
             Some(m) if mitm_enabled => mitm_upstream_tls(m)?,
             _ => UpstreamTlsVerification::Strict,
         },
+        bypass_hosts: match &tunnel.mitm {
+            Some(m) if mitm_enabled => mitm_bypass_hosts(m)?,
+            _ => Vec::new(),
+        },
     };
     let socks_block_web_in_mitm = tunnel.socks_block_web
         || (mitm_enabled && tunnel.mitm.as_ref().is_some_and(|m| m.socks_block_web));
@@ -149,7 +153,7 @@ pub fn proxy_server_options(proxy: &Proxy) -> ServerOptions {
 
 /// Map a Proxy's MITM settings into [`MitmOptions`] (`Ok(None)` when MITM is off). `ca` is
 /// always `None`: the runtime loads the CA in memory from the vault. Fails on a malformed
-/// `insecure_hosts` rule in `Allowlist` mode.
+/// `insecure_hosts` rule in `Allowlist` mode or a malformed `bypass_hosts` rule.
 pub fn proxy_mitm_options(proxy: &Proxy) -> Result<Option<MitmOptions>, MappingError> {
     proxy
         .mitm
@@ -162,6 +166,7 @@ pub fn proxy_mitm_options(proxy: &Proxy) -> Result<Option<MitmOptions>, MappingE
                 cert_ttl: m.cert_ttl,
                 cert_cache_max: m.cert_cache_max_entries,
                 upstream_tls: mitm_upstream_tls(m)?,
+                bypass_hosts: mitm_bypass_hosts(m)?,
             })
         })
         .transpose()
@@ -313,6 +318,7 @@ pub(crate) fn rule_config(r: &RoutingRule) -> RuleConfig {
         match_all: r.match_all,
         disabled: r.disabled,
         resolve_dns: r.resolve_dns,
+        bypass_mitm: r.bypass_mitm,
         target: one_or_many(&r.target),
     }
 }
@@ -600,13 +606,34 @@ mod tests {
             }),
             ..Tunnel::default()
         };
+        tunnel.mitm.as_mut().unwrap().bypass_hosts = vec!["*.bank.example".into()];
         tunnel.forward.enabled = false;
         let cfg = tunnel_to_engine_config(&tunnel).unwrap();
         assert_eq!(cfg.mitm_options.upstream_tls, UpstreamTlsVerification::Strict);
+        assert!(cfg.mitm_options.bypass_hosts.is_empty());
         tunnel.forward.enabled = true;
         tunnel.forward.http_port = 8128;
         let cfg = tunnel_to_engine_config(&tunnel).unwrap();
         assert_eq!(cfg.mitm_options.upstream_tls, UpstreamTlsVerification::InsecureAll);
+        assert_eq!(cfg.mitm_options.bypass_hosts, vec![FilterRule::from_str("*.bank.example").unwrap()]);
+    }
+
+    #[test]
+    fn proxy_maps_mitm_bypass_hosts() {
+        let mut proxy = Proxy { name: "p".into(), ..Proxy::default() };
+        proxy.mitm = Some(MitmConfig {
+            bypass_hosts: vec!["*.bank.example".into(), "10.0.0.0/8".into()],
+            ..MitmConfig::default()
+        });
+        assert_eq!(
+            proxy_mitm_options(&proxy).unwrap().unwrap().bypass_hosts,
+            vec![FilterRule::from_str("*.bank.example").unwrap(), FilterRule::from_str("10.0.0.0/8").unwrap()]
+        );
+        proxy.mitm.as_mut().unwrap().bypass_hosts.push("bad rule".into());
+        assert!(matches!(
+            proxy_mitm_options(&proxy),
+            Err(MappingError::InvalidFilterRule { scope: "mitm_bypass_hosts", .. })
+        ));
     }
 
     fn full_proxy() -> (Proxy, TunnelId, SecretRef) {
