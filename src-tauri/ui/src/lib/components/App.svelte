@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { store } from "../stores.svelte";
+  import AboutView from "./AboutView.svelte";
   import HeaderBar from "./HeaderBar.svelte";
   import HostKeyModal from "./HostKeyModal.svelte";
   import HostProfilesView from "./HostProfilesView.svelte";
@@ -227,6 +228,8 @@
       <ProfileLibraryView />
     {:else if store.view === "keys" || store.view === "vault"}
       <KeyVaultView />
+    {:else if store.view === "about"}
+      <AboutView />
     {:else}
       <SettingsView />
     {/if}

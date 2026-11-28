@@ -55,6 +55,7 @@ export type NavView =
   | "profileLibrary"
   | "vault"
   | "settings"
+  | "about"
   | "sessions"
   | "keys";
 

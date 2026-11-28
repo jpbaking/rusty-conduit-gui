@@ -25,9 +25,29 @@ jobs:
     name: Verify
     uses: ./.github/workflows/ci.yml
 
+  # The tag carries the full release version (v0.2.0-beta.6); the version files hold X.Y.Z,
+  # because MSI and RPM versions cannot carry a pre-release label.
+  version:
+    name: Release version
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Resolve the release version from the tag
+        id: resolve
+        run: |
+          python3 scripts/release-version.py --ref-type "$GITHUB_REF_TYPE" --ref-name "$GITHUB_REF_NAME" \
+            --sha "$GITHUB_SHA" --github-output "$GITHUB_OUTPUT"
+
   package:
     name: Package (${{ matrix.name }})
-    needs: verify
+    needs: [verify, version]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -77,6 +97,8 @@ jobs:
     env:
       TARGET: ${{ matrix.target }}
       BUNDLE_DIR: target/${{ matrix.target }}/release/bundle
+      # Read by the frontend build (About page) and the app binary (`--version`).
+      CONDUIT_RELEASE_VERSION: ${{ needs.version.outputs.version }}
       # The secrets context is not available in step `if` conditions.
       HAS_WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE != '' }}
     steps:
@@ -208,11 +230,21 @@ jobs:
           out="$PWD/release-files"
           cd "$BUNDLE_DIR"
           # The product name "Rusty Conduit GUI" names the installers. Release assets get a
-          # name without spaces or parentheses, which GitHub would otherwise rewrite.
-          asset_name() { basename "$1" | tr ' ' '-' | tr -d '()'; }
+          # name without spaces or parentheses, which GitHub would otherwise rewrite, and the
+          # full release version in place of the X.Y.Z Tauri wrote (0.2.0 -> 0.2.0-beta.6).
+          base="${CONDUIT_RELEASE_VERSION%%-*}"
+          asset_name() {
+            local name
+            name="$(basename "$1" | tr ' ' '-' | tr -d '()')"
+            case "$name" in
+              *"$base"*) printf '%s\n' "${name%%"$base"*}$CONDUIT_RELEASE_VERSION${name#*"$base"}" ;;
+              *) echo "::error::$name does not contain version $base" >&2; return 1 ;;
+            esac
+          }
           for file in $ARTIFACTS; do
             if [ ! -f "$file" ]; then echo "::error::No file matches $file"; exit 1; fi
-            cp "$file" "$out/$(asset_name "$file")"
+            name="$(asset_name "$file")"
+            cp "$file" "$out/$name"
           done
           # An artifact upload drops symlinks and file modes, so the .app must travel as a tar.
           if [ "$RUNNER_OS" = "macOS" ]; then
@@ -221,7 +253,8 @@ jobs:
               echo "::error::Expected one .app in macos/, found: ${apps[*]}"; exit 1
             fi
             for dmg in dmg/*.dmg; do
-              tar -czf "$out/$(asset_name "$dmg" | sed 's/\.dmg$//').app.tar.gz" -C macos "$(basename "${apps[0]}")"
+              name="$(asset_name "$dmg")"
+              tar -czf "$out/${name%.dmg}.app.tar.gz" -C macos "$(basename "${apps[0]}")"
             done
           fi
 
@@ -234,7 +267,7 @@ jobs:
 
   release:
     name: Release
-    needs: package
+    needs: [package, version]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -266,4 +299,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: gh release create "$GITHUB_REF_NAME" --draft --verify-tag --generate-notes -- *
+          PRERELEASE: ${{ needs.version.outputs.prerelease }}
+        run: |
+          # A tag with a label (v0.2.0-beta.6) is published as a GitHub pre-release.
+          extra=()
+          if [ "$PRERELEASE" = "true" ]; then extra=(--prerelease); fi
+          gh release create "$GITHUB_REF_NAME" --draft --verify-tag --generate-notes "${extra[@]}" -- *

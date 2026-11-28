@@ -110,6 +110,9 @@ pub fn run() {
         // Native open and save dialogs for file paths. Only those two are allowed, in
         // `capabilities/default.json`; the plugin's file-system access is not granted.
         .plugin(tauri_plugin_dialog::init())
+        // Opens the About links in the default browser. `capabilities/default.json` scopes it
+        // to the project's own web pages.
+        .plugin(tauri_plugin_opener::init())
         .manage(ShellState::default())
         .on_window_event(window::on_window_event)
         .invoke_handler(commands::ipc_handler!())

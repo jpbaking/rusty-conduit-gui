@@ -3,5 +3,17 @@
   "identifier": "default",
   "description": "Minimal capability for the Manage Window.",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:allow-open", "dialog:allow-save"]
+  "permissions": [
+    "core:default",
+    "dialog:allow-open",
+    "dialog:allow-save",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        { "url": "https://jpbaking.github.io/rusty-conduit-series/*" },
+        { "url": "https://github.com/jpbaking/rusty-conduit-gui" },
+        { "url": "https://github.com/jpbaking/rusty-conduit-gui/*" }
+      ]
+    }
+  ]
 }

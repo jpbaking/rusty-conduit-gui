@@ -74,9 +74,19 @@ impl CliFlags {
     }
 }
 
-/// The `--version` output: the binary name and its version.
+/// The full app version. Release builds get it from the tag through `CONDUIT_RELEASE_VERSION`
+/// (`0.2.0-beta.6`, checked against the package version by `scripts/release-version.py`); any
+/// other build is a development build of the package version (`0.2.0-dev`).
+pub fn app_version() -> &'static str {
+    match option_env!("CONDUIT_RELEASE_VERSION") {
+        Some(version) if !version.is_empty() => version,
+        _ => concat!(env!("CARGO_PKG_VERSION"), "-dev"),
+    }
+}
+
+/// The `--version` output: the binary name and its full version.
 pub fn version_text() -> String {
-    format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+    format!("{} {}", env!("CARGO_PKG_NAME"), app_version())
 }
 
 /// The `--help` output: a usage line and every flag this app understands.
@@ -211,8 +221,11 @@ mod tests {
     #[test]
     fn platform_version_text_names_package_and_version() {
         let text = version_text();
-        assert_eq!(text, format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")));
+        assert_eq!(text, format!("{} {}", env!("CARGO_PKG_NAME"), app_version()));
         assert!(text.starts_with("rusty-conduit-gui "));
+        // The tag's version, or a dev build, always starts with the package's X.Y.Z.
+        let rest = app_version().strip_prefix(env!("CARGO_PKG_VERSION")).unwrap();
+        assert!(rest.is_empty() || rest.starts_with('-'), "{}", app_version());
     }
 
     #[test]

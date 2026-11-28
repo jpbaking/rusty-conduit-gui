@@ -19,6 +19,7 @@
     { view: "profileLibrary", label: "Profile Library" },
     { view: "vault", label: "Vault", also: ["keys"] },
     { view: "settings", label: "Settings" },
+    { view: "about", label: "About" },
   ];
 
   const query = $derived(store.search.trim().toLowerCase());

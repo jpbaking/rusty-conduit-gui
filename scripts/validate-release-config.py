@@ -14,7 +14,7 @@ PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 PNG_SIZES = {"32x32.png": 32, "128x128.png": 128, "128x128@2x.png": 256}
 REQUIRED_JOBS = {
     "ci.yml": {"frontend", "rust-and-e2e"},
-    "release.yml": {"verify", "package", "release"},
+    "release.yml": {"verify", "version", "package", "release"},
 }
 CI_OSES = {"ubuntu-22.04", "macos-latest", "windows-latest"}
 FRONTEND_COMMANDS = ("npm ci", "npm run check", "npm test", "npm run build")
@@ -38,7 +38,10 @@ PACKAGE_COMMANDS = (
     "tauri build --config src-tauri/tauri.bundle.conf.json",
     "scripts/smoke-test-bundle.py",
 )
-RELEASE_COMMANDS = ("SHA256SUMS.txt", "gh release create", "--draft")
+RELEASE_COMMANDS = ("SHA256SUMS.txt", "gh release create", "--draft", "--prerelease")
+# The tag's full version (v0.2.0-beta.6 -> 0.2.0-beta.6) labels the app and every asset.
+VERSION_COMMANDS = ("scripts/release-version.py", '--ref-name "$GITHUB_REF_NAME"', "--github-output")
+RELEASE_VERSION_ENV = "CONDUIT_RELEASE_VERSION"
 # v0.2.0 (rusty-conduit-gui) replaces v0.1.0 (rusty-conduit-ssh-gui).
 LEGACY_PACKAGE = "rusty-conduit-ssh-gui"
 LEGACY_UPGRADE_FIELDS = {"deb": ("replaces", "conflicts"), "rpm": ("obsoletes", "conflicts")}
@@ -247,6 +250,13 @@ def job_uses(job):
     return {step.get("uses", "").split("@")[0] for step in steps if isinstance(step, dict)}
 
 
+def as_list(value):
+    """A job's `needs`, which may be one name or a list."""
+    if isinstance(value, str):
+        return [value]
+    return list(value) if isinstance(value, list) else []
+
+
 def job_matrix(job):
     strategy = job.get("strategy", {}) if isinstance(job, dict) else {}
     matrix = strategy.get("matrix", {}) if isinstance(strategy, dict) else {}
@@ -307,12 +317,23 @@ def check_release(document, text, errors):
     if verify.get("uses") != "./.github/workflows/ci.yml":
         errors.append("release.yml: verify must call ./.github/workflows/ci.yml")
 
+    version = jobs.get("version", {})
+    require_commands("release.yml", "version", version, VERSION_COMMANDS, errors)
+    outputs = version.get("outputs", {}) if isinstance(version, dict) else {}
+    if not {"version", "prerelease"} <= set(outputs or {}):
+        errors.append("release.yml: version job must output version and prerelease")
+
     package = jobs.get("package")
     if not isinstance(package, dict):
         errors.append("release.yml: missing required job package")
         return
-    if package.get("needs") != "verify":
-        errors.append("release.yml: package must need verify")
+    if sorted(as_list(package.get("needs"))) != ["verify", "version"]:
+        errors.append("release.yml: package must need verify and version")
+    package_env = package.get("env") or {}
+    if "needs.version.outputs.version" not in str(package_env.get(RELEASE_VERSION_ENV, "")):
+        errors.append(f"release.yml: package must set {RELEASE_VERSION_ENV} from the version job")
+    if "$CONDUIT_RELEASE_VERSION" not in job_runs(package):
+        errors.append("release.yml: release assets must be named with $CONDUIT_RELEASE_VERSION")
     include = job_matrix(package).get("include", [])
     found = {entry.get("name"): (entry.get("os"), entry.get("target")) for entry in include}
     if found != RELEASE_TARGETS:
@@ -331,6 +352,8 @@ def check_release(document, text, errors):
 
     release = jobs.get("release", {})
     require_commands("release.yml", "release", release, RELEASE_COMMANDS, errors)
+    if "version" not in as_list(release.get("needs") if isinstance(release, dict) else None):
+        errors.append("release.yml: release must need version, to mark pre-releases")
     steps = release.get("steps", []) if isinstance(release, dict) else []
     publish = [s for s in steps if isinstance(s, dict) and "gh release create" in s.get("run", "")]
     condition = publish[0].get("if", "") if publish else ""

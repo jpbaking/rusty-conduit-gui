@@ -1,4 +1,5 @@
-// Minimal types for the Node built-ins the `*.test.ts` files use. There is no `@types/node` here.
+// Minimal types for the Node built-ins the `*.test.ts` files and `vite.config.ts` use. There is no
+// `@types/node` here.
 
 declare module "node:test" {
   type TestFn = () => void | Promise<void>;
@@ -16,4 +17,8 @@ declare module "node:assert/strict" {
     match(value: string, pattern: RegExp, message?: string): void;
   };
   export default assert;
+}
+
+declare module "node:fs" {
+  export function readFileSync(path: URL, encoding: "utf8"): string;
 }

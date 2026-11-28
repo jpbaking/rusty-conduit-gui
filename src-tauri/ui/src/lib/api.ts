@@ -3,6 +3,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import type {
   AccessRecordView,
   AirSwitchCommitResult,
@@ -95,6 +96,19 @@ export function errorMessage(error: unknown): string {
 /** True inside the Tauri webview. */
 export const hasBackend = (): boolean =>
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+
+/**
+ * Opens a web page in the default browser. The desktop app only allows the project's own pages
+ * (`opener:allow-open-url` in `capabilities/default.json`); the dev preview opens a new tab.
+ */
+export async function openExternal(url: string): Promise<void> {
+  try {
+    if (hasBackend()) return await openUrl(url);
+    window.open(url, "_blank", "noopener,noreferrer");
+  } catch (error) {
+    throw toApiError(error);
+  }
+}
 
 async function call<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   try {

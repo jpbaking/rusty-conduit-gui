@@ -14,6 +14,7 @@ Owns everything under `src-tauri/ui/`. Inherits all root and `../DOX.md` rules a
 - `src/lib/types.ts` field names match the serialized Rust structs; change both sides together.
 - `src/lib/api.ts` is the only IPC client. Secret arguments are write-only; no secret ever enters `src/lib/stores.svelte.ts` or other UI state, and secret inputs are cleared before any request is awaited.
 - Client-side rules (`src/lib/validate.ts`, `src/lib/password.ts`) mirror backend rules (`../src/controller/password.rs`, `../../crates/conduit-core`); keep them in sync.
+- Web links open only through `openExternal` in `src/lib/api.ts`, never by navigating the Manage Window. The desktop app allows only the URLs listed under `opener:allow-open-url` in `../capabilities/default.json`; add a new link's URL there.
 - Tests run with Node's built-in runner (`node --experimental-strip-types --test`); there is no `@types/node` (see `src/lib/node-test.d.ts`).
 
 ## Verification
@@ -29,7 +30,8 @@ Owns everything under `src-tauri/ui/`. Inherits all root and `../DOX.md` rules a
 - **Key vault and MITM CAs** — SSH keys, CA vault, and vault unlock. Start: `src/lib/components/KeyVaultView.svelte`. Files: `src/lib/components/AddKeyModal.svelte`, `src/lib/components/CaVaultSection.svelte`, `src/lib/components/AddCaModal.svelte`, `src/lib/components/VaultUnlockModal.svelte`.
 - **Settings and backups** — vault settings, master password rules, backups and import, port-forward presets. Start: `src/lib/components/SettingsView.svelte`. Files: `src/lib/components/VaultSettingsSection.svelte`, `src/lib/components/PasswordRules.svelte`, `src/lib/components/BackupSection.svelte`, `src/lib/components/ImportModal.svelte`, `src/lib/components/ForwardPresetsSection.svelte`, `src/lib/password.ts`.
 - **Shared form controls and helpers** — fields, switches, modal, file dialogs, port mux, validation, and formatting. Start: `src/lib/validate.ts`. Files: `src/lib/components/PortField.svelte`, `src/lib/components/NumberField.svelte`, `src/lib/components/ProxySwitch.svelte`, `src/lib/components/MuxCheckbox.svelte`, `src/lib/components/ModalDialog.svelte`, `src/lib/components/BrowseButton.svelte`, `src/lib/fileDialog.ts`, `src/lib/portMux.svelte.ts`, `src/lib/format.ts`.
-- **Unit tests** — pure-helper tests. Start: `src/lib/validate.test.ts`. Files: `src/lib/chain.test.ts`, `src/lib/format.test.ts`, `src/lib/password.test.ts`, `src/lib/portForwards.test.ts`, `src/lib/routingRows.test.ts`.
+- **About** — logo, release version with its label pill (`beta`, or `dev` for local builds), engine tag, description, and project links opened in the default browser. Start: `src/lib/components/AboutView.svelte`. Files: `src/lib/version.ts`, `vite.config.ts` (`__APP_VERSION__` from `CONDUIT_RELEASE_VERSION`, `__ENGINE_VERSION__`), `src/lib/api.ts` (`openExternal`).
+- **Unit tests** — pure-helper tests. Start: `src/lib/validate.test.ts`. Files: `src/lib/version.test.ts`, `src/lib/chain.test.ts`, `src/lib/format.test.ts`, `src/lib/password.test.ts`, `src/lib/portForwards.test.ts`, `src/lib/routingRows.test.ts`.
 
 ## Child DOX Index
 - (none)

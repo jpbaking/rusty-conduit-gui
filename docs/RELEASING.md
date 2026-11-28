@@ -12,9 +12,11 @@ This runbook covers how to cut a release, build installers locally, configure si
 
 Every release also includes `SHA256SUMS.txt`.
 
+Every asset is named with the tag's full version, for example `Rusty-Conduit-GUI_0.2.0-beta.6_amd64.deb` or `Rusty-Conduit-GUI-0.2.0-beta.6-1.x86_64.rpm` for tag `v0.2.0-beta.6`.
+
 ## 1. Bump the version
 
-Set the same `X.Y.Z` in all three files:
+Set the same plain `X.Y.Z` in all three files. Never put a label such as `-beta.6` in them: MSI and RPM versions cannot carry one. The label lives only in the tag (see below).
 
 - `src-tauri/Cargo.toml` (`[package]` version)
 - `src-tauri/tauri.conf.json`
@@ -28,7 +30,21 @@ cargo update --workspace
 python3 scripts/validate-release-config.py
 ```
 
-Tags use the format `vX.Y.Z`, for example `v0.2.0`. The tag must point at the commit that contains the version bump.
+Tags use the format `vX.Y.Z` for a final release or `vX.Y.Z-<label>` for a pre-release, for example `v0.2.0-beta.6`. The tag's `X.Y.Z` must equal the version files, and the tag must point at the commit that contains them. Successive betas of one version keep the same files and only move the tag number (`v0.2.0-beta.6`, `v0.2.0-beta.7`, …).
+
+The release workflow turns the tag into the **release version** with `scripts/release-version.py` (`v0.2.0-beta.6` → `0.2.0-beta.6`) and fails early when the tag's `X.Y.Z` does not match the files. That version, passed to the build as `CONDUIT_RELEASE_VERSION`, appears in:
+
+- the About page and `rusty-conduit-gui --version`;
+- every release asset's file name;
+- the GitHub Release, which is marked a **pre-release** when the tag has a label.
+
+Builds outside the release workflow (local builds, `npm run dev`, CI) show `X.Y.Z-dev`. A manual dry run shows `X.Y.Z-dev.<short sha>`. Installers and the operating system's app list still show the plain `X.Y.Z`.
+
+To check a tag before pushing it:
+
+```sh
+python3 scripts/release-version.py --ref-type tag --ref-name v0.2.0-beta.6
+```
 
 ## 2. Engine dependency
 
@@ -128,11 +144,11 @@ Linux builds run on Ubuntu 22.04, so the binaries link against its glibc (the co
 3. Tag the release and push the tag:
 
    ```sh
-   git tag -a vX.Y.Z -m "vX.Y.Z"
-   git push origin vX.Y.Z
+   git tag -a vX.Y.Z-beta.N -m "vX.Y.Z-beta.N"   # or vX.Y.Z for a final release
+   git push origin vX.Y.Z-beta.N
    ```
 
-4. Wait for the workflow. It runs the CI gates, builds all five targets, smoke-tests them, and creates a **draft** GitHub Release.
+4. Wait for the workflow. It checks the tag against the version files, runs the CI gates, builds all five targets, smoke-tests them, and creates a **draft** GitHub Release (a pre-release for a labelled tag) whose assets carry the tag's version.
 5. Download the draft's files and verify them with `sha256sum --check SHA256SUMS.txt`.
 6. Complete the checklist below.
 7. Edit the release notes and publish the draft.
@@ -143,7 +159,7 @@ Automated checks confirm that the installers exist, contain both binaries, and (
 
 ### All platforms
 
-- [ ] The app installs and launches, and the version is correct.
+- [ ] The app installs and launches, and **About** and `rusty-conduit-gui --version` show the tag's version (for example `0.2.0-beta.6`, with a **BETA** pill), not `-dev`.
 - [ ] A vault can be created, locked, and unlocked.
 - [ ] **Upgrade from v0.1.0:** with `rusty-conduit-ssh-gui` installed and holding data, installing v0.2.0 replaces it. The first launch shows the rename banner, and the old vault, sessions, host-key pins, and presets load unchanged.
 - [ ] A direct SSH connection works, and an unknown host key prompts for approval.
