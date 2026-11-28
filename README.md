@@ -2,6 +2,11 @@
 
 One system tray app and **Manage Window** for the whole Rusty Conduit proxy family. Build local **Proxies** whose traffic goes direct, through **SSH Tunnels**, through other upstream proxies, or wherever **Auto Switch** rules send it. Save, run, autostart, and auto-reconnect them all at once, without touching `~/.ssh`.
 
+> [!IMPORTANT]
+> **For development, testing, labs, and homelabs.** These tools are well tested and built
+> with care, but nothing here is promised to be production-ready, and the proxies have **no
+> inbound authentication**. Keep them on loopback or a private network you control.
+
 Built with Tauri v2, Svelte 5, and TypeScript over a UI-agnostic Rust workspace that embeds the shared [`rusty-conduit-engine`](https://github.com/jpbaking/rusty-conduit-engine) `v0.6.0`. It replaces the earlier **Rusty Conduit (SSH)** app (`rusty-conduit-ssh-gui` `v0.1.0`); see [Upgrading from v0.1.0](docs/RELEASING.md#8-upgrading-from-v010-rusty-conduit-ssh-gui).
 
 ## Features
