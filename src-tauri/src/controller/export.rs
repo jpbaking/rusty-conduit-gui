@@ -29,9 +29,11 @@ use conduit_core::{
     OpenSshOptions, Proxy, ProxyId, SecretRef, SessionProfile, SourceMode, Tunnel, TunnelId,
     UpstreamPasswordSource, UpstreamProfile, VaultCaMeta, VaultKeyMeta,
 };
+// An import file chooses its own Argon2 cost, so a hostile one must not be able to hang the app;
+// `conduit_vault` owns the `MAX_ARGON_*` caps and also enforces them on every derivation.
 use conduit_vault::{
     decrypt_record, derive_master_key, encrypt_record, generate_dek, Argon2Params, Dek, VaultError,
-    UPSTREAM_PASSWORD_RECORD,
+    MAX_ARGON_MEMORY_KIB, MAX_ARGON_PARALLELISM, MAX_ARGON_TIME_COST, UPSTREAM_PASSWORD_RECORD,
 };
 use rusty_conduit_engine::routing::{PROFILE_BLOCK, PROFILE_DIRECT};
 use serde::{Deserialize, Serialize};
@@ -62,10 +64,6 @@ const MAX_IMPORT_BYTES: u64 = 64 * 1024 * 1024;
 /// What an untrusted `openssh.ssh_bin` is reset to.
 const DEFAULT_SSH_BIN: &str = "ssh";
 
-// An import file chooses its own Argon2 cost, so a hostile one must not be able to hang the app.
-const MAX_ARGON_MEMORY_KIB: u32 = 1024 * 1024;
-const MAX_ARGON_TIME_COST: u32 = 64;
-const MAX_ARGON_PARALLELISM: u8 = 16;
 
 #[derive(Deserialize)]
 struct Probe {
@@ -824,8 +822,8 @@ impl AppController {
         plaintext: &[u8],
     ) -> Result<(), AppError> {
         let params = self.argon();
-        let mut salt = generate_dek().to_bytes();
-        salt.truncate(SALT_LEN);
+        // The salt is public; it only borrows the DEK generator's randomness.
+        let salt = generate_dek().to_bytes()[..SALT_LEN].to_vec();
         let key = bundle_key(passphrase.as_bytes(), &params, &salt)?;
         let file = EncryptedExport {
             format: FORMAT.into(),
@@ -2032,8 +2030,8 @@ mod tests {
     /// Writes an encrypted version 1 file of `payload`, sealed under the v1 AAD type.
     fn write_v1_encrypted(c: &AppController, path: &Path, secrets: bool, payload: &[u8]) {
         let params = c.argon();
-        let mut salt = generate_dek().to_bytes();
-        salt.truncate(SALT_LEN);
+        // The salt is public; it only borrows the DEK generator's randomness.
+        let salt = generate_dek().to_bytes()[..SALT_LEN].to_vec();
         let key = bundle_key(BUNDLE_PASS.as_bytes(), &params, &salt).unwrap();
         let record_type = if secrets { BUNDLE_RECORD_TYPE_V1 } else { CONFIG_ONLY_RECORD_TYPE_V1 };
         let file = EncryptedExport {

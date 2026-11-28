@@ -12,6 +12,9 @@ pub const MAX_BASE_LEN: usize = 64;
 pub const MAX_DIR_LEN: usize = 80;
 
 const CREATE_ATTEMPTS: usize = 16;
+/// Empty file in every runtime directory, so the startup sweep only removes directories this
+/// app created (the macOS base is the shared `/tmp`).
+const RUNTIME_MARKER: &str = ".rusty-conduit-runtime";
 
 /// A private directory that is deleted when this value is dropped.
 #[derive(Debug)]
@@ -25,7 +28,7 @@ impl RuntimeDir {
         Self::create_in(&default_base()?)
     }
 
-    /// Creates `<base>/rc-<short_hex>`, mode `0700` on Unix.
+    /// Creates `<base>/rc-<short_hex>`, mode `0700` on Unix, holding the sweep marker.
     pub fn create_in(base: &Path) -> io::Result<Self> {
         let rng = SystemRandom::new();
         for _ in 0..CREATE_ATTEMPTS {
@@ -40,7 +43,12 @@ impl RuntimeDir {
                 ));
             }
             match create_private_dir(&path) {
-                Ok(()) => return Ok(Self { path }),
+                Ok(()) => {
+                    // On failure, dropping `dir` removes the new directory again.
+                    let dir = Self { path };
+                    write_private_file(&dir.path.join(RUNTIME_MARKER), b"")?;
+                    return Ok(dir);
+                }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error),
             }
@@ -81,6 +89,58 @@ pub fn write_private_file(path: &Path, contents: &[u8]) -> io::Result<()> {
     }
     file.write_all(contents)?;
     file.flush()
+}
+
+/// Removes the runtime directories a crashed app left in the default base (its `Drop` never
+/// ran). Call once at startup, before any session starts; the single-instance guard ensures no
+/// other instance is using them. Returns how many were removed.
+pub fn sweep_stale_runtime_dirs() -> io::Result<usize> {
+    sweep_in(&default_base()?)
+}
+
+/// Removes every `<base>/rc-<8 lowercase hex>` directory that holds the runtime marker and,
+/// on Unix, is owned by the current user. Anything else is left alone.
+pub fn sweep_in(base: &Path) -> io::Result<usize> {
+    let entries = match fs::read_dir(base) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if entry.file_name().to_str().is_some_and(is_runtime_dir_name)
+            && is_own_dir(&path)
+            && fs::symlink_metadata(path.join(RUNTIME_MARKER)).is_ok_and(|m| m.is_file())
+            && fs::remove_dir_all(&path).is_ok()
+        {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+/// `rc-` followed by exactly the 8 lowercase hex characters [`RuntimeDir::create_in`] writes.
+fn is_runtime_dir_name(name: &str) -> bool {
+    name.strip_prefix("rc-").is_some_and(|hex| {
+        hex.len() == 8 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    })
+}
+
+/// A real directory (not a symlink), owned by the current user on Unix.
+fn is_own_dir(path: &Path) -> bool {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: `getuid` has no preconditions.
+        if meta.uid() != unsafe { libc::getuid() } {
+            return false;
+        }
+    }
+    meta.is_dir()
 }
 
 fn create_private_dir(path: &Path) -> io::Result<()> {
@@ -187,6 +247,46 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
         assert!(write_private_file(&link, b"overwrite").is_err());
         assert_eq!(fs::read(&target).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn runtime_dir_sweep_removes_only_marked_stale_dirs() {
+        let base = RuntimeDir::create().unwrap();
+        let base = base.path();
+        let stale = base.join("rc-0a1b2c3d");
+        create_private_dir(&stale).unwrap();
+        fs::write(stale.join(RUNTIME_MARKER), b"").unwrap();
+        fs::write(stale.join("agent.sock"), b"x").unwrap();
+        // No marker: a same-named directory this app did not create.
+        create_private_dir(&base.join("rc-0a1b2c3e")).unwrap();
+        // Marked, but the name does not match.
+        for name in ["rc-xyz", "rc-0a1b2c3d0", "other"] {
+            create_private_dir(&base.join(name)).unwrap();
+            fs::write(base.join(name).join(RUNTIME_MARKER), b"").unwrap();
+        }
+        fs::write(base.join("rc-01234567"), b"plain file").unwrap();
+
+        assert_eq!(sweep_in(base).unwrap(), 1);
+        assert!(!stale.exists());
+        for name in [
+            "rc-0a1b2c3e",
+            "rc-xyz",
+            "rc-0a1b2c3d0",
+            "other",
+            "rc-01234567",
+        ] {
+            assert!(base.join(name).exists(), "{name} was removed");
+        }
+        assert_eq!(sweep_in(&base.join("missing")).unwrap(), 0);
+    }
+
+    #[test]
+    fn runtime_dir_holds_the_sweep_marker() {
+        let base = RuntimeDir::create().unwrap();
+        let dir = RuntimeDir::create_in(base.path()).unwrap();
+        assert!(dir.path().join(RUNTIME_MARKER).is_file());
+        let name = dir.path().file_name().unwrap().to_str().unwrap();
+        assert!(is_runtime_dir_name(name), "{name}");
     }
 
     #[test]

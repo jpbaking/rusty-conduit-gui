@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use keyring_core::{CredentialStore, Entry};
 use secrecy::{ExposeSecret, SecretBox};
+use zeroize::Zeroizing;
 use crate::crypto::Dek;
 use crate::VaultError;
 
@@ -48,7 +49,7 @@ impl KeyringBackend for MemoryKeyringBackend {
         let guard = self.store.lock().expect("keyring mutex poisoned");
         let bytes = guard
             .get(vault_id)
-            .map(|s| s.expose_secret().clone())
+            .map(|s| Zeroizing::new(s.expose_secret().clone()))
             .ok_or_else(|| VaultError::KeyringEntryMissing {
                 vault_id: vault_id.to_string(),
             })?;
@@ -56,12 +57,9 @@ impl KeyringBackend for MemoryKeyringBackend {
     }
 
     fn set_dek(&self, vault_id: &str, dek: &Dek) -> Result<(), VaultError> {
-        let bytes = dek.to_bytes();
+        let secret = SecretBox::new(Box::new(dek.with_key(<[u8]>::to_vec)));
         let mut guard = self.store.lock().expect("keyring mutex poisoned");
-        guard.insert(
-            vault_id.to_string(),
-            SecretBox::new(Box::new(bytes)),
-        );
+        guard.insert(vault_id.to_string(), secret);
         Ok(())
     }
 
@@ -153,14 +151,14 @@ impl KeyringBackend for OsKeyringBackend {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let entry = Self::entry(vault_id)?;
-        let bytes = entry.get_secret().map_err(|e| match e {
+        let bytes = Zeroizing::new(entry.get_secret().map_err(|e| match e {
             keyring_core::Error::NoEntry => VaultError::KeyringEntryMissing {
                 vault_id: vault_id.to_string(),
             },
             _ => VaultError::KeyringUnavailable {
                 reason: format!("{e}"),
             },
-        })?;
+        })?);
         Dek::from_bytes(&bytes)
     }
 

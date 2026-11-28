@@ -45,8 +45,21 @@ pub enum StorageError {
     },
 }
 
+/// Create a new file that only its owner can read or write (`0600` on Unix) from the first
+/// byte, so secrets never sit in a world-readable temp file. Fails if `path` already exists.
+fn create_private(path: &Path) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
 /// Write `value` to `path` atomically: temp file in the same directory, `sync_all`, then
-/// `rename` over the destination. The final file is created `0600`.
+/// `rename` over the destination. The temp file, and so the final file, is created `0600`.
 fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), StorageError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| StorageError::WriteFile {
@@ -64,7 +77,7 @@ fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), Storage
     let tmp_path = dir.join(format!(".{base}.{tmp}.json", tmp = Uuid::new_v4()));
 
     {
-        let mut tmp = fs::File::create(&tmp_path).map_err(|source| StorageError::WriteFile {
+        let mut tmp = create_private(&tmp_path).map_err(|source| StorageError::WriteFile {
             path: tmp_path.clone(),
             source,
         })?;
@@ -79,18 +92,6 @@ fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), Storage
         tmp.sync_all().map_err(|source| StorageError::WriteFile {
             path: tmp_path.clone(),
             source,
-        })?;
-    }
-
-    // Restrict the on-disk permissions to owner read/write (0600).
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600)).map_err(|source| {
-            StorageError::WriteFile {
-                path: tmp_path.clone(),
-                source,
-            }
         })?;
     }
 
@@ -225,6 +226,14 @@ mod tests {
             let perms = fs::metadata(&path).unwrap().permissions();
             assert_eq!(perms.mode() & 0o777, 0o600);
             let _ = fs::remove_file(&path);
+
+            // The temp file is owner-only from the moment it exists, not just after writing.
+            let tmp = tmp_path("perms.tmp.json");
+            fs::create_dir_all(tmp.parent().unwrap()).unwrap();
+            let file = create_private(&tmp).unwrap();
+            assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+            assert!(create_private(&tmp).is_err(), "an existing file must not be reused");
+            let _ = fs::remove_file(&tmp);
         }
     }
 

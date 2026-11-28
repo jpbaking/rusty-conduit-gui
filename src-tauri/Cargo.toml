@@ -45,6 +45,10 @@ zeroize = { workspace = true }
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
 
+# `mallopt` caps glibc malloc arenas at startup (see `src/main.rs`).
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+libc = { workspace = true }
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(conduit_check_tauri_tray)'] }
 

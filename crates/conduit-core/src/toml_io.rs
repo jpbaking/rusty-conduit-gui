@@ -26,12 +26,13 @@ use zeroize::Zeroizing;
 
 use crate::airswitch_import::ExtractedSecret;
 use crate::model::{
-    AuthMethod, HopEntry, HostProfile, LoggingConfig, MitmConfig, MitmUpstreamTlsMode,
-    OpenSshOptions, ReverseConfig, TunnelConfig,
+    AuthMethod, ForwardProxyProtocol, HopEntry, HostProfile, LoggingConfig, MitmConfig,
+    MitmUpstreamTlsMode, OpenSshOptions, ReverseConfig, TunnelConfig,
 };
 use crate::v2_model::{
     GlobalFilterConfig, ListenerConfig, NetworkConfig, Proxy, RouteOneOrMany, RouteTarget,
-    RoutingTablesConfig, Tunnel, TunnelId, UpstreamKind, UpstreamPasswordSource, UpstreamProfile,
+    RoutingTablesConfig, TargetRef, Tunnel, TunnelId, UpstreamKind, UpstreamPasswordSource,
+    UpstreamProfile,
 };
 
 const DIRECT: &str = "direct";
@@ -218,6 +219,9 @@ struct ConduitFile {
     block: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     socks_block_web: Option<bool>,
+    /// Custom error page template; accepted on import, never written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error_page: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mitm: Option<MitmFile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -310,6 +314,9 @@ struct SshFile {
     block: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     socks_block_web: Option<bool>,
+    /// Custom error page template; accepted on import, never written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error_page: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ssh: Option<SshSection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -400,6 +407,9 @@ struct SwitchFile {
     http_port: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     socks_block_web: Option<bool>,
+    /// Custom error page template; accepted on import, never written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error_page: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     socks_port: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -632,6 +642,16 @@ fn network_of(
     })
 }
 
+/// The app always serves its built-in error page, so an imported `error_page` is only reported.
+fn warn_error_page(error_page: &Option<PathBuf>, warnings: &mut Vec<String>) {
+    if let Some(path) = error_page {
+        warnings.push(format!(
+            "error_page {} was not imported: the app serves the built-in error page",
+            path.display()
+        ));
+    }
+}
+
 fn header(cli: &str, proxy: &Proxy) -> String {
     format!(
         "# {cli} config.toml exported by Rusty Conduit from Proxy {:?}.\n\
@@ -680,6 +700,7 @@ pub fn import_rusty_conduit_toml(
     const CLI: &str = "rusty-conduit";
     let f: ConduitFile = parse_file(CLI, toml_str)?;
     let mut warnings = Vec::new();
+    warn_error_page(&f.error_page, &mut warnings);
     let socks_block_web = f.socks_block_web.unwrap_or(false);
     let proxy = Proxy {
         name: name.to_string(),
@@ -730,6 +751,7 @@ pub fn export_rusty_conduit_toml(proxy: &Proxy) -> Result<TomlExport, TomlExport
         socks_block_web: (proxy.socks_block_web
             || proxy.mitm.as_ref().is_some_and(|m| m.socks_block_web))
             .then_some(true),
+        error_page: None,
         mitm: proxy.mitm.as_ref().map(|m| mitm_to_file(m, &mut notes)),
         logging: Some(logging_to_file(&proxy.logging)),
     };
@@ -800,6 +822,7 @@ pub fn import_rusty_conduit_ssh_toml(
     const CLI: &str = "rusty-conduit-ssh";
     let f: SshFile = parse_file(CLI, toml_str)?;
     let mut warnings = Vec::new();
+    warn_error_page(&f.error_page, &mut warnings);
     let mut notes = vec![
         "The SSH destination may be a ~/.ssh/config alias, which the app does not read: check \
          the hop's host, port, and user, and add its authentication (key or password) by hand"
@@ -998,16 +1021,19 @@ pub fn export_rusty_conduit_ssh_toml(
                 .into(),
         ));
     }
+    // A v2 Proxy routes to `@tunnel:<id>`; an older one to a legacy `tunnel` profile.
     let tunnel_id = only_target(&proxy.routing.default)
-        .and_then(|t| proxy.profiles.iter().find(|p| p.name == t))
-        .and_then(|p| match p.kind {
-            UpstreamKind::Tunnel { tunnel_id } => Some(tunnel_id),
-            _ => None,
+        .and_then(|t| match TargetRef::parse(t) {
+            TargetRef::Tunnel(tunnel_id) => Some(tunnel_id),
+            _ => proxy.profiles.iter().find(|p| p.name == t).and_then(|p| match p.kind {
+                UpstreamKind::Tunnel { tunnel_id } => Some(tunnel_id),
+                _ => None,
+            }),
         })
         .ok_or_else(|| {
             unsupported(
-                "its default target is not a single `tunnel` profile; rusty-conduit-ssh \
-                 sends everything through one tunnel"
+                "its default target is not a single `tunnel` profile or `@tunnel:` target; \
+                 rusty-conduit-ssh sends everything through one tunnel"
                     .into(),
             )
         })?;
@@ -1121,6 +1147,7 @@ pub fn export_rusty_conduit_ssh_toml(
         socks_block_web: (proxy.socks_block_web
             || proxy.mitm.as_ref().is_some_and(|m| m.socks_block_web))
             .then_some(true),
+        error_page: None,
         ssh: Some(ssh),
         reverse,
         mitm: proxy.mitm.as_ref().map(|m| mitm_to_file(m, &mut notes)),
@@ -1184,6 +1211,7 @@ pub fn import_rusty_conduit_switch_toml(
     let invalid = |message: String| TomlImportError::Invalid { cli: CLI, message };
     let f: SwitchFile = parse_file(CLI, toml_str)?;
     let mut warnings = Vec::new();
+    warn_error_page(&f.error_page, &mut warnings);
     if f.watch_config.is_some() || f.watch_debounce.is_some() {
         warnings.push(
             "`watch_config` / `watch_debounce` were ignored: use External TOML link mode to \
@@ -1321,9 +1349,84 @@ fn non_empty(s: &str) -> Option<String> {
     (!s.trim().is_empty()).then(|| s.to_string())
 }
 
-/// Export any Proxy as a `rusty-conduit-switch` `config.toml`. `tunnel` profiles become
-/// commented `socks5` placeholders, and vaulted passwords become `password_env` references.
-/// `tunnels` is used only to name the Tunnels in the placeholders.
+/// Append a commented `[profiles.<name>]` block, preceded by `prose` as comment lines.
+fn push_placeholder(
+    placeholders: &mut String,
+    name: &str,
+    block: SwitchProfileFile,
+    prose: &str,
+) -> Result<(), TomlExportError> {
+    let mut table = BTreeMap::new();
+    table.insert(name.to_string(), block);
+    let mut wrapper = BTreeMap::new();
+    wrapper.insert("profiles", table);
+    let body = to_toml(&wrapper)?;
+    placeholders.push('\n');
+    for line in prose.lines() {
+        placeholders.push_str(&format!("# {line}\n"));
+    }
+    for line in body.lines() {
+        placeholders.push_str(&format!("# {line}\n").replace("# \n", "#\n"));
+    }
+    Ok(())
+}
+
+fn tunnel_label(tunnels: &[Tunnel], tunnel_id: TunnelId) -> String {
+    tunnels
+        .iter()
+        .find(|t| t.id == tunnel_id)
+        .map(|t| format!("{:?}", t.name))
+        .unwrap_or_else(|| tunnel_id.to_string())
+}
+
+fn local_socks5_placeholder() -> SwitchProfileFile {
+    SwitchProfileFile {
+        kind: "socks5".into(),
+        host: Some("127.0.0.1".into()),
+        port: Some(1080),
+        ..SwitchProfileFile::default()
+    }
+}
+
+/// Every `@tunnel:` / `@forward:` target the Proxy routes to (routing tables and composite
+/// slots), mapped to the profile name it is exported as.
+fn synthetic_target_names(proxy: &Proxy) -> BTreeMap<String, String> {
+    let mut names = BTreeMap::new();
+    let mut add = |raw: &str| match TargetRef::parse(raw) {
+        TargetRef::Tunnel(tunnel_id) => {
+            names.insert(raw.to_string(), format!("tunnel-{tunnel_id}"));
+        }
+        TargetRef::TunnelForward { forward_id, .. } => {
+            names.insert(raw.to_string(), format!("forward-{forward_id}"));
+        }
+        _ => {}
+    };
+    let r = &proxy.routing;
+    r.default.as_slice().iter().for_each(|t| add(t));
+    for rule in &r.rules {
+        rule.target.as_slice().iter().for_each(|t| add(t));
+    }
+    for table in [r.http.as_ref(), r.socks.as_ref()].into_iter().flatten() {
+        if let Some(d) = &table.default {
+            d.as_slice().iter().for_each(|t| add(t));
+        }
+        for rule in &table.rules {
+            rule.target.as_slice().iter().for_each(|t| add(t));
+        }
+    }
+    for p in &proxy.profiles {
+        if let UpstreamKind::Composite { http, https, fallback } = &p.kind {
+            [http, https, fallback].into_iter().for_each(|t| add(t));
+        }
+    }
+    names
+}
+
+/// Export any Proxy as a `rusty-conduit-switch` `config.toml`. Legacy `tunnel` profiles and
+/// `@tunnel:` / `@forward:` targets become commented placeholder profiles (synthetic targets
+/// are renamed `tunnel-<tunnel id>` / `forward-<forward id>` everywhere they are used), and
+/// vaulted passwords become `password_env` references. `tunnels` names the Tunnels and finds
+/// each forward's listener for the placeholders.
 pub fn export_rusty_conduit_switch_toml(
     proxy: &Proxy,
     tunnels: &[Tunnel],
@@ -1332,6 +1435,8 @@ pub fn export_rusty_conduit_switch_toml(
     let mut notes = Vec::new();
     let mut profiles = BTreeMap::new();
     let mut placeholders = String::new();
+    let synthetic = synthetic_target_names(proxy);
+    let renamed = |slot: &str| synthetic.get(slot).cloned().unwrap_or_else(|| slot.to_string());
     for p in &proxy.profiles {
         let mut out = SwitchProfileFile {
             host: p.host.clone(),
@@ -1352,39 +1457,29 @@ pub fn export_rusty_conduit_switch_toml(
                 out = SwitchProfileFile {
                     kind: "composite".into(),
                     bypass: p.bypass.clone(),
-                    http_proxy: non_empty(http),
-                    https_proxy: non_empty(https),
-                    fallback_proxy: non_empty(fallback),
+                    http_proxy: non_empty(&renamed(http)),
+                    https_proxy: non_empty(&renamed(https)),
+                    fallback_proxy: non_empty(&renamed(fallback)),
                     ..SwitchProfileFile::default()
                 };
             }
             UpstreamKind::Tunnel { tunnel_id } => {
-                let tunnel_name = tunnels
-                    .iter()
-                    .find(|t| t.id == *tunnel_id)
-                    .map(|t| format!("{:?}", t.name))
-                    .unwrap_or_else(|| tunnel_id.to_string());
+                let tunnel_name = tunnel_label(tunnels, *tunnel_id);
                 let block = SwitchProfileFile {
-                    kind: "socks5".into(),
-                    host: Some("127.0.0.1".into()),
-                    port: Some(1080),
                     bypass: p.bypass.clone(),
-                    ..SwitchProfileFile::default()
+                    ..local_socks5_placeholder()
                 };
-                let mut table = BTreeMap::new();
-                table.insert(p.name.clone(), block);
-                let mut wrapper = BTreeMap::new();
-                wrapper.insert("profiles", table);
-                let body = to_toml(&wrapper)?;
-                placeholders.push_str(&format!(
-                    "\n# Profile `{}` routes through the app's SSH Tunnel {tunnel_name}. Run \
-                     rusty-conduit-ssh (or ssh -D) for it,\n# then uncomment this block and \
-                     point it at that SOCKS5 port.\n",
-                    p.name
-                ));
-                for line in body.lines() {
-                    placeholders.push_str(&format!("# {line}\n").replace("# \n", "#\n"));
-                }
+                push_placeholder(
+                    &mut placeholders,
+                    &p.name,
+                    block,
+                    &format!(
+                        "Profile `{}` routes through the app's SSH Tunnel {tunnel_name}. Run \
+                         rusty-conduit-ssh (or ssh -D) for it,\nthen uncomment this block and \
+                         point it at that SOCKS5 port.",
+                        p.name
+                    ),
+                )?;
                 notes.push(format!(
                     "Profile `{}` is an SSH Tunnel ({tunnel_name}): it is written as a \
                      commented socks5 placeholder; until it is uncommented, rules that target \
@@ -1413,7 +1508,76 @@ pub fn export_rusty_conduit_switch_toml(
         profiles.insert(p.name.clone(), out);
     }
 
-    let routing = proxy.routing.clone();
+    for (raw, name) in &synthetic {
+        match TargetRef::parse(raw) {
+            TargetRef::Tunnel(tunnel_id) => {
+                let tunnel_name = tunnel_label(tunnels, tunnel_id);
+                push_placeholder(
+                    &mut placeholders,
+                    name,
+                    local_socks5_placeholder(),
+                    &format!(
+                        "Profile `{name}` stands for `{raw}`, the app's SSH Tunnel {tunnel_name}. \
+                         Run rusty-conduit-ssh (or ssh -D) for it,\nthen uncomment this block \
+                         and point it at that SOCKS5 port."
+                    ),
+                )?;
+                notes.push(format!(
+                    "Target `{raw}` is an SSH Tunnel ({tunnel_name}): it is written as profile \
+                     `{name}`, a commented socks5 placeholder; until it is uncommented, rules \
+                     that target it are rejected"
+                ));
+            }
+            TargetRef::TunnelForward { tunnel_id, forward_id } => {
+                let tunnel_name = tunnel_label(tunnels, tunnel_id);
+                let forward = tunnels
+                    .iter()
+                    .find(|t| t.id == tunnel_id)
+                    .and_then(|t| t.port_forwards.iter().find(|f| f.id == forward_id));
+                let kind = forward.and_then(|f| match f.proxy_protocol {
+                    ForwardProxyProtocol::Http => Some("http"),
+                    ForwardProxyProtocol::Socks5 => Some("socks5"),
+                    ForwardProxyProtocol::None => None,
+                });
+                let (block, prose) = match (forward, kind) {
+                    (Some(f), Some(kind)) => (
+                        SwitchProfileFile {
+                            kind: kind.into(),
+                            host: Some(f.bind.to_string()),
+                            port: Some(f.port),
+                            ..SwitchProfileFile::default()
+                        },
+                        format!(
+                            "Profile `{name}` stands for `{raw}`, a local forward on the app's \
+                             SSH Tunnel {tunnel_name}. Run\n`ssh -L {}:{}` for it, then \
+                             uncomment this block.",
+                            f.listen(),
+                            f.destination()
+                        ),
+                    ),
+                    _ => (
+                        local_socks5_placeholder(),
+                        format!(
+                            "Profile `{name}` stands for `{raw}`, a forward on the app's SSH \
+                             Tunnel {tunnel_name} that\nwas not found or speaks no proxy \
+                             protocol: point this block at a proxy that reaches it, then \
+                             uncomment it."
+                        ),
+                    ),
+                };
+                push_placeholder(&mut placeholders, name, block, &prose)?;
+                notes.push(format!(
+                    "Target `{raw}` is a port forward on SSH Tunnel {tunnel_name}: it is written \
+                     as profile `{name}`, a commented placeholder; until it is uncommented, \
+                     rules that target it are rejected"
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    let mut routing = proxy.routing.clone();
+    rewrite_routing(&mut routing, &synthetic);
 
     let (allow, block) = filter_to_file(&proxy.filter);
     let l = &proxy.listeners;
@@ -2110,6 +2274,122 @@ inherit = true
         let corp = expected.profiles.iter_mut().find(|x| x.name == "corp").unwrap();
         corp.password = Some(UpstreamPasswordSource::Env("CONDUIT_UPSTREAM_CORP_PASSWORD".into()));
         assert_eq!(back.proxy, expected);
+    }
+
+    #[test]
+    fn error_page_is_accepted_with_a_warning_and_never_exported() {
+        let line = "error_page = \"/etc/conduit/error.html\"\n";
+        let warned = |w: &[String]| {
+            w.iter().any(|w| w.contains("error_page /etc/conduit/error.html was not imported"))
+        };
+        let conduit = import_rusty_conduit_toml(&format!("{line}{CONDUIT_TOML}"), "c").unwrap();
+        assert!(warned(&conduit.warnings), "{:?}", conduit.warnings);
+        let ssh = import_rusty_conduit_ssh_toml(&format!("{line}{SSH_TOML}"), "s").unwrap();
+        assert!(warned(&ssh.warnings), "{:?}", ssh.warnings);
+        let switch = import_rusty_conduit_switch_toml(&format!("{line}{SWITCH_TOML}"), "w").unwrap();
+        assert!(warned(&switch.warnings), "{:?}", switch.warnings);
+
+        let exports = [
+            export_rusty_conduit_toml(&conduit.proxy).unwrap().toml,
+            export_rusty_conduit_ssh_toml(ssh.proxy.as_ref().unwrap(), std::slice::from_ref(&ssh.tunnel))
+                .unwrap()
+                .toml,
+            export_rusty_conduit_switch_toml(&switch.proxy, &[]).unwrap().toml,
+        ];
+        for toml in exports {
+            assert!(!toml.contains("error_page"), "{toml}");
+        }
+    }
+
+    #[test]
+    fn ssh_export_v2_tunnel_target_round_trips() {
+        let (tunnel, mut proxy) = ssh_pair();
+        assert!(crate::v2_model::migrate_tunnel_profiles(&mut proxy));
+        let wire = crate::v2_model::tunnel_target_name(tunnel.id);
+        assert_eq!(only_target(&proxy.routing.default), Some(wire.as_str()));
+        assert!(proxy.profiles.is_empty());
+
+        let out = export_rusty_conduit_ssh_toml(&proxy, std::slice::from_ref(&tunnel)).unwrap();
+        assert!(out.toml.contains("target = \"carol@target.example\""), "{}", out.toml);
+        assert!(!out.toml.contains("@tunnel:"), "{}", out.toml);
+
+        let back = import_rusty_conduit_ssh_toml(&out.toml, "corp").unwrap();
+        let hops: Vec<_> = back.tunnel.hops.iter().map(|h| hop_label(&h.host)).collect();
+        assert_eq!(hops, ["carol@target.example:2022"]);
+        let mut p = back.proxy.unwrap();
+        assert!(crate::v2_model::migrate_tunnel_profiles(&mut p));
+        let back_wire = crate::v2_model::tunnel_target_name(back.tunnel.id);
+        assert_eq!(only_target(&p.routing.default), Some(back_wire.as_str()));
+        assert_eq!(p.filter, proxy.filter);
+    }
+
+    /// The commented placeholder blocks, uncommented. Prose and setup notes stay comments.
+    fn uncomment_placeholders(toml: &str) -> String {
+        toml.lines()
+            .map(|l| match l.strip_prefix("# ") {
+                Some(rest) if rest.starts_with("[profiles.") || (rest.contains(" = ") && !rest.starts_with("- ")) => rest,
+                _ => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn switch_export_synthetic_targets_become_named_placeholders() {
+        let tunnel_id = TunnelId::new();
+        let forward_id = Uuid::new_v4();
+        let tunnel = Tunnel {
+            id: tunnel_id,
+            name: "corp".into(),
+            port_forwards: vec![PortForward {
+                id: forward_id,
+                direction: ForwardDirection::Local,
+                port: 18080,
+                dest_host: "proxy.internal".into(),
+                dest_port: 3128,
+                proxy_protocol: ForwardProxyProtocol::Http,
+                ..PortForward::default()
+            }],
+            ..Tunnel::default()
+        };
+        let tunnel_wire = crate::v2_model::tunnel_target_name(tunnel_id);
+        let forward_wire = crate::v2_model::forward_target_name(tunnel_id, forward_id);
+        let mut proxy = import_rusty_conduit_switch_toml(SWITCH_TOML, "v2").unwrap().proxy;
+        proxy.routing.default = RouteOneOrMany::Many(vec![tunnel_wire.clone(), "direct".into()]);
+        proxy.routing.rules[0].target = RouteOneOrMany::One(tunnel_wire.clone());
+        proxy.routing.rules[1].target = RouteOneOrMany::One(forward_wire.clone());
+        let split = proxy.profiles.iter_mut().find(|p| p.name == "split").unwrap();
+        split.kind = UpstreamKind::Composite {
+            http: forward_wire.clone(),
+            https: String::new(),
+            fallback: tunnel_wire.clone(),
+        };
+
+        let out = export_rusty_conduit_switch_toml(&proxy, std::slice::from_ref(&tunnel)).unwrap();
+        let live: String = out.toml.lines().filter(|l| !l.starts_with('#')).collect::<Vec<_>>().join("\n");
+        assert!(!live.contains("@tunnel:") && !live.contains("@forward:"), "{}", out.toml);
+        let tunnel_name = format!("tunnel-{tunnel_id}");
+        let forward_name = format!("forward-{forward_id}");
+        assert!(out.toml.contains("ssh -L 127.0.0.1:18080:proxy.internal:3128"), "{}", out.toml);
+        let notes = out.notes.join("\n");
+        assert!(notes.contains(&tunnel_name) && notes.contains(&forward_name), "{notes}");
+
+        let back = import_rusty_conduit_switch_toml(&uncomment_placeholders(&out.toml), "v2").unwrap();
+        let p = back.proxy;
+        let tunnel_profile = p.profiles.iter().find(|x| x.name == tunnel_name).unwrap();
+        assert_eq!(tunnel_profile.kind, UpstreamKind::Socks5);
+        assert_eq!((tunnel_profile.host.as_deref(), tunnel_profile.port), (Some("127.0.0.1"), Some(1080)));
+        let forward_profile = p.profiles.iter().find(|x| x.name == forward_name).unwrap();
+        assert_eq!(forward_profile.kind, UpstreamKind::Http);
+        assert_eq!((forward_profile.host.as_deref(), forward_profile.port), (Some("127.0.0.1"), Some(18080)));
+        assert_eq!(p.routing.default.as_slice(), [tunnel_name.as_str(), "direct"]);
+        assert_eq!(only_target(&p.routing.rules[0].target), Some(tunnel_name.as_str()));
+        assert_eq!(only_target(&p.routing.rules[1].target), Some(forward_name.as_str()));
+        let split = p.profiles.iter().find(|x| x.name == "split").unwrap();
+        assert_eq!(
+            split.kind,
+            UpstreamKind::Composite { http: forward_name.clone(), https: String::new(), fallback: tunnel_name.clone() }
+        );
     }
 
     #[test]

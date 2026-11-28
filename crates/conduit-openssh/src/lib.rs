@@ -25,7 +25,7 @@ pub use config::{
     hop_alias, render_config, write_config, ConfigError, ConfigHop, SessionConfig, WriteConfigError,
 };
 pub use known_hosts::{host_key_alias, render_known_hosts, write_known_hosts, HopKey};
-pub use runtime_dir::{write_private_file, RuntimeDir};
+pub use runtime_dir::{sweep_stale_runtime_dirs, write_private_file, RuntimeDir};
 pub use supervisor::{
     resolve_worker_bin, LogFn, OpenSshError, OpenSshSupervisor, SupervisorHop, SupervisorOptions,
 };

@@ -11,7 +11,9 @@ Owns everything under `crates/conduit-vault/`. Inherits all root DOX rules and a
 ## Local Contracts
 - Every record is encrypted with XChaCha20-Poly1305 under a random 256-bit DEK; the DEK is wrapped by the OS keyring and/or an Argon2id master key. Never add a plaintext fallback.
 - Secret material is zeroized after use (`zeroize` / `secrecy`); never log, `Debug`-print, or serialize it in clear.
-- Every `vault.bin` write is atomic.
+- Raw key bytes (DEK copies, keyring reads, unwrapped plaintext, generated seeds, backup keys) never leave `Zeroizing` / `SecretBox`.
+- Argon2 parameters from any file are untrusted: `Argon2Params::to_argon2` rejects anything above `MAX_ARGON_MEMORY_KIB` (1 GiB), `MAX_ARGON_TIME_COST` (64), or `MAX_ARGON_PARALLELISM` (16), or a key length other than 32, before memory is reserved.
+- Every `vault.bin` write is atomic, through a temp file created `0600` (`create_new`) before any byte is written.
 - Crypto stays pure Rust: no C crypto library may enter the dependency graph (checked by `../../scripts/check-pure-rust-crypto.py`).
 - Platform keyring stores are chosen per target in `Cargo.toml` (macOS login Keychain, Windows native store, Linux Secret Service over `zbus`).
 

@@ -136,6 +136,13 @@ pub fn run() {
                     window::UiEvent::MigrationNotice { message, is_warning },
                 );
             }
+            // After the single-instance guard and before any Tunnel starts: remove the runtime
+            // directories (askpass and agent sockets, known_hosts) a crashed run left behind.
+            match conduit_openssh::sweep_stale_runtime_dirs() {
+                Ok(0) => {}
+                Ok(removed) => eprintln!("removed {removed} stale ssh runtime directories"),
+                Err(error) => eprintln!("could not sweep stale ssh runtime directories: {error}"),
+            }
             let controller = AppController::open(dir, ControllerOptions::default())?;
             tauri::async_runtime::spawn(controller.known_hosts_autosave());
             app.manage(controller.clone());

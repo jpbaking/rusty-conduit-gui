@@ -46,6 +46,18 @@ elliptic-curve = { version = "0.14" }
 ring = "0.17"
 libc = "0.2"
 
-# Keep debug builds small and fast to compile.
+# Keep debug builds of the workspace crates fast to compile.
 [profile.dev]
 opt-level = 0
+
+# Optimize dependencies (argon2, chacha20poly1305, ring) in debug builds too, so a 128 MiB
+# Argon2id vault unlock takes about as long as in a release build.
+[profile.dev.package."*"]
+opt-level = 2
+
+# Thin LTO with one codegen unit inlines across the rusty-conduit-engine crate boundary;
+# stripped symbols keep the installers small.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

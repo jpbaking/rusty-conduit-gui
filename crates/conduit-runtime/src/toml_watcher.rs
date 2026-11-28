@@ -148,9 +148,10 @@ pub struct ExternalTomlMerge {
 }
 
 /// Folds an imported `rusty-conduit-switch` file into `current`: listeners, network, profiles,
-/// routing, filter, and logging come from the file; everything else stays. A profile with no
-/// password source in the file keeps `current`'s vaulted password when the names match. Inline
-/// passwords are dropped here (the extracted secrets are zeroized), never stored.
+/// routing, filter, `socks_block_web`, and logging come from the file; everything else stays.
+/// A profile with no password source in the file keeps `current`'s vaulted password when the
+/// names match. Inline passwords are dropped here (the extracted secrets are zeroized), never
+/// stored.
 pub fn merge_external_toml(current: &Proxy, imported: SwitchTomlImport) -> ExternalTomlMerge {
     let SwitchTomlImport { proxy: file, extracted_secrets, mut warnings } = imported;
     // The importer notes "moved to the Vault", which link mode does not do.
@@ -160,6 +161,7 @@ pub fn merge_external_toml(current: &Proxy, imported: SwitchTomlImport) -> Exter
     proxy.network = file.network;
     proxy.routing = file.routing;
     proxy.filter = file.filter;
+    proxy.socks_block_web = file.socks_block_web;
     proxy.logging = file.logging;
     proxy.profiles = file.profiles;
     for profile in &mut proxy.profiles {
@@ -288,6 +290,16 @@ target = "corp"
         assert_eq!(other.password, None);
         assert!(merged.warnings.iter().any(|w| w.contains("`other`") && w.contains("ignored")));
         assert!(!format!("{p:?}{:?}", merged.warnings).contains("inline-canary"));
+    }
+
+    #[test]
+    fn merge_takes_socks_block_web_from_the_file() {
+        let current = Proxy { socks_block_web: true, ..Proxy::default() };
+        let text = format!("socks_block_web = true\n{V1}");
+        let on = merge_external_toml_text(&Proxy::default(), &text).unwrap();
+        assert!(on.proxy.socks_block_web);
+        let off = merge_external_toml_text(&current, V1).unwrap();
+        assert!(!off.proxy.socks_block_web, "the linked file has no socks_block_web");
     }
 
     #[test]

@@ -411,14 +411,13 @@ const proxyA: Proxy = {
   name: "Work",
   profiles: [
     upstream("corp", { type: "http" }, "192.0.2.80", 8080),
-    upstream("staging", { type: "tunnel", tunnel_id: TUNNEL_A }, null, null),
   ],
   routing: {
     default: "direct",
     resolve_dns: false,
     rules: [
       { name: "intranet", host_wildcard: "*.corp.example", match_all: false, disabled: false, target: ["corp", "direct"] },
-      { name: "staging", host_wildcard: "*.staging.example", match_all: false, disabled: false, target: "staging" },
+      { name: "staging", host_wildcard: "*.staging.example", match_all: false, disabled: false, target: `@tunnel:${TUNNEL_A}` },
     ],
   },
 };
@@ -751,7 +750,7 @@ function dispatchV2(command: string, args?: Record<string, unknown>): unknown {
       for (const other of proxies) {
         if (other.profile.id === args?.proxyId || !bindsOverlap(bind, other.profile.listeners.bind)) continue;
         for (const port of [other.profile.listeners.http_port, other.profile.listeners.socks_port]) {
-          if (ports.has(port)) conflicts.push({ port, kind: "session", detail: `Used by proxy "${other.profile.name}".` });
+          if (ports.has(port)) conflicts.push({ port, kind: "proxy", detail: `Used by proxy "${other.profile.name}".` });
         }
       }
       return { conflicts } satisfies PortConflictReport;

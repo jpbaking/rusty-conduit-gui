@@ -435,19 +435,26 @@ fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
     fs::create_dir_all(dir)?;
 
     {
-        let mut tmp = fs::File::create(&tmp_path)?;
+        let mut tmp = create_private(&tmp_path)?;
         tmp.write_all(bytes)?;
         tmp.sync_all()?;
     }
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))?;
-    }
-
     fs::rename(&tmp_path, path)?;
     Ok(())
+}
+
+/// Create a new file that only its owner can read or write (`0600` on Unix) from the first
+/// byte, so secrets never sit in a world-readable temp file. Fails if `path` already exists.
+fn create_private(path: &Path) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
 }
 
 #[cfg(test)]
@@ -604,6 +611,20 @@ mod tests {
             Vault::create_with_password(&path, b"pw", Argon2Params::FAST).unwrap();
             let perms = fs::metadata(&path).unwrap().permissions();
             assert_eq!(perms.mode() & 0o777, 0o600);
+            let _ = fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn temp_file_is_owner_only_from_creation() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = tmp_vault("private.tmp");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let file = create_private(&path).unwrap();
+            assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+            assert!(create_private(&path).is_err(), "an existing file must not be reused");
             let _ = fs::remove_file(&path);
         }
     }

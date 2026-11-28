@@ -392,6 +392,9 @@ impl AppController {
             }
             None => None,
         };
+        // Save v2 `@tunnel:<id>` targets now rather than a legacy `tunnel` profile that only
+        // the next startup would migrate.
+        conduit_core::migrate_tunnel_profiles(&mut proxy);
 
         let saved = match self.upsert_proxy(proxy).await {
             Ok(saved) => saved,
@@ -675,13 +678,37 @@ mod tests {
         let proxy = out.proxy.unwrap();
         let config = c.config_snapshot();
         assert!(config.tunnels.iter().any(|t| t.id == tunnel.id));
-        assert!(proxy
-            .profiles
-            .iter()
-            .any(|p| p.kind == UpstreamKind::Tunnel { tunnel_id: tunnel.id }));
+        let target = conduit_core::tunnel_target_name(tunnel.id);
+        assert_eq!(proxy.routing.default, RouteOneOrMany::One(target));
 
         let export = c.export_proxy_toml(proxy.id, CliTomlFormat::RustyConduitSsh, None).unwrap();
         assert!(export.toml.contains("[ssh]"), "{}", export.toml);
+    }
+
+    #[tokio::test]
+    async fn commit_toml_import_saves_ssh_proxy_with_a_v2_tunnel_target() {
+        let dir = TempDir::new();
+        let files = TempDir::new();
+        let path = write(&files, "ssh.toml", SSH_TOML);
+        let c = controller(&dir);
+        let out = c
+            .commit_toml_import(path, Some(CliTomlFormat::RustyConduitSsh), Some("bastion".into()))
+            .await
+            .unwrap();
+        let tunnel = out.tunnel.unwrap();
+        let saved = out.proxy.unwrap();
+        let stored = c.config_snapshot().proxies.into_iter().find(|p| p.id == saved.id).unwrap();
+        for proxy in [&saved, &stored] {
+            assert_eq!(
+                proxy.routing.default,
+                RouteOneOrMany::One(conduit_core::tunnel_target_name(tunnel.id))
+            );
+            assert!(
+                !proxy.profiles.iter().any(|p| matches!(p.kind, UpstreamKind::Tunnel { .. })),
+                "legacy tunnel profile kept: {:?}",
+                proxy.profiles
+            );
+        }
     }
 
     #[tokio::test]

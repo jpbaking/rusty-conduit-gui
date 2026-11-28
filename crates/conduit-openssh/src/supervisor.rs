@@ -235,6 +235,7 @@ async fn probe_socks(address: SocketAddr) -> bool {
 ///
 /// Linux sends `PR_SET_PDEATHSIG` when the spawning *thread* exits, and a Tokio blocking-pool
 /// thread can exit at any time. This thread lasts as long as the child needs it.
+#[cfg(target_os = "linux")]
 async fn spawn_guarded(mut command: Command) -> io::Result<(Child, mpsc::Sender<()>)> {
     let runtime = tokio::runtime::Handle::current();
     let (result_tx, result_rx) = oneshot::channel();
@@ -255,6 +256,17 @@ async fn spawn_guarded(mut command: Command) -> io::Result<(Child, mpsc::Sender<
     let child = result_rx
         .await
         .map_err(|_| io::Error::other("ssh spawn thread ended early"))??;
+    Ok((child, keep_tx))
+}
+
+/// Spawns `command` directly. Only Linux ties the child to the thread that spawned it; macOS
+/// (the `conduit-worker` parent watcher) and Windows (a Job Object) guard it without one, so
+/// no idle thread is kept per session. The returned sender has no receiver and only keeps the
+/// signature the same as on Linux.
+#[cfg(not(target_os = "linux"))]
+async fn spawn_guarded(mut command: Command) -> io::Result<(Child, mpsc::Sender<()>)> {
+    let child = command.spawn()?;
+    let (keep_tx, _) = mpsc::channel::<()>();
     Ok((child, keep_tx))
 }
 

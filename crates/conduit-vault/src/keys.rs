@@ -16,6 +16,7 @@ use std::fmt;
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use russh::keys::{Algorithm, EcdsaCurve, HashAlg, PrivateKey};
 use russh::keys::ssh_key::LineEnding;
@@ -133,8 +134,8 @@ pub fn generate_key(algo: KeyGenAlgorithm) -> Result<(PrivateKey, KeyInfo), Vaul
         KeyGenAlgorithm::Ed25519 => {
             use russh::keys::ssh_key::private::{Ed25519Keypair, KeypairData};
 
-            let mut seed = [0u8; 32];
-            OsRng.fill_bytes(&mut seed);
+            let mut seed = Zeroizing::new([0u8; 32]);
+            OsRng.fill_bytes(&mut seed[..]);
             let keypair = Ed25519Keypair::from_seed(&seed);
             PrivateKey::new(KeypairData::Ed25519(keypair), "").map_err(|e| KeyError::Crypto {
                 reason: format!("failed to build Ed25519 keypair: {e}"),
@@ -399,9 +400,9 @@ pub fn export_backup(
     OsRng.fill_bytes(&mut salt);
 
     let master_key = derive_master_key(passphrase, &params, &salt)?;
-    let mut backup_key = [0u8; DEK_BYTES];
-    OsRng.fill_bytes(&mut backup_key);
-    let dek = Dek::from_bytes(&backup_key)?;
+    let mut backup_key = Zeroizing::new([0u8; DEK_BYTES]);
+    OsRng.fill_bytes(&mut backup_key[..]);
+    let dek = Dek::from_bytes(&backup_key[..])?;
 
     let wrapped_key = crate::crypto::wrap_dek_with_key(&dek, &*master_key);
     let payload_ct = encrypt_record(
@@ -631,6 +632,20 @@ mod tests {
             import_backup(&bundle, b"wrong"),
             Err(VaultError::Key { .. }) | Err(VaultError::UnlockFailed)
         ));
+    }
+
+    #[test]
+    fn backup_rejects_huge_argon_memory_before_deriving() {
+        let bundle = export_backup(&[], b"pass", Argon2Params::FAST).unwrap();
+        let mut file: serde_json::Value = serde_json::from_slice(&bundle).unwrap();
+        file["argon2"]["memory_kib"] = serde_json::json!(u32::MAX);
+        let edited = serde_json::to_vec(&file).unwrap();
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            import_backup(&edited, b"pass"),
+            Err(VaultError::InvalidFormat { .. })
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
     #[test]

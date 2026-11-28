@@ -14,7 +14,8 @@ mod store;
 
 pub use crypto::{
     decrypt_record, derive_master_key, generate_dek, encrypt_record, Argon2Params, Dek,
-    VaultHeader, DEK_BYTES, NONCE_BYTES, VAULT_MAGIC, VAULT_VERSION,
+    VaultHeader, DEK_BYTES, MAX_ARGON_MEMORY_KIB, MAX_ARGON_PARALLELISM, MAX_ARGON_TIME_COST,
+    NONCE_BYTES, VAULT_MAGIC, VAULT_VERSION,
 };
 pub use keys::{
     algorithm_name, export_backup, generate_key, import_backup, import_key, BackupKey,

@@ -1,44 +1,60 @@
-# phase-0002 — Runtime tunnel forward listener, filtered dialer, and in-process -L proxy dialer (conduit-runtime)
+# phase-0002 — Vault hardening: bounded Argon2 costs, zeroized key copies, owner-only temp files
 
 - Status: done
-- Owner: executor
+- Owner: planner
 - Depends on: phase-0001
-- Goal: Implement tunnel-level filter enforcement on Proxy traffic, in-process HTTP/SOCKS5 handshakes for `@forward:<tid>:<fid>` targets, optional tunnel forward listener + MITM in `TunnelManager`, and automatic external dialer registration in `ProxyManager`.
-- Done when: `cargo clippy -p conduit-runtime --all-targets -- -D warnings` and `cargo test -p conduit-runtime` pass, including tests for filtered tunnel dialing, in-process `-L` HTTP and SOCKS5 handshake dialing, optional tunnel forward listener, and `ProxyManager::test_route` with `@tunnel:` / `@forward:` targets.
-- Pattern to follow: `crates/conduit-runtime/src/tunnel_manager.rs:160-217` (`SwitchableDialer`), `crates/conduit-runtime/src/runner.rs:750-770` and `923-945` (forward `Server::from_options` and `MitmState` setup), `crates/conduit-runtime/src/proxy_manager.rs:565-610` (`compile_routing`).
+- Goal: Reject unauthenticated Argon2 parameters above fixed caps before any memory is allocated, keep every raw DEK and seed copy in `Zeroizing`, and create vault/config temp files `0600` from the first byte.
+- Done when: every command in `## Verify` exits 0, including new tests that a `vault.bin` header and a `CVBK` backup with `memory_kib = u32::MAX` fail fast with an error and no allocation.
+- Pattern to follow: `src-tauri/src/controller/export.rs:66-68, 621-635` (`MAX_ARGON_MEMORY_KIB` = 1 GiB, `MAX_ARGON_TIME_COST` = 64, `MAX_ARGON_PARALLELISM` = 16 and the `check_bundle_params` range checks)
 
 ## Context
-`rusty-conduit-engine` already exposes `rusty_conduit_engine::upstream::http::connect_tunnel` and `rusty_conduit_engine::upstream::socks5::{handshake, encode_connect_request}` over any `AsyncRead + AsyncWrite + Unpin` stream. When a Proxy routes through `@tunnel:<tid>`, it must dial the tunnel's in-process SSH dialer (bypassing any customized tunnel forward `ip:port` and bypassing tunnel MITM), while STILL enforcing the tunnel's configured `forward.allow` / `forward.block` `HostFilter`. When a Proxy routes through `@forward:<tid>:<fid>`, it checks the tunnel's filter on the requested destination host, dials `(forward.dest_host, forward.dest_port)` through the tunnel's raw SSH dialer (skipping the local `-L` port), and runs the HTTP CONNECT or SOCKS5 handshake on that stream. Meanwhile, if `tunnel.forward.enabled` is true, `TunnelStack` runs a local `Server::from_options` with the tunnel's `forward_filter` and optional `MitmState` (loaded from the vault if `tunnel.mitm` is set).
+B-02: `VaultHeader::unwrap_dek` (`crates/conduit-vault/src/crypto.rs:186-191`) and `import_backup` (`crates/conduit-vault/src/keys.rs`) pass the `Argon2Params` read from disk straight to `derive_master_key`, which maps `memory_kib` KiB (up to 4 TiB) through `WorkMemory::new` before AEAD authentication runs. Only encrypted GUI exports check bounds today.
+Design decision: move the three caps into `conduit-vault` as `pub const`s next to `Argon2Params`, enforce them in `Argon2Params::to_argon2()` (which every derivation goes through) as `VaultError::InvalidFormat { reason: "unsupported Argon2 parameters: ..." }`, and make `export.rs` import those constants instead of defining its own. `BASELINE` (128 MiB, t=3, p=1) and the test-only `FAST` stay inside the caps.
+Zeroizing: `Dek::to_bytes` returns `Zeroizing<Vec<u8>>`; the keyring backends wrap `expose_secret().clone()` / `get_secret()` copies; `unwrap_dek` wraps its decrypted plaintext; `generate_key`'s Ed25519 seed and `export_backup`'s `backup_key` are `Zeroizing<[u8; 32]>`.
+Temp files: both atomic writers create the file with `File::create` and `chmod 0600` only after writing. Create with `OpenOptions` (`write`, `create_new`, and `OpenOptionsExt::mode(0o600)` on Unix) and drop the later `set_permissions`.
 
 ## Scope
-- In: `crates/conduit-runtime/src/tunnel_manager.rs`, `crates/conduit-runtime/src/proxy_manager.rs`, `crates/conduit-runtime/src/lib.rs`, `crates/conduit-runtime/tests/u2_tunnels_proxies.rs` (plus an optional new helper module `crates/conduit-runtime/src/forward_dialer.rs` if cleaner)
-- Out: `crates/conduit-core/`, `crates/conduit-tray/`, `src-tauri/`
+- In: `crates/conduit-vault/src/crypto.rs`, `crates/conduit-vault/src/keyring.rs`, `crates/conduit-vault/src/keys.rs`, `crates/conduit-vault/src/store.rs`, `crates/conduit-vault/src/lib.rs` (re-exports only), `crates/conduit-core/src/storage.rs`, `src-tauri/src/controller/export.rs` (constants and imports only), `crates/conduit-vault/DOX.md`
+- Out: the on-disk formats (`VAULT_VERSION`, field layout, `CVBK` layout), `crates/conduit-openssh/`, `src-tauri/ui/`
 
 ## Sub-tasks
-1. [done] In `crates/conduit-runtime/src/tunnel_manager.rs`, add `FilteredTunnelDialer` wrapping `SwitchableDialer` with a live `Arc<RwLock<Option<HostFilter>>>` (refreshed on `upsert_tunnel` and tunnel start). On `connect(host, port, timeout)`, check the filter first; if denied, return `RouteBlocked::new(...).into_io()` (using `rusty_conduit_engine::upstream::RouteBlocked`), otherwise delegate to the inner dialer. Expose `TunnelManager::dialer(&self, id: TunnelId)` returning the filtered dialer and `TunnelManager::forward_dialer(&self, tid: TunnelId, fid: Uuid) -> Option<Arc<dyn UpstreamDialer>>` returning a `TunnelForwardDialer` that: (a) checks the tunnel filter on `host`, (b) looks up the current `PortForward` by `fid` (verifying `direction == Local` and `proxy_protocol != None`), (c) dials `(dest_host, dest_port)` via the raw `SwitchableDialer`, (d) performs `http::connect_tunnel` (attaching any trailing bytes via `UpstreamStream::with_prefix`) or `socks5::handshake` with `encode_connect_request(host, port)`. — done when: unit tests verify filter denial and both HTTP CONNECT and SOCKS5 in-process handshakes against local mock servers.
-2. [done] In `crates/conduit-runtime/src/tunnel_manager.rs`, extend `TunnelSnapshot` with `pub listeners: Vec<ListenerInfo>` (the tunnel's bound forward listeners when `tunnel.forward.enabled`, empty otherwise) and update `TunnelStack` to start/stop an optional forward `Server::from_options(&cfg.forward_server, ...)` backed by the tunnel's raw dialer + `cfg.forward_filter` + optional `MitmState` (reading CA PEM from `ctx.vault` when `cfg.mitm_enabled`, returning `LinkError::Locked` if vault is locked and MITM CA is needed). Update `needs_secrets` check in `TunnelStack::start` to also account for `tunnel.forward.enabled && tunnel.mitm.is_some()`. Also expose `TunnelManager::tunnels(&self) -> Vec<Tunnel>` (or `known_tunnels_full`) for `ProxyManager`. — done when: unit/integration test starts a Tunnel with `forward.enabled = true` and confirms `snapshot.listeners` is populated and traffic flows through it; and starts a Tunnel with `forward.enabled = false` and confirms `snapshot.listeners` is empty.
-3. [done] In `crates/conduit-runtime/src/proxy_manager.rs`, update `compile_routing`, `launch`, `reload`, `test_route`, `test_upstream`, `set_override`, and `profile_exists` to: (a) validate using `validate_proxy_with_tunnels` with live tunnels from `TunnelManager`, (b) register external dialers for all `@tunnel:<tid>` (via `tunnels.dialer(tid)`) and `@forward:<tid>:<fid>` (via `tunnels.forward_dialer(tid, fid)`) targets referenced in `proxy.routing`, (c) include Tunnel forward listeners in `other_listeners` for self-loop / port-conflict checks, (d) format friendly `redacted_upstream` in `test_route` (e.g. `tunnel:<name>` and `tunnel:<name> › <fwd_name> (http|socks5)`), and (e) allow `set_override` to accept `@tunnel:<tid>` and `@forward:<tid>:<fid>` targets by registering that target's external dialer in the override `RoutingState` whenever it is not already in `saved.registry`. — done when: `ProxyManager` tests pass for routing through `@tunnel:<id>`, `@forward:<tid>:<fid>`, tunnel filter enforcement on Proxy traffic, and `test_route` / `set_override`.
-4. [done] Run `cargo clippy -p conduit-runtime --all-targets -- -D warnings` and `cargo test -p conduit-runtime`. — done when: both commands exit 0 with zero warnings.
+1. [done] Add `pub const MAX_ARGON_MEMORY_KIB: u32 = 1024 * 1024`, `MAX_ARGON_TIME_COST: u32 = 64`, `MAX_ARGON_PARALLELISM: u8 = 16` to `crypto.rs`, re-export them from `lib.rs`, and check `memory_kib <= MAX`, `1..=MAX` time cost, `1..=MAX` parallelism, and `derived_key_len == 32` at the top of `to_argon2()`; switch `export.rs` to the re-exported constants — done when: `grep -c 'const MAX_ARGON' src-tauri/src/controller/export.rs` prints `0` and `cargo test -p conduit-vault --locked` passes.
+2. [done] Tests: `unwrap_dek` on a header whose `argon2.memory_kib = u32::MAX` returns `InvalidFormat` (and returns quickly); `import_backup` of a `CVBK` bundle edited to `memory_kib = u32::MAX` fails the same way; the existing `export.rs` test at line ~1532 still passes — done when: `cargo test --workspace --locked argon` runs the new tests and passes.
+3. [done] Zeroize raw copies as listed in Context; update callers (`keyring.rs:59, 171`, `export.rs:827, 2035`, the `crypto.rs:440` test) — done when: `cargo clippy --workspace --all-targets --locked -- -D warnings` passes and `grep -n 'fn to_bytes' crates/conduit-vault/src/crypto.rs` shows `Zeroizing<Vec<u8>>`.
+4. [done] Owner-only temp files in `store.rs` `atomic_write_bytes` and `storage.rs` `atomic_write_json`; extend the existing perms test in `storage.rs` and add one for `store.rs` that checks the temp file mode by creating it through the same helper — done when: `cargo test -p conduit-vault -p conduit-core --locked` passes.
+5. [done] DOX pass: `crates/conduit-vault/DOX.md` Local Contracts state the Argon2 caps and that raw key bytes never leave `Zeroizing`/`SecretBox` — done when: `grep -c 'MAX_ARGON_MEMORY_KIB' crates/conduit-vault/DOX.md` prints at least `1`.
+6. [done] (planner, Gate D finding) Move `atomic_write_json`'s doc comment back onto it (it had ended up above `create_private` in `storage.rs`), and merge the `MAX_ARGON_*` import in `export.rs` into the existing `use conduit_vault::{...}` block — done when: clippy and `cargo test --workspace --locked` pass.
 
 ## Verify
 ```sh
-cargo clippy -p conduit-runtime --all-targets -- -D warnings && cargo test -p conduit-runtime
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+cargo test -p rusty-conduit-gui --test secret_leak_scan --locked
+python3 scripts/check-pure-rust-crypto.py
+git diff --exit-code -- crates/conduit-openssh src-tauri/ui
 ```
 
 ## Escalate when
-- `rusty_conduit_engine::upstream::http::connect_tunnel` or `socks5::handshake` is private or lacks a needed method/type export in the pinned `v0.4.1` engine crate → stop, set Status: needs-human — reason: name the exact missing engine symbol.
-- `TunnelStack` forward server setup conflicts with `OpenSshTunnelLink` or `RusshTunnelLink` lifecycle ordering → stop, set Status: needs-human — reason: describe the lifecycle conflict.
+- An existing vault, keyring, or backup fixture fails to open with the new caps → stop, set Status: needs-human — reason: name the fixture and its parameters (real user vaults must keep opening).
+- Making a temp file `create_new` breaks a retry path that reuses the name → stop, set Status: needs-human — reason: name the caller.
 
 ## Log
 - (append-only, one line per event)
-- sub-task 1: added `FilteredTunnelDialer` in `tunnel_manager.rs`, `TunnelForwardDialer` in `forward_dialer.rs`, exposed `TunnelManager::dialer` (filtered) and `TunnelManager::forward_dialer`, and added unit tests for filter denial and HTTP CONNECT / SOCKS5 in-process handshakes
-- sub-task 2: extended `TunnelSnapshot` with `listeners`, added optional forward `Server` + `MitmState` + vault-lock check to `TunnelStack`, exposed `TunnelManager::tunnels` and `TunnelManager::forward_listeners`, and added unit tests
-- sub-task 3: updated `ProxyManager` (`compile_routing`, `launch`, `reload`, `test_route`/`test_route_with_tunnels`/`test_route_live`, `test_upstream`, `set_override`, `profile_exists`, `other_listeners`, `port_conflict`) for `validate_proxy_with_tunnels`, `@tunnel:`/`@forward:` external dialers, tunnel forward listener conflict/self-loop checks, friendly upstream labels, and added unit + E2E tests
-- sub-task 4: ran full `conduit-runtime` clippy and test verification suite
+- planner begins phase-0002 (planner-owned)
+- sub-task 1: `MAX_ARGON_*` consts in crypto.rs, re-exported from lib.rs, enforced at the top of `to_argon2()` (InvalidFormat "unsupported Argon2 parameters: ..."); export.rs imports them
+- sub-task 2: tests `argon_params_above_caps_are_rejected`, `unwrap_dek_rejects_huge_argon_memory_before_deriving` (crypto.rs), `backup_rejects_huge_argon_memory_before_deriving` (keys.rs); each asserts < 1 s
+- sub-task 3: `Dek::to_bytes` → `Zeroizing<Vec<u8>>`; keyring get_dek copies wrapped; MemoryKeyringBackend::set_dek builds its SecretBox via `with_key` (no loose copy); `unwrap_dek` plaintext wrapped; Ed25519 seed and backup key `Zeroizing<[u8; 32]>`; export.rs salt sites take a public `Vec` slice of the generator output
+- sub-task 4: `create_private` (OpenOptions write + create_new + mode 0600) in store.rs and storage.rs replaces `File::create` + later chmod; temp names are fresh UUIDs, so no retry reuses a name; tests check the helper's mode and refusal to reuse
+- sub-task 5: conduit-vault DOX Local Contracts list the caps, Zeroizing rule, and 0600 create_new temp file
+- phase-0002 verified and closed
+
+- Gate D: storage.rs doc comment was attached to the wrong fn; export.rs had a mid-file `use`; both fixed (sub-task 6)
 
 ## Evidence
 - (append-only: command → observed result)
-- `cargo test -p conduit-runtime --lib tunnel_manager::tests` → exit 0 (14 passed; 0 failed)
-- `cargo test -p conduit-runtime --lib tunnel_manager::tests::loopback_tunnel_forward` → exit 0 (2 passed; 0 failed)
-- `cargo test -p conduit-runtime --lib proxy_manager::tests && cargo test -p conduit-runtime --test u2_tunnels_proxies proxy_routes_through_synthetic_tunnel_and_forward_targets_with_filter` → exit 0 (15 unit + 1 E2E passed; 0 failed)
-- `cargo clippy -p conduit-runtime --all-targets -- -D warnings && cargo test -p conduit-runtime` → exit 0 (0 warnings; 97 unit + 9 e2e_runtime + 9 openssh_e2e + 8 u2_tunnels_proxies = 123 passed, 0 failed)
+- `cargo test --workspace --locked argon` → 3 new tests ok (plus existing export argon test in the full run)
+- `grep -c 'const MAX_ARGON' src-tauri/src/controller/export.rs` → 0; `grep -n 'fn to_bytes' crates/conduit-vault/src/crypto.rs` → `75: pub fn to_bytes(&self) -> Zeroizing<Vec<u8>>`
+- `cargo test -p conduit-vault -p conduit-core --locked` → all ok (156 + 48 + 7)
+- `grep -c 'MAX_ARGON_MEMORY_KIB' crates/conduit-vault/DOX.md` → 1
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` → exit 0; `cargo test --workspace --locked` → 673 passed, 0 failed; secret_leak_scan → 6 passed; PURE_RUST_CRYPTO_OK; `git diff --exit-code -- crates/conduit-openssh src-tauri/ui` → exit 0
+- Gate D fix-up: clippy exit 0; `cargo test --workspace --locked` → 680 passed

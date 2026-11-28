@@ -1,56 +1,55 @@
-# phase-0005 — UI: Tunnel editor Proxy/Filters/MITM tabs, -L proxy protocol, and plain Start mode
+# phase-0005 — conduit-openssh: Linux-only parent thread and stale runtime directory sweep
 
 - Status: done
-- Owner: executor
-- Depends on: phase-0003
-- Goal: Update the Tunnel editor to show Proxy (Forward + Reverse cards with clear guidance), Filters, and conditional MITM tabs, add the Proxy protocol selector to Local `-L` port forwards, and reword Tunnel Start mode into 3 plain radio choices.
-- Done when: `(cd src-tauri/ui && npm run check && npm test)` exits 0 with zero warnings.
-- Pattern to follow: `src-tauri/ui/src/lib/components/TunnelEditor.svelte`, `src-tauri/ui/src/lib/components/SessionEditor.svelte` (how `ProxyTab`, `FiltersTab`, and `MitmTab` are wired), `src-tauri/ui/src/lib/components/ForwardProxyTab.svelte`, `src-tauri/ui/src/lib/components/KeepaliveTab.svelte:133-169`, `src-tauri/ui/src/lib/components/PortForwardRow.svelte`.
+- Owner: planner
+- Depends on: phase-0004
+- Goal: Spawn `ssh` from a dedicated `conduit-ssh-parent` thread only on Linux, where `PR_SET_PDEATHSIG` needs it, and remove the `rc-*` runtime directories a crashed app left behind, once at app startup.
+- Done when: every command in `## Verify` exits 0, including a sweep test that removes a stale `rc-<8 hex>` directory and keeps a non-matching one.
+- Pattern to follow: `crates/conduit-openssh/src/supervisor.rs:234-258` (`spawn_guarded`), `crates/conduit-openssh/src/runtime_dir.rs:28-52` (`RuntimeDir::create_in`, the `rc-<hex>` naming)
 
 ## Context
-Decisions already made by the user:
-1. Tunnels must still have both **Forward** and **Reverse** cards in a **"Proxy"** tab (replacing today's "Reverse" tab). On a Tunnel, Forward is **off by default**, and can be toggled off even if Reverse and port forwards are also off (unlike legacy v1 sessions). Show a clear guidance note in the Forward card: Proxies that route through this tunnel dial it directly without needing a local forward listener; only enable Forward if you need a dedicated local bind address and port (`ssh -D` style). If Forward is enabled and a Proxy also uses this tunnel, the Proxy bypasses the tunnel's forward ip:port and tunnel MITM, while still enforcing the tunnel's configured filters.
-2. Add a **"Filters"** tab to `TunnelEditor.svelte` editing `tunnel.forward.allow` / `tunnel.forward.block` (with a note that these filters apply both to the optional Forward listener and to all Proxy traffic routed through this tunnel) and `tunnel.reverse.reverse_allow` / `tunnel.reverse.reverse_block`.
-3. Show a **"MITM"** tab in `TunnelEditor.svelte` **only when `tunnel.forward.enabled` is true** (reset `activeTab` to Proxy/Connection if Forward is toggled off while on MITM). Include a note that MITM applies only to this tunnel's own Forward listener, not to Proxies routing through the tunnel.
-4. In `PortForwardRow.svelte`, for `Local -L` forwards only, add a **Proxy protocol** `<select>` (`None (raw TCP)` = `"none"`, `HTTP proxy` = `"http"`, `SOCKS5 proxy` = `"socks5"`) with a short hint that HTTP/SOCKS5 forwards appear as selectable profiles in Proxy Routing. When switching direction to `Remote -R`, reset `proxy_protocol` to `"none"`.
-5. In `KeepaliveTab.svelte`, reword the Tunnel Start mode fieldset into 3 clear top-level radio options (no nested checkbox):
-   - *Run only while a Proxy uses it* (`"linked"`)
-   - *Start manually* (`{ manual: { autostart: false } }`)
-   - *Start with the app* (`{ manual: { autostart: true } }`)
-   Also update the header pill in `TunnelEditor.svelte` to reflect `"Auto-start"` when `manual.autostart` is true, `"Manual"` when `manual.autostart` is false, and `"Linked"` when `"linked"`.
+B-03 (GUI part): `spawn_guarded` creates an idle OS thread per session on every platform, but only Linux needs it (the parent-death signal fires when the spawning thread exits). macOS uses the `conduit-worker` parent watcher and Windows a Job Object, both already in `crates/conduit-openssh/src/orphan.rs`. On non-Linux targets, spawn directly inside the runtime and return a keep-alive sender whose receiver is already dropped, so callers stay unchanged.
+A crash (`SIGKILL`, power loss) skips `RuntimeDir`'s `Drop`, leaving `rc-<hex>` directories (askpass sockets, agent sockets, known_hosts) under the runtime base. Decision: add `pub fn sweep_stale_runtime_dirs() -> io::Result<usize>` (with a testable `sweep_in(base)`) that removes entries named exactly `rc-` + 8 lowercase hex characters that are directories owned by the current user (Unix: `metadata.uid() == getuid()`); call it once from app startup after the single-instance guard and before any Tunnel starts, logging the count at debug level. The single-instance plugin guarantees no other app instance owns those directories.
+Amendment (planner, 2026-11-28, before starting): on macOS the base is the shared `/tmp`, where another program could own a same-named `rc-<hex>` directory. `RuntimeDir::create_in` therefore writes an empty marker file `.rusty-conduit-runtime` (owner-only) inside each new directory, and the sweep removes only matching directories that contain that marker. Directories left by a crash before this change lack the marker and are kept (safe failure).
+Deferred by plan: owner-only DACLs on the Windows agent pipes (`agent_server.rs:149-153`); the `socks_port == 0` path (unreachable).
 
 ## Scope
-- In: `src-tauri/ui/src/lib/components/TunnelEditor.svelte`, `src-tauri/ui/src/lib/components/ForwardProxyTab.svelte`, `src-tauri/ui/src/lib/components/ReverseProxyTab.svelte`, `src-tauri/ui/src/lib/components/PortForwardsTab.svelte`, `src-tauri/ui/src/lib/components/FiltersTab.svelte`, `src-tauri/ui/src/lib/components/PortForwardRow.svelte`, `src-tauri/ui/src/lib/components/KeepaliveTab.svelte`, `src-tauri/ui/src/lib/portForwards.ts`, `src-tauri/ui/src/lib/portForwards.test.ts`
-- Out: `crates/`, `src-tauri/src/`, `src-tauri/ui/src/lib/components/ProxyRoutingTab.svelte`, `src-tauri/ui/dist/`
+- In: `crates/conduit-openssh/src/supervisor.rs` (`spawn_guarded` only), `crates/conduit-openssh/src/runtime_dir.rs`, `crates/conduit-openssh/src/lib.rs` (re-export only), the one `src-tauri/src/` startup site that calls the sweep, `crates/conduit-openssh/DOX.md`
+- Out: `crates/conduit-openssh/src/orphan.rs`, `agent_server.rs`, `askpass.rs`, `crates/conduit-runtime/`, `src-tauri/ui/`
 
 ## Sub-tasks
-1. [done] In `src-tauri/ui/src/lib/components/TunnelEditor.svelte`: (a) wire `tunnel.forward`, `tunnel.mitm`, `tunnel.socks_block_web`, and `snapshot.listeners` through `tunnelAsSession`, `sessionIntoTunnel`, and `tunnelAsSessionView` (removing `NO_FORWARD`), (b) replace the `"Reverse"` tab with `"Proxy"` (rendering `ForwardProxyTab` with tunnel guidance + `ReverseProxyTab`), add `"Filters"` tab (rendering `FiltersTab` with tunnel filter note), and conditionally include the `"MITM"` tab (rendering `MitmTab`) only when `tunnel.forward.enabled` is true, (c) update `tabForField` and `activeTab` clamping when MITM tab disappears, (d) update the start-mode header pill (`Linked` / `Manual` / `Auto-start`). — done when: `TunnelEditor.svelte` compiles cleanly under `npm run check`.
-2. [done] In `src-tauri/ui/src/lib/components/ForwardProxyTab.svelte`, detect tunnel mode (or accept an optional `isTunnel` prop) so that on a Tunnel: (a) `lockedReason` is always `undefined` (Forward can always be turned off), (b) the guidance note about Proxies dialing the tunnel directly (bypassing ip:port and tunnel MITM, while still enforcing tunnel filters) is shown, and (c) `ForwardProxyTab` reads/writes `editor.draft.forward` via `useChainEditor()` or props so it works identically for both `SessionEditor` and `TunnelEditor`. Check `FiltersTab.svelte` similarly so it works cleanly in `TunnelEditor` via the editor context or props. — done when: `(cd src-tauri/ui && npm run check)` exits 0.
-3. [done] In `src-tauri/ui/src/lib/components/PortForwardRow.svelte` and `src-tauri/ui/src/lib/portForwards.ts`, add the **Proxy protocol** `<select>` (`none` / `http` / `socks5`) for `Local -L` forwards, reset `proxy_protocol` to `"none"` in `setDirection("remote")`, and ensure newly created `PortForward` objects include `proxy_protocol: "none"`. Update `portForwards.test.ts` to cover `proxy_protocol` defaults and round-trips. — done when: `(cd src-tauri/ui && npm run check && npm test)` exits 0.
-4. [done] In `src-tauri/ui/src/lib/components/KeepaliveTab.svelte`, replace the 2-radio + nested-checkbox Start mode UI with the 3 plain radio choices (*Run only while a Proxy uses it*, *Start manually*, *Start with the app*) mapping directly to `"linked"`, `{ manual: { autostart: false } }`, and `{ manual: { autostart: true } }`. — done when: `(cd src-tauri/ui && npm run check && npm test)` exits 0.
-5. [done] In `src-tauri/ui/src/lib/components/ReverseProxyTab.svelte` and `src-tauri/ui/src/lib/components/PortForwardsTab.svelte`, allow turning off Reverse proxy and Port Forwards freely when `ed.isTunnel` is true (`lockedReason` = `undefined` on Tunnels, since Tunnels need no local listener), while preserving the existing lock for legacy v1 `SessionEditor`. — done when: `(cd src-tauri/ui && npm run check && npm test)` exits 0.
+1. [done] `#[cfg(target_os = "linux")]` on the thread-based `spawn_guarded`; a `#[cfg(not(target_os = "linux"))]` variant that spawns directly and returns `(child, keep_tx)` with the receiver dropped; doc comments explain why — done when: `cargo clippy -p conduit-openssh --all-targets --locked -- -D warnings` passes and `grep -n 'conduit-ssh-parent' crates/conduit-openssh/src/supervisor.rs` sits inside the Linux-only function.
+2. [done] Marker file in `RuntimeDir::create_in`, and `sweep_in(base)` / `sweep_stale_runtime_dirs()` in `runtime_dir.rs` as decided, with tests on a temp base: a stale `rc-0a1b2c3d` directory with the marker is removed; `rc-0a1b2c3e` without the marker, `rc-xyz`, `rc-0a1b2c3d0`, a plain file named `rc-01234567`, and `other` are kept; a `RuntimeDir` created in the base contains the marker — done when: `cargo test -p conduit-openssh --locked runtime_dir` passes.
+3. [done] Call the sweep once at startup in `src-tauri/src/` (find the site with `grep -n 'single_instance\|fn run' src-tauri/src/lib.rs`) and log the count at debug level; a failure is logged and ignored — done when: `cargo test -p rusty-conduit-gui --locked` passes.
+4. [done] DOX pass: `crates/conduit-openssh/DOX.md` notes the Linux-only parent thread and the startup sweep — done when: `grep -c 'sweep' crates/conduit-openssh/DOX.md` prints at least `1`.
 
 ## Verify
 ```sh
-cd src-tauri/ui && npm run check && npm test
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+git diff --exit-code -- crates/conduit-openssh/src/orphan.rs crates/conduit-openssh/src/agent_server.rs crates/conduit-runtime src-tauri/ui
 ```
+- manual (planner): the Linux build compiles the thread path — CI after push, or a Linux container if Docker is running.
 
 ## Escalate when
-- `ForwardProxyTab.svelte` or `FiltersTab.svelte` relies on `store.draft` in a way that breaks legacy `SessionEditor.svelte` when adapted for `TunnelEditor.svelte` → stop, set Status: needs-human — reason: describe the coupling.
+- The app has no single-instance guard on some platform → stop, set Status: needs-human — reason: the sweep could delete a live instance's directory.
+- A Tunnel test fails on macOS after the direct-spawn change → stop, set Status: needs-human — reason: paste the failure.
 
 ## Log
 - (append-only, one line per event)
-- sub-task 1: wired `tunnel.forward`, `tunnel.mitm`, `tunnel.socks_block_web` in `TunnelEditor.svelte`, replaced Reverse with Proxy, added Filters and conditional MITM tabs, clamped `activeTab` when Forward is disabled, and updated start-mode header pill (`Linked` / `Manual` / `Auto-start`).
-- sub-task 2: adapted `ForwardProxyTab.svelte` and `FiltersTab.svelte` to use `chainEditor()` with tunnel mode detection, unlocked Forward toggle on Tunnels, and added tunnel guidance/filter notes.
-- sub-task 3: added Proxy protocol selector (`none` / `http` / `socks5`) for Local `-L` forwards in `PortForwardRow.svelte`, reset `proxy_protocol` to `"none"` on switch to Remote `-R`, verified `newForward` defaults in `portForwards.ts`, and added `proxy_protocol` tests in `portForwards.test.ts`.
-- sub-task 4: replaced 2-radio + nested-checkbox Start mode in `KeepaliveTab.svelte` with 3 plain top-level radio choices (`Run only while a Proxy uses it`, `Start manually`, `Start with the app`) and removed unused `.nested` style.
-- planner reopened phase-0005 with sub-task 5 to unlock `lockedReason` in `ReverseProxyTab.svelte` and `PortForwardsTab.svelte` when `ed.isTunnel` is true.
-- sub-task 5: unlocked `lockedReason` when `ed.isTunnel` is true in `ReverseProxyTab.svelte` and `PortForwardsTab.svelte`, preserving the legacy v1 `SessionEditor` lock.
+- planner amended Context and sub-task 2 before starting: marker-file guard so the sweep cannot delete a same-named directory another program owns in the shared macOS `/tmp`
+- planner begins phase-0005 (planner-owned)
+- sub-task 1: thread-based `spawn_guarded` is `#[cfg(target_os = "linux")]`; non-Linux variant spawns directly and returns a sender whose receiver is dropped
+- sub-task 2: `RUNTIME_MARKER` written by `create_in` (Drop removes the dir if that fails); `sweep_in` / `sweep_stale_runtime_dirs` match `rc-<8 lowercase hex>`, real dir (symlink_metadata), owner uid, marker file; tests `runtime_dir_sweep_removes_only_marked_stale_dirs`, `runtime_dir_holds_the_sweep_marker` (an uppercase-name case was dropped: macOS filesystems are case-insensitive)
+- sub-task 3: sweep called in `src-tauri/src/lib.rs` setup just before `AppController::open`; the app has no log levels (eprintln only), so it prints only when something was removed or the sweep failed
+- sub-task 4: conduit-openssh DOX Local Contracts describe the Linux-only parent thread and the marker-guarded startup sweep
+- rustfmt: the crate had 4 pre-existing rustfmt diffs (lib.rs, supervisor.rs imports); the new code adds none
+- phase-0005 verified and closed
 
 ## Evidence
 - (append-only: command → observed result)
-- `cd src-tauri/ui && npm run check` → exit 0 (`svelte-check found 0 errors and 0 warnings`)
-- `cd src-tauri/ui && npm run check` (after sub-task 2) → exit 0 (`svelte-check found 0 errors and 0 warnings`)
-- `cd src-tauri/ui && npm run check && npm test` (after sub-task 3) → exit 0 (`svelte-check found 0 errors and 0 warnings`; 105/105 UI tests passed)
-- `cd src-tauri/ui && npm run check && npm test` (after sub-task 4 / phase verify) → exit 0 (`svelte-check found 0 errors and 0 warnings`; 105/105 UI tests passed)
-- `cd src-tauri/ui && npm run check && npm test` (after sub-task 5 / phase verify) → exit 0 (`svelte-check found 0 errors and 0 warnings`; 105/105 UI tests passed)
+- `cargo test -p conduit-openssh --locked runtime_dir` → 7 passed + `runtime_dir_is_removed_and_ssh_stops_on_drop` passed
+- `grep -n 'conduit-ssh-parent' crates/conduit-openssh/src/supervisor.rs` → line 244, inside the `#[cfg(target_os = "linux")]` fn at 238
+- `grep -c 'sweep' crates/conduit-openssh/DOX.md` → 1
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` → exit 0; `cargo test --workspace --locked` → 680 passed, 0 failed; `git diff --exit-code -- crates/conduit-openssh/src/orphan.rs crates/conduit-openssh/src/agent_server.rs crates/conduit-runtime src-tauri/ui` → exit 0
+- manual Linux: rust:1-bookworm `cargo clippy -p conduit-openssh --all-targets --locked -- -D warnings && cargo test -p conduit-openssh --locked` → exit 0 (59 unit + 6 integration passed)

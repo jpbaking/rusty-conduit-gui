@@ -4805,6 +4805,7 @@ dependencies = [
  "conduit-tray",
  "conduit-vault",
  "getrandom 0.4.3",
+ "libc",
  "p12-keystore",
  "rcgen",
  "ring",

@@ -45,7 +45,7 @@ Always export the Proxy as `rusty-conduit-switch`: it covers every Proxy mode, s
 | Upstream profile, password in the vault | `password_file = "/run/secrets/<profile>"` (packaged or placeholder) |
 | Upstream profile, `password_env` / `password_file` | Kept as is, plus a `.env.example` entry or a placeholder file |
 | Upstream host `127.0.0.1` / `localhost` | Rewritten to `host.docker.internal`, with `extra_hosts: ["host.docker.internal:host-gateway"]` and a warning |
-| `UpstreamKind::Tunnel` profile | `type = "socks5"`, `host = "tunnel-<name>"`, `port = 1080`. Today's switch export writes this as a commented placeholder; the exporter needs a mode that writes it for real. |
+| `UpstreamKind::Tunnel` profile or `@tunnel:` / `@forward:` target | `type = "socks5"`, `host = "tunnel-<name>"`, `port = 1080` (a forward: its `http`/`socks5` listener). Today's switch export writes these as commented placeholders (synthetic targets renamed `tunnel-<id>` / `forward-<id>`); the exporter needs a mode that writes them for real. |
 | `TunnelForward` target (a `-L` forward with a proxy protocol) | A profile of that protocol at `tunnel-<name>:<forward port>`, and `-L 0.0.0.0:<port>:<dest>` after `--` on the tunnel service |
 | Tunnel hops (`HopEntry`) | `ssh_config`: one `Host` block per hop, `ProxyJump` to the previous one, `HostKeyAlias`, `UserKnownHostsFile`, `StrictHostKeyChecking yes`, `BatchMode yes`, `UpdateHostKeys no`. Adapt `conduit-openssh`'s `render_config`, which already renders this chain. |
 | Pinned host keys | `known_hosts` via `conduit-openssh`'s `render_known_hosts`, from `HostKeyRecord.public_key_openssh` |

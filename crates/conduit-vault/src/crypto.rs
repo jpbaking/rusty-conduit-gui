@@ -33,6 +33,16 @@ pub const NONCE_BYTES: usize = 24;
 /// Size of the Argon2id salt in bytes.
 pub const SALT_BYTES: usize = 16;
 
+// Argon2 parameters are read from files before anything authenticates them, so a hostile
+// `vault.bin` header, backup, or export must not be able to make a derivation map terabytes of
+// memory or run for hours. Every derivation checks these in [`Argon2Params::to_argon2`].
+/// Largest accepted Argon2 memory cost in KiB (1 GiB).
+pub const MAX_ARGON_MEMORY_KIB: u32 = 1024 * 1024;
+/// Largest accepted Argon2 time cost (iterations).
+pub const MAX_ARGON_TIME_COST: u32 = 64;
+/// Largest accepted Argon2 parallelism (lanes).
+pub const MAX_ARGON_PARALLELISM: u8 = 16;
+
 /// AAD domain-separation tag bound into every record ciphertext. Kept in one place so the
 /// record AAD and the DEK-wrapping AAD can never drift.
 const DEK_WRAP_AAD: &[u8] = b"conduit-vault::dek-wrap::v1";
@@ -61,9 +71,9 @@ impl Dek {
         Ok(Dek(SecretBox::new(Box::new(arr))))
     }
 
-    /// Serialize the DEK to raw bytes (for keyring storage or header wrapping).
-    pub fn to_bytes(&self) -> Vec<u8> {
-        self.0.expose_secret().to_vec()
+    /// Copy the DEK out as raw bytes (for keyring storage); the copy zeroizes on drop.
+    pub fn to_bytes(&self) -> Zeroizing<Vec<u8>> {
+        Zeroizing::new(self.0.expose_secret().to_vec())
     }
 
     /// Borrow the raw key bytes for the duration of `f`. The bytes are never copied out of the
@@ -123,9 +133,23 @@ impl Argon2Params {
         derived_key_len: 32,
     };
 
-    /// Build the [`Argon2`] builder for these parameters.
+    /// Build the [`Argon2`] builder for these parameters, rejecting any above the
+    /// `MAX_ARGON_*` caps (or a key length other than 32) before memory is reserved.
     pub fn to_argon2(&self) -> Result<Argon2<'static>, VaultError> {
         use argon2::Params;
+        let within_caps = self.derived_key_len == 32
+            && self.memory_kib <= MAX_ARGON_MEMORY_KIB
+            && (1..=MAX_ARGON_TIME_COST).contains(&self.time_cost)
+            && (1..=MAX_ARGON_PARALLELISM).contains(&self.parallelism);
+        if !within_caps {
+            return Err(VaultError::InvalidFormat {
+                reason: format!(
+                    "unsupported Argon2 parameters: memory {} KiB, time cost {}, parallelism {}, \
+                     key length {}",
+                    self.memory_kib, self.time_cost, self.parallelism, self.derived_key_len
+                ),
+            });
+        }
         Params::new(self.memory_kib, self.time_cost, self.parallelism as u32, Some(self.derived_key_len))
             .map(|p| Argon2::new(Algorithm::Argon2id, Version::V0x13, p))
             .map_err(|e| VaultError::Crypto {
@@ -347,6 +371,7 @@ pub fn unwrap_dek(wrapped: &[u8], master_key: &[u8]) -> Result<Dek, VaultError> 
             },
         )
         .map_err(|_| VaultError::UnlockFailed)?;
+    let pt = Zeroizing::new(pt);
     Dek::from_bytes(&pt)
 }
 
@@ -462,6 +487,36 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect::<String>();
         assert!(!rendered.contains(&hex));
+    }
+
+    #[test]
+    fn argon_params_above_caps_are_rejected() {
+        let over = [
+            Argon2Params { memory_kib: MAX_ARGON_MEMORY_KIB + 1, ..Argon2Params::FAST },
+            Argon2Params { time_cost: 0, ..Argon2Params::FAST },
+            Argon2Params { time_cost: MAX_ARGON_TIME_COST + 1, ..Argon2Params::FAST },
+            Argon2Params { parallelism: 0, ..Argon2Params::FAST },
+            Argon2Params { parallelism: MAX_ARGON_PARALLELISM + 1, ..Argon2Params::FAST },
+            Argon2Params { derived_key_len: 64, ..Argon2Params::FAST },
+        ];
+        for params in over {
+            assert!(
+                matches!(params.to_argon2(), Err(VaultError::InvalidFormat { .. })),
+                "{params:?} was accepted"
+            );
+        }
+        assert!(Argon2Params::BASELINE.to_argon2().is_ok());
+        assert!(Argon2Params::FAST.to_argon2().is_ok());
+    }
+
+    #[test]
+    fn unwrap_dek_rejects_huge_argon_memory_before_deriving() {
+        let dek = sample_dek();
+        let mut header = VaultHeader::new(&dek, &Argon2Params::FAST, b"pw");
+        header.argon2.memory_kib = u32::MAX;
+        let started = std::time::Instant::now();
+        assert!(matches!(header.unwrap_dek(b"pw"), Err(VaultError::InvalidFormat { .. })));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
     #[test]

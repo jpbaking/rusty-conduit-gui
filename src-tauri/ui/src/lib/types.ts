@@ -17,6 +17,8 @@ export type AppErrorCode =
   | "storage"
   | "validation"
   | "runtime"
+  | "proxy"
+  | "tunnel"
   | "vault_not_initialized"
   | "vault_exists"
   | "not_found"
@@ -392,7 +394,7 @@ export interface ChainTestResult {
 
 // Session-editor helpers.
 
-export type PortConflictKind = "session" | "os_socket";
+export type PortConflictKind = "session" | "proxy" | "tunnel" | "os_socket";
 
 export interface PortConflict {
   port: number;

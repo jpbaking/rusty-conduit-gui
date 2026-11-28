@@ -3,7 +3,14 @@
 import { api, errorMessage, subscribeShellEvents, subscribeV2Events } from "./api";
 import { authRefs, blankHost, profileRefs } from "./chain";
 import { isActive } from "./format";
-import { hostErrors, proxyErrors, sessionErrors, tunnelErrors, type FieldErrors } from "./validate";
+import {
+  hostErrors,
+  proxyErrors,
+  sessionErrors,
+  tunnelErrors,
+  tunnelTarget,
+  type FieldErrors,
+} from "./validate";
 import type {
   AuthMethod,
   CaView,
@@ -143,12 +150,6 @@ function blankProxy(name: string, httpPort: number, socksPort: number): Proxy {
     mitm: null,
     logging: { ...DEFAULT_LOGGING },
   };
-}
-
-/** A profile name derived from a Tunnel's name: lower case, words joined by `-`. */
-export function tunnelProfileName(tunnelName: string): string {
-  const slug = tunnelName.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
-  return slug && slug !== "direct" && slug !== "block" ? slug : "tunnel";
 }
 
 /** Vault records an upstream profile's password points at. */
@@ -518,8 +519,20 @@ class AppStore {
   async deleteKey(id: KeyId, confirmed: Usage): Promise<Usage | null> {
     const first = await api.deleteKey(id);
     if (!first.deleted) {
-      const seen = new Set([...confirmed.hosts, ...confirmed.sessions].map((ref) => ref.id));
-      const current = [...first.usage.hosts, ...first.usage.sessions];
+      const seen = new Set(
+        [
+          ...confirmed.hosts,
+          ...confirmed.sessions,
+          ...(confirmed.tunnels ?? []),
+          ...(confirmed.proxies ?? []),
+        ].map((ref) => ref.id),
+      );
+      const current = [
+        ...first.usage.hosts,
+        ...first.usage.sessions,
+        ...(first.usage.tunnels ?? []),
+        ...(first.usage.proxies ?? []),
+      ];
       if (current.some((ref) => !seen.has(ref.id))) return first.usage;
       const forced = await api.deleteKey(id, true);
       if (!forced.deleted) return forced.usage;
@@ -541,7 +554,7 @@ class AppStore {
 
   /** Names of unsaved edits whose MITM uses this CA. */
   draftsUsingCa(id: MitmCaId): string[] {
-    return Object.values(this.drafts)
+    return [...Object.values(this.drafts), ...Object.values(this.proxyDrafts)]
       .filter((profile) => profile.mitm?.ca === id)
       .map((profile) => profile.name);
   }
@@ -553,8 +566,11 @@ class AppStore {
   async deleteMitmCa(id: MitmCaId, confirmed: Usage): Promise<Usage | null> {
     const first = await api.deleteMitmCa(id);
     if (!first.deleted) {
-      const seen = new Set(confirmed.sessions.map((ref) => ref.id));
-      if (first.usage.sessions.some((ref) => !seen.has(ref.id))) return first.usage;
+      const seen = new Set(
+        [...confirmed.sessions, ...(confirmed.proxies ?? [])].map((ref) => ref.id),
+      );
+      const current = [...first.usage.sessions, ...(first.usage.proxies ?? [])];
+      if (current.some((ref) => !seen.has(ref.id))) return first.usage;
       const forced = await api.deleteMitmCa(id, true);
       if (!forced.deleted) return forced.usage;
     }
@@ -563,6 +579,11 @@ class AppStore {
       profile.mitm?.ca === id ? { ...profile, mitm: { ...profile.mitm, ca: null } } : profile,
     ]);
     this.drafts = Object.fromEntries(drafts);
+    const proxyDrafts = Object.entries(this.proxyDrafts).map(([key, profile]) => [
+      key,
+      profile.mitm?.ca === id ? { ...profile, mitm: { ...profile.mitm, ca: null } } : profile,
+    ]);
+    this.proxyDrafts = Object.fromEntries(proxyDrafts);
     await this.refresh();
     return null;
   }
@@ -973,7 +994,11 @@ class AppStore {
     await api.trustTestedHostKey(pending.sessionId, sha256);
     this.testHostKey = null;
     await this.refresh();
-    if (this.selectedId === pending.sessionId) await this.testSelected();
+    if (this.selectedTunnelId === pending.sessionId) {
+      await this.testTunnelChain(pending.sessionId);
+    } else if (this.selectedId === pending.sessionId) {
+      await this.testSelected();
+    }
   }
 
   /** Leaves the key untrusted. The hop stays marked in the test result. */
@@ -1136,22 +1161,7 @@ class AppStore {
     const proxy = blankProxy(names[preset], httpPort, socksPort);
     const tunnel =
       this.tunnels.find((t) => t.profile.id === tunnelId)?.profile ?? this.tunnels[0]?.profile ?? null;
-    if (preset !== "direct" && (preset === "tunnel" || tunnel)) {
-      const name = tunnel ? tunnelProfileName(tunnel.name) : "tunnel";
-      proxy.profiles = [
-        {
-          name,
-          kind: { type: "tunnel", tunnel_id: tunnel?.id ?? tunnelId ?? NEW_SESSION_ID },
-          host: null,
-          port: null,
-          username: null,
-          password: null,
-          bypass: [],
-          color: null,
-        },
-      ];
-      if (preset === "tunnel") proxy.routing = { ...proxy.routing, default: name };
-    }
+    if (preset === "tunnel") proxy.routing = { ...proxy.routing, default: tunnelTarget(tunnel?.id ?? tunnelId ?? NEW_SESSION_ID) };
     this.proxyDrafts = { ...this.proxyDrafts, [NEW_SESSION_ID]: proxy };
     this.selectProxy(NEW_SESSION_ID);
     return proxy;
@@ -1448,9 +1458,17 @@ class AppStore {
 
   async testTunnelChain(id: TunnelId): Promise<TunnelChainTestResult | null> {
     this.tunnelChainResult = null;
+    this.testHostKey = null;
     try {
       const result = await api.testTunnelChain(id);
-      if (this.selectedTunnelId === id) this.tunnelChainResult = result;
+      if (this.selectedTunnelId === id) {
+        this.tunnelChainResult = result;
+        const prompt = result.hops.find((hop) => hop.host_key)?.host_key;
+        if (prompt) {
+          const sessionName = this.tunnels.find((t) => t.profile.id === id)?.profile.name ?? "Tunnel";
+          this.testHostKey = { sessionId: id, sessionName, prompt, source: "test" };
+        }
+      }
       return result;
     } catch (error) {
       this.notice = errorMessage(error);

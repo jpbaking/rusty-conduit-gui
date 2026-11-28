@@ -139,6 +139,12 @@ jobs:
           rustup default stable
           rustup target add $RUST_TARGETS
 
+      - name: Cache Rust builds and the Tauri CLI
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rusty-conduit-gui -> target
+          key: release-${{ matrix.name }}
+
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "$TAURI_CLI_VERSION" --locked
 

@@ -1,49 +1,61 @@
-# phase-0003 — Tauri controller, IPC, tray bridge, and frontend types/validation sync
+# phase-0003 — CLI config.toml drift: error_page, @tunnel/@forward export, socks_block_web merge
 
 - Status: done
-- Owner: executor
+- Owner: planner
 - Depends on: phase-0002
-- Goal: Wire the new core/runtime tunnel and routing capabilities through `src-tauri` controllers, tray bridge, and `src-tauri/ui` TypeScript wire types, client validation, and mock data.
-- Done when: `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, and `(cd src-tauri/ui && npm run check && npm test)` all exit 0.
-- Pattern to follow: `src-tauri/src/controller/proxies.rs:176-210` (`upsert_proxy`), `src-tauri/src/tray_bridge.rs:85-115` (proxy tray item building), `src-tauri/ui/src/lib/types.ts` and `src-tauri/ui/src/lib/validate.ts`.
+- Goal: Accept every CLI `config.toml` the three CLIs accept, export v2 Proxies that route through `@tunnel:` / `@forward:` targets, normalize imported Proxies to v2 targets, and keep `socks_block_web` in linked-file mode.
+- Done when: every command in `## Verify` exits 0, including the new round-trip tests in sub-tasks 1-4.
+- Pattern to follow: `crates/conduit-core/src/toml_io.rs:1361-1394` (the existing commented `socks5` placeholder and note for a legacy `UpstreamKind::Tunnel` profile in the Switch exporter); `crates/conduit-core/src/v2_model.rs:628-660` (`TargetRef::parse`)
 
 ## Context
-`src-tauri` adapts `conduit-core` and `conduit-runtime` over Tauri IPC, and `src-tauri/ui/src/lib/types.ts` + `validate.ts` must exactly mirror the serialized Rust structs and validation rules. Existing saved configs may contain legacy `UpstreamKind::Tunnel` profiles in `proxy.profiles`, so `AppController` should run `migrate_tunnel_profiles` on load (and keep config valid). Also `src-tauri/ui/src/lib/mock.ts` must compile against updated `types.ts` so `npm run check` stays green.
+B-04 (1): `ConduitFile`, `SshFile`, and `SwitchFile` are `deny_unknown_fields` and lack `error_page`, so a valid CLI file with `error_page = "..."` is rejected. The app has no custom error page, so import accepts the key and adds the warning `error_page <path> was not imported: the app serves the built-in error page`; export never writes it.
+(2) After `migrate_tunnel_profiles` (`v2_model.rs:700-732`), Proxies route to `@tunnel:<uuid>` / `@forward:<tid>:<fid>` instead of `UpstreamKind::Tunnel` profiles. `export_rusty_conduit_ssh_toml` only recognizes the legacy profile, and the Switch exporter writes the raw synthetic targets, which no CLI accepts. Decision: the SSH exporter accepts a default of exactly one `@tunnel:<uuid>` as well as the legacy profile. The Switch exporter gives every synthetic target a profile name (`tunnel-<tunnel uuid>`; `forward-<forward uuid>`), rewrites routing (default, rules, `http`/`socks` tables) and composite slots to those names, and emits a commented placeholder plus a note for each, like the legacy path does: `socks5 127.0.0.1:1080` for a tunnel, and for a forward a profile of its `proxy_protocol` (`http` or `socks5`) at the forward's `bind:port`, with a note to run `ssh -L <listen>:<dest>` for it.
+`commit_toml_import` (`src-tauri/src/controller/import_export.rs:342-415`) still saves legacy `UpstreamKind::Tunnel` profiles until the next restart; run `conduit_core::migrate_tunnel_profiles(&mut proxy)` after the tunnel-id fix-up and before `upsert_proxy`.
+(3) `merge_external_toml` (`crates/conduit-runtime/src/toml_watcher.rs:154-202`) copies listeners, network, routing, filter, logging, and profiles but drops the file's top-level `socks_block_web`; copy it too and update the doc comment above the function.
 
 ## Scope
-- In: `src-tauri/src/controller/proxies.rs`, `src-tauri/src/controller/tunnels.rs`, `src-tauri/src/controller/parity.rs`, `src-tauri/src/controller.rs`, `src-tauri/src/controller/import_export.rs`, `src-tauri/src/tray_bridge.rs`, `src-tauri/src/commands.rs`, `src-tauri/ui/src/lib/types.ts`, `src-tauri/ui/src/lib/validate.ts`, `src-tauri/ui/src/lib/validate.test.ts` (if present), `src-tauri/ui/src/lib/mock.ts`, `src-tauri/ui/src/lib/stores.svelte.ts`, `src-tauri/ui/src/lib/portForwards.ts`, `src-tauri/ui/src/lib/components/TunnelEditor.svelte` (only minimal compile-fix if `TunnelSnapshot.listeners` or `Tunnel.forward` breaks `npm run check`)
-- Out: `crates/conduit-core/`, `crates/conduit-runtime/`, `src-tauri/ui/src/lib/components/ProxyRoutingTab.svelte`, `src-tauri/ui/src/lib/components/ProxyProfilesTab.svelte`, `src-tauri/ui/dist/`
+- In: `crates/conduit-core/src/toml_io.rs`, `crates/conduit-core/src/v2_model.rs` (make `rewrite_target` / `rewrite_table` `pub(crate)` only), `crates/conduit-runtime/src/toml_watcher.rs`, `src-tauri/src/controller/import_export.rs`, `crates/conduit-core/DOX.md`, `docs/` pages that describe TOML import/export notes
+- Out: the CLI repos, `src-tauri/ui/`, `crates/conduit-vault/`
 
 ## Sub-tasks
-1. [done] In `src-tauri/src/controller/proxies.rs`, `src-tauri/src/controller/tunnels.rs`, `src-tauri/src/controller/parity.rs`, and `src-tauri/src/controller.rs`: (a) switch proxy validation to `validate_proxy_with_tunnels` passing the saved `&[Tunnel]` slice, (b) run `migrate_tunnel_profiles` on loaded proxies in `AppController` startup (persisting if any proxy was migrated), (c) in `parity.rs`, include tunnel forward listeners (`tunnels.forward_listeners()` / saved tunnel `forward` ports) in `check_port_conflicts` and `check_proxy_port_conflicts`, (d) keep `AppController::test_route` static and add `AppController::test_route_live(&self, ...)` calling `self.proxies.test_route_live(...)`, and call `controller.test_route_live(...)` from `src-tauri/src/commands.rs:442` so `@tunnel:` and `@forward:` targets show friendly upstream names without modifying `secret_leak_scan.rs`. — done when: `cargo test -p rusty-conduit-gui` passes.
-2. [done] In `src-tauri/src/tray_bridge.rs`, keep `profiles` passing custom `proxy.profiles` names (do NOT expose raw `@tunnel:<uuid>` UUIDs in tray menu labels, since `conduit-tray` displays the override string verbatim). Verify `cargo test -p rusty-conduit-gui` and `cargo test -p conduit-tray` pass. — done when: `cargo test -p rusty-conduit-gui` and `cargo test -p conduit-tray` pass.
-3. [done] In `src-tauri/ui/src/lib/types.ts`, add `ForwardProxyProtocol = "none" | "http" | "socks5"`, add `proxy_protocol: ForwardProxyProtocol` to `PortForward`, add `forward: ForwardConfig`, `mitm: MitmConfig | null`, `socks_block_web: boolean` to `Tunnel`, and add `listeners: ListenerInfo[]` to `TunnelSnapshot`. Update `src-tauri/ui/src/lib/mock.ts` and any minimal compile references (e.g. `TunnelEditor.svelte`, `portForwards.ts`) so `npm run check` passes. — done when: `(cd src-tauri/ui && npm run check)` exits 0.
-4. [done] In `src-tauri/ui/src/lib/validate.ts`, add target helper constants/functions (`TUNNEL_TARGET_PREFIX = "@tunnel:"`, `FORWARD_TARGET_PREFIX = "@forward:"`, `tunnelTarget(id)`, `forwardTarget(tid, fid)`, `isSyntheticTarget(name)`), mirror `validate_tunnel` (always validate `forward.allow`/`block`, validate `forward` ports & `mitm` when `forward.enabled`, reject remote forward with `proxy_protocol !== "none"`), and mirror `validate_proxy_with_tunnels` (reject profile names starting with `@`, validate `@tunnel:` and `@forward:` targets against known tunnels/forwards). Update or add unit tests in `src-tauri/ui/src/lib/`. — done when: `(cd src-tauri/ui && npm run check && npm test)` exits 0.
-5. [done] Run workspace Rust checks and UI checks: `cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && (cd src-tauri/ui && npm run check && npm test)`. — done when: command exits 0.
+1. [done] `error_page: Option<PathBuf>` on all three file structs (serde default, `skip_serializing_if = "Option::is_none"`), the import warning, `None` on export; tests importing each CLI's `config.toml` with `error_page` succeed with the warning — done when: `cargo test -p conduit-core --locked toml_io::tests::error_page` passes.
+2. [done] SSH exporter accepts `@tunnel:<uuid>` as the single default target; test: a migrated v2 Proxy (`migrate_tunnel_profiles` applied) exports and re-imports to the same tunnel target and hops — done when: `cargo test -p conduit-core --locked toml_io::tests::ssh_export_v2` passes.
+3. [done] Switch exporter rewrite and placeholders as decided in Context; test: a Proxy with `@tunnel:` in default and a rule, an `@forward:` rule, and a composite slot exports to TOML whose uncommented part contains no `@tunnel:` or `@forward:`, and whose placeholders, once uncommented, import with `import_rusty_conduit_switch_toml` without error — done when: `cargo test -p conduit-core --locked toml_io::tests::switch_export_synthetic` passes.
+4. [done] `migrate_tunnel_profiles` in `commit_toml_import`, plus a controller test that importing a `rusty-conduit-ssh` file saves a Proxy whose default is `@tunnel:<saved tunnel id>` with no `tunnel` profile — done when: `cargo test -p rusty-conduit-gui --locked commit_toml_import` passes.
+5. [done] `socks_block_web` in `merge_external_toml` and its doc comment; extend `merge_keeps_app_fields_and_vaulted_passwords` or add a test with `socks_block_web = true` in the linked file — done when: `cargo test -p conduit-runtime --locked toml_watcher` passes.
+6. [done] Docs pass: update `crates/conduit-core/DOX.md` and any `docs/` text that lists export notes or import warnings (`grep -rn 'placeholder\|error_page\|@tunnel' docs crates/conduit-core/DOX.md`) — done when: the grep output was reviewed and every stale statement fixed, recorded in Evidence.
+7. [done] (planner, Gate D finding) Rewrap the `merge_external_toml` doc comment and the new test line in `toml_watcher.rs` to ≤ 100 columns — done when: `cargo test -p conduit-runtime --locked toml_watcher` passes.
 
 ## Verify
 ```sh
-cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && (cd src-tauri/ui && npm run check && npm test)
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+cargo test -p rusty-conduit-gui --test secret_leak_scan --locked
+git diff --exit-code -- src-tauri/ui crates/conduit-vault
 ```
 
 ## Escalate when
-- `crates/conduit-tray` cannot display a friendly label separate from the override target string `@tunnel:<uuid>` without changing `conduit-tray`'s public API → stop, set Status: needs-human — reason: ask whether to widen scope to `crates/conduit-tray/` or keep tray override limited to named profiles for now.
-- Any existing Rust integration test in `src-tauri/tests/` fails due to the `migrate_tunnel_profiles` behavior on load → stop, set Status: needs-human — reason: describe the failing test.
+- An exported placeholder cannot be made to import cleanly in the Switch importer → stop, set Status: needs-human — reason: paste the TOML and the import error.
+- Running `migrate_tunnel_profiles` at import changes what an existing controller test asserts → stop, set Status: needs-human — reason: name the test.
 
 ## Log
 - (append-only, one line per event)
-- blocked on sub-task 1: `check_port_conflicts` / `check_proxy_port_conflicts` live in `src-tauri/src/controller/parity.rs` (outside `Scope: In`), and changing `AppController::test_route` to `&self` affects `src-tauri/tests/secret_leak_scan.rs:679,682` (outside `Scope: In`)
-- planner resolved escalation: added `src-tauri/src/controller/parity.rs` to `Scope: In`, and specified keeping `AppController::test_route` static while adding `AppController::test_route_live(&self, ...)` called from `src-tauri/src/commands.rs:442`. Returned sub-task 1 and phase-0003 to `todo` for executor continuation.
-- completed sub-task 1: wired `validate_proxy_with_tunnels`, startup `migrate_tunnel_profiles`, tunnel forward port conflict checks in `parity.rs`, and `AppController::test_route_live` in `commands.rs`
-- completed sub-task 2: verified `tray_bridge.rs` keeps custom `proxy.profiles` names only and passes `rusty-conduit-gui` and `conduit-tray` tests
-- completed sub-task 3: synced `types.ts`, `mock.ts`, `portForwards.ts`, `stores.svelte.ts`, `TunnelEditor.svelte`, and `validate.test.ts` with new `ForwardProxyProtocol`, `Tunnel`, and `TunnelSnapshot` fields
-- completed sub-task 4: added target helpers and synced `tunnelErrors`/`proxyErrors` in `validate.ts`, updated `stores.svelte.ts` to pass full `Tunnel` objects, and added unit tests in `validate.test.ts`
-- completed sub-task 5 and phase verification: full workspace clippy, Rust tests, svelte-check, and UI unit tests all passed
+- planner begins phase-0003 (planner-owned)
+- sub-task 1: `error_page: Option<PathBuf>` on ConduitFile/SshFile/SwitchFile; `warn_error_page` adds the import warning; exports write `None`
+- sub-task 2: SSH exporter resolves the default via `TargetRef::parse` (`@tunnel:<id>`) or a legacy `tunnel` profile; error text keeps "single `tunnel` profile"
+- sub-task 3: `synthetic_target_names` + `push_placeholder`; Switch export renames `@tunnel:`/`@forward:` to `tunnel-<id>`/`forward-<id>` in routing (toml_io's own `rewrite_routing`, so v2_model.rs was not touched) and composite slots, with placeholders and notes; legacy tunnel placeholder output unchanged (existing test passes)
+- sub-task 4: `migrate_tunnel_profiles` before `upsert_proxy` in `commit_toml_import`; the existing assertion in `ssh_toml_creates_a_tunnel_and_a_proxy_routed_to_it` (legacy Tunnel profile) is exactly the behaviour this sub-task changes, so it now asserts the `@tunnel:` default — not an unexpected test change, so no escalation; new test `commit_toml_import_saves_ssh_proxy_with_a_v2_tunnel_target`
+- sub-task 5: `merge_external_toml` copies `socks_block_web`; doc comment updated; test `merge_takes_socks_block_web_from_the_file`
+- sub-task 6: docs grep reviewed (see Evidence); updated conduit-core DOX Local Contracts and docs/FUTURE-EXPORTER.md table row
+- phase-0003 verified and closed
+
+- Gate D: toml_watcher doc line and new test line exceeded 100 columns; rewrapped (sub-task 7)
 
 ## Evidence
 - (append-only: command → observed result)
-- `rg -n "check_port_conflicts|validate_proxy|test_route|migrate_tunnel_profiles|forward_listeners" src-tauri/src` → `check_port_conflicts` at `src-tauri/src/controller/parity.rs:166`, `check_proxy_port_conflicts` at `src-tauri/src/controller/parity.rs:248`
-- `rg -n "test_route|check_port_conflicts|UpstreamKind::Tunnel" src-tauri/tests/` → `AppController::test_route` called statically at `src-tauri/tests/secret_leak_scan.rs:679` and `682`
-- `cargo test -p rusty-conduit-gui && cargo test -p conduit-tray` → exit 0 (`rusty-conduit-gui`: 176 unit + 6 secret_leak_scan passed; `conduit-tray`: 23 passed)
-- `cd src-tauri/ui && npm run check` → exit 0 (`svelte-check found 0 errors and 0 warnings`)
-- `cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && (cd src-tauri/ui && npm run check && npm test)` → exit 0 (0 clippy warnings; all workspace Rust tests passed; svelte-check 0 errors/warnings; 95/95 UI tests passed)
+- `cargo test -p conduit-core --locked toml_io` → 22 passed (incl. `error_page_is_accepted_with_a_warning_and_never_exported`, `ssh_export_v2_tunnel_target_round_trips`, `switch_export_synthetic_targets_become_named_placeholders`, existing `toml_io_switch_export_uses_password_env_and_tunnel_placeholders`)
+- `cargo test -p rusty-conduit-gui --locked --lib import_export` → 8 passed (incl. `commit_toml_import_saves_ssh_proxy_with_a_v2_tunnel_target`)
+- `cargo test -p conduit-runtime --locked toml_watcher` → 5 passed (incl. `merge_takes_socks_block_web_from_the_file`)
+- docs grep `grep -rn 'placeholder\|error_page\|@tunnel' docs crates/conduit-core/DOX.md`: TODO.md:26 and FUTURE-EXPORTER.md (secret placeholders) unaffected; FUTURE-EXPORTER.md:48 updated for synthetic targets; conduit-core DOX gained the error_page and synthetic-target contracts; README.md:16 and RELEASING.md:172 still accurate
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` → exit 0; `cargo test --workspace --locked` → 678 passed, 0 failed; secret_leak_scan → 6 passed; `git diff --exit-code -- src-tauri/ui crates/conduit-vault` → exit 0
+- Gate D fix-up: `cargo test -p conduit-runtime --locked toml_watcher` → 5 passed

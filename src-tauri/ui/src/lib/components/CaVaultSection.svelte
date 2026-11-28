@@ -14,20 +14,31 @@
   let renaming = $state.raw<CaView | null>(null);
   let renameValue = $state("");
   let deleting = $state.raw<CaView | null>(null);
-  let deleteUsage = $state.raw<Usage>({ hosts: [], sessions: [] });
+  let deleteUsage = $state.raw<Usage>({ hosts: [], sessions: [], proxies: [] });
   let usageChanged = $state(false);
   let busy = $state(false);
   let dialogError = $state<string | null>(null);
 
   const ready = $derived(store.vault.initialized && store.vault.unlocked);
   const unsavedUsers = $derived(deleting ? store.draftsUsingCa(deleting.id) : []);
-  /** Sessions that hold the CA in memory right now, so deleting it stops them. */
+  /** Sessions and Proxies that hold the CA in memory right now, so deleting it stops them. */
   const runningIds = $derived(
-    new Set(store.sessions.filter((s) => isActive(s.runtime.state)).map((s) => s.profile.id)),
+    new Set([
+      ...store.sessions.filter((s) => isActive(s.runtime.state)).map((s) => s.profile.id),
+      ...store.proxies
+        .filter(
+          (p) =>
+            p.snapshot.state.state === "starting" ||
+            p.snapshot.state.state === "running" ||
+            p.snapshot.state.state === "reloading",
+        )
+        .map((p) => p.profile.id),
+    ]),
   );
 
-  const usageLabel = (count: number) => `Used by ${count} ${count === 1 ? "session" : "sessions"}`;
-  const usageNames = (usage: Usage) => usage.sessions.map((ref) => ref.name).join(", ");
+  const usageLabel = (count: number) => `Used by ${count} ${count === 1 ? "item" : "items"}`;
+  const usageNames = (usage: Usage) =>
+    [...usage.sessions, ...(usage.proxies ?? [])].map((ref) => ref.name).join(", ");
 
   function selectOnFocus(node: HTMLInputElement) {
     node.focus();
@@ -166,7 +177,7 @@
 {/if}
 
 {#if deleting}
-  {@const affected = deleteUsage.sessions.length}
+  {@const affected = deleteUsage.sessions.length + (deleteUsage.proxies ?? []).length}
   <ModalDialog title="Delete CA" onDismiss={() => { if (!busy) deleting = null; }}>
     <p>Delete <strong>{deleting.name}</strong>? This cannot be undone.</p>
     {#if usageChanged}
@@ -174,12 +185,15 @@
     {/if}
     {#if affected > 0}
       <p>
-        These sessions will have no CA. Running ones are stopped now, and none of them will start
+        These sessions and Proxies will have no CA. Running ones are stopped now, and none of them will start
         until you choose another CA or turn MITM off:
       </p>
       <ul class="plain-list">
         {#each deleteUsage.sessions as ref (ref.id)}
           <li>{ref.name}{#if runningIds.has(ref.id)} <span class="pill busy">running, will be stopped</span>{/if}</li>
+        {/each}
+        {#each deleteUsage.proxies ?? [] as ref (ref.id)}
+          <li>{ref.name} (Proxy){#if runningIds.has(ref.id)} <span class="pill busy">running, will be stopped</span>{/if}</li>
         {/each}
       </ul>
     {/if}

@@ -13,8 +13,8 @@ Owns everything under `crates/conduit-openssh/`. Inherits all root DOX rules and
 - Every value written to the per-session `ssh -F` file is validated or quoted; a newline must never become a new directive.
 - Passwords never appear in argv, the environment, or a file; askpass serves each at most once.
 - Child processes start from an empty environment plus the allowlist in `src/env.rs`.
-- `ssh` children must not outlive their parent (`src/orphan.rs`).
-- Runtime files live in a short, private per-session directory (`src/runtime_dir.rs`).
+- `ssh` children must not outlive their parent (`src/orphan.rs`). Only Linux spawns `ssh` from a dedicated `conduit-ssh-parent` thread (`spawn_guarded`), because `PR_SET_PDEATHSIG` fires when the spawning thread exits; macOS and Windows spawn directly.
+- Runtime files live in a short, private per-session directory (`src/runtime_dir.rs`) named `rc-<8 hex>` and holding a `.rusty-conduit-runtime` marker. App startup calls `sweep_stale_runtime_dirs()` once, before any Tunnel starts, to remove marked directories owned by the user that a crashed run left behind; unmarked or foreign directories are never touched.
 - `conduit-worker` is a separate binary (`[[bin]]` in `Cargo.toml`); keep its CLI (`askpass`, worker mode) in sync with how `src/supervisor.rs` invokes it.
 
 ## Verification
